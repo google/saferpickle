@@ -19,7 +19,7 @@ import os
 from typing import Any, Dict, List, Sequence
 from absl import app
 from absl import flags
-import safer_pickle
+import saferpickle
 from lib import utils
 
 
