@@ -15,14 +15,20 @@
 """Utility functions for safer_pickle."""
 
 import ast
+import bz2
+import enum
 import functools
+import gzip
 import importlib
 import inspect
 import io
+import lzma
+import math
 import os
 import re
 import subprocess
 import sys
+import tarfile
 import types
 from typing import FrozenSet, Set
 import zipfile
@@ -30,6 +36,16 @@ import zipfile
 from absl import logging
 
 from lib import constants
+
+
+@enum.unique
+class Classification(enum.Enum):
+  """Classification of a class name."""
+
+  SAFE = "SAFE"
+  UNSAFE = "UNSAFE"
+  SUSPICIOUS = "SUSPICIOUS"
+  UNKNOWN = "UNKNOWN"
 
 
 def create_pattern(strings: FrozenSet[str]) -> re.Pattern[str]:
@@ -172,6 +188,55 @@ def extract_zip_contents(file_bytes: bytes) -> list[tuple[str, bytes]]:
   return contents
 
 
+def is_bz2_bytes(file_bytes: bytes) -> bool:
+  """Checks if the provided bytes represent a bz2 file."""
+  return file_bytes.startswith(b"\x42\x5a\x68")
+
+
+def extract_bz2_contents(file_bytes: bytes) -> bytes:
+  """Extracts contents from bz2 bytes."""
+  return bz2.decompress(file_bytes)
+
+
+def is_lzma_bytes(file_bytes: bytes) -> bool:
+  """Checks if the provided bytes represent an lzma file."""
+  return file_bytes.startswith(b"\xfd\x37\x7a\x58\x5a\x00")
+
+
+def extract_lzma_contents(file_bytes: bytes) -> bytes:
+  """Extracts contents from lzma bytes."""
+  return lzma.decompress(file_bytes)
+
+
+def is_gzip_bytes(file_bytes: bytes) -> bool:
+  """Checks if the provided bytes represent a gzip file."""
+  return file_bytes.startswith(b"\x1f\x8b")
+
+
+def extract_gzip_contents(file_bytes: bytes) -> bytes:
+  """Extracts contents from gzip bytes."""
+  return gzip.decompress(file_bytes)
+
+
+def is_tar_bytes(file_bytes: bytes) -> bool:
+  """Checks if the provided bytes represent a tar file."""
+  return len(file_bytes) > 262 and file_bytes[257:262] == b"ustar"
+
+
+def extract_tar_contents(file_bytes: bytes) -> list[tuple[str, bytes]]:
+  """Extracts contents from tar bytes."""
+  contents = []
+  with tarfile.open(fileobj=io.BytesIO(file_bytes)) as tf:
+    for member in tf.getmembers():
+      if ".." in member.name or member.name.startswith("/"):
+        # For now, just extract and let the caller handle this
+        pass
+      f = tf.extractfile(member)
+      if f:
+        contents.append((member.name, f.read()))
+  return contents
+
+
 def is_pickle_file(
     pickle_bytes: bytes | io.BytesIO, return_num_bytes_read: bool = False
 ) -> bool | tuple[bool, int]:
@@ -294,6 +359,48 @@ def get_module_members(module_name: str) -> Set[str] | None:
     elif isinstance(node, ast.ClassDef):
       members.add(node.name)
   return members
+
+
+def get_optimal_workers(file_size: int) -> int:
+  """Calculates the optimal number of workers based on the file size using tiers.
+
+  Args:
+    file_size: The size of the file in bytes.
+
+  Returns:
+    The optimal number of workers to use.
+  """
+  if file_size is None:
+    return 1
+  for threshold, workers in constants.WORKER_TIERS:
+    if file_size < threshold:
+      return min(constants.MAX_NUM_CHUNKS or 1, workers)
+
+  # If file size is larger than or equal to the largest threshold,
+  # use logarithmic scaling.
+  largest_threshold, largest_workers = constants.WORKER_TIERS[-1]
+  # Ensure largest_workers is capped at MAX_NUM_CHUNKS before scaling up.
+  largest_workers = min(largest_workers, constants.MAX_NUM_CHUNKS or 1)
+  scaled_workers = largest_workers + int(
+      math.log(file_size / largest_threshold, 2)
+  )
+
+  # Cap at around half the number of available CPU cores.
+  return min(constants.MAX_NUM_CHUNKS or 1, scaled_workers)
+
+
+@functools.lru_cache(maxsize=None)
+def classify_class_name(class_name: str) -> Classification | None:
+  """Classifies a class name based on the safe, unsafe, and suspicious patterns."""
+  if re.search(safe_pattern, class_name):
+    return Classification.SAFE
+  if re.search(unsafe_pattern, class_name):
+    return Classification.UNSAFE
+  if re.search(suspicious_pattern, class_name):
+    return Classification.SUSPICIOUS
+  if re.search(unknown_pattern, class_name):
+    return Classification.UNKNOWN
+  return None
 
 
 def resolve_library_modules_from_results(

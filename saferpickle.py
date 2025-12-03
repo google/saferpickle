@@ -17,10 +17,10 @@
 import concurrent.futures
 import contextlib
 import dataclasses
-import enum
 import functools
 import importlib
 import io
+import lzma
 import math
 from multiprocessing import shared_memory
 import os
@@ -28,9 +28,11 @@ import pickle
 import pickletools
 import re
 import sys
+import tarfile
 import tempfile
 import threading
 from typing import Any, BinaryIO, Callable, Dict, Iterator, Optional, Set, Tuple
+import zipfile
 
 from absl import logging
 from third_party.corrupy import picklemagic
@@ -38,37 +40,14 @@ from third_party.corrupy import picklemagic
 import multiprocessing
 from lib import config
 from lib import constants
+from lib import exceptions
 from lib import utils
 
 
-class IllegalArgumentCombinationError(Exception):
-  """Custom exception for using allow_unsafe and strict_check together."""
-
-  def __init__(self, m: str) -> None:
-    self.message = m
-
-  def __str__(self) -> str:
-    return self.message
-
-
-class StrictCheckError(Exception):
-  """Custom exception for strict check failures."""
-
-  def __init__(self, m: str) -> None:
-    self.message = m
-
-  def __str__(self) -> str:
-    return self.message
-
-
-class UnsafePickleDetectedError(Exception):
-  """Custom exception for unsafe pickle files."""
-
-  def __init__(self, m: str) -> None:
-    self.message = m
-
-  def __str__(self) -> str:
-    return self.message
+IllegalArgumentCombinationError = exceptions.IllegalArgumentCombinationError
+StrictCheckError = exceptions.StrictCheckError
+UnsafePickleDetectedError = exceptions.UnsafePickleDetectedError
+MaxRecursionDepthExceededError = exceptions.MaxRecursionDepthExceededError
 
 
 # Global flag for debug mode
@@ -78,14 +57,7 @@ DEBUG_MODE = False
 IS_COLAB_ENABLED = "google.colab" in sys.modules
 
 
-@enum.unique
-class Classification(enum.Enum):
-  """Classification of a class name."""
-
-  SAFE = "SAFE"
-  UNSAFE = "UNSAFE"
-  SUSPICIOUS = "SUSPICIOUS"
-  UNKNOWN = "UNKNOWN"
+Classification = utils.Classification
 
 
 @dataclasses.dataclass
@@ -134,7 +106,15 @@ def _custom_genops(
     if opcode.arg is not None:
       try:
         opcode_argument = opcode.arg.reader(pickle_file)
-      except Exception:  # pylint: disable=broad-except
+      except (
+          ValueError,
+          IndexError,
+          AttributeError,
+          EOFError,
+          TypeError,
+          ImportError,
+          pickle.UnpicklingError,
+      ):
         # Continue if we can't read the argument
         continue
 
@@ -211,7 +191,15 @@ def _custom_chunked_genops(
           pickle_file.seek(pos_before_arg_read)
           continue
 
-      except Exception:  # pylint: disable=broad-except
+      except (
+          ValueError,
+          IndexError,
+          AttributeError,
+          EOFError,
+          TypeError,
+          ImportError,
+          pickle.UnpicklingError,
+      ):
         # Continue if we can't read the argument within the chunk
         pickle_file.seek(pos_before_arg_read)
         continue
@@ -237,32 +225,6 @@ def _custom_chunked_genops(
 
     if charcode == b".":
       break
-
-
-def get_optimal_workers(file_size: int) -> int:
-  """Calculates the optimal number of workers based on the file size using tiers.
-
-  Args:
-    file_size: The size of the file in bytes.
-
-  Returns:
-    The optimal number of workers to use.
-  """
-  for threshold, workers in constants.WORKER_TIERS:
-    if file_size < threshold:
-      return min(constants.MAX_NUM_CHUNKS or 1, workers)
-
-  # If file size is larger than or equal to the largest threshold,
-  # use logarithmic scaling.
-  largest_threshold, largest_workers = constants.WORKER_TIERS[-1]
-  # Ensure largest_workers is capped at MAX_NUM_CHUNKS before scaling up.
-  largest_workers = min(largest_workers, constants.MAX_NUM_CHUNKS or 1)
-  scaled_workers = largest_workers + int(
-      math.log(file_size / largest_threshold, 2)
-  )
-
-  # Cap at around half the number of available CPU cores.
-  return min(constants.MAX_NUM_CHUNKS or 1, scaled_workers)
 
 
 def _process_chunk_for_generate_ops(
@@ -311,19 +273,15 @@ def generate_ops_from_file(
     strings.
   """
   filtered_operands = set()
-  if shm_name and pickle_length:
-    length = pickle_length
-  else:
-    length = os.path.getsize(pickle_file_path)
-  num_workers = get_optimal_workers(length)
+  num_workers = utils.get_optimal_workers(pickle_length)
 
   if (
-      length < constants.MIN_SIZE_FOR_CHUNKING
+      pickle_length < constants.MIN_SIZE_FOR_CHUNKING
       or not utils.is_sys_executable_patched()
   ):
     if shm_name:
       shm = shared_memory.SharedMemory(name=shm_name)
-      pickle_bytes = bytes(shm.buf[:length])
+      pickle_bytes = bytes(shm.buf[:pickle_length])
     else:
       with open(pickle_file_path, "rb") as f:
         pickle_bytes = f.read()
@@ -337,17 +295,17 @@ def generate_ops_from_file(
     return filtered_operands
   else:
     # Divide into constants.MAX_NUM_CHUNKS for larger files
-    chunk_size = math.ceil(length / num_workers)
+    chunk_size = math.ceil(pickle_length / num_workers)
     ranges = []
     for chunk_index in range(num_workers):
       chunk_start_size = chunk_index * chunk_size
-      # Extend the chunk end by CHUNK_OVERLAP, but don't exceed length
+      # Extend the chunk end by CHUNK_OVERLAP, but don't exceed pickle_length
       chunk_end = min(
-          chunk_start_size + chunk_size + constants.CHUNK_OVERLAP, length
+          chunk_start_size + chunk_size + constants.CHUNK_OVERLAP, pickle_length
       )
-      if chunk_start_size < length:
+      if chunk_start_size < pickle_length:
         ranges.append((chunk_start_size, chunk_end))
-      if chunk_end == length:
+      if chunk_end == pickle_length:
         break  # Last chunk reaches the end
 
     ctx = multiprocessing.get_context("spawn")
@@ -453,20 +411,6 @@ def get_class_instantiations(pickle_bytes: bytes) -> tuple[io.StringIO, bool]:
   return picklemagic_output, is_build_instr_blocked
 
 
-@functools.lru_cache(maxsize=None)
-def classify_class_name(class_name: str) -> Classification | None:
-  """Classifies a class name based on the safe, unsafe, and suspicious patterns."""
-  if re.search(utils.safe_pattern, class_name):
-    return Classification.SAFE
-  if re.search(utils.unsafe_pattern, class_name):
-    return Classification.UNSAFE
-  if re.search(utils.suspicious_pattern, class_name):
-    return Classification.SUSPICIOUS
-  if re.search(utils.unknown_pattern, class_name):
-    return Classification.UNKNOWN
-  return None
-
-
 def categorize_strings(
     filtered_output: Set[str] | io.StringIO,
     use_picklemagic: bool = False,
@@ -514,7 +458,7 @@ def categorize_strings(
           continue
 
         class_name = class_args_match.group(1)
-        class_name_classification = classify_class_name(class_name)
+        class_name_classification = utils.classify_class_name(class_name)
 
         match class_name_classification:
           case Classification.SAFE:
@@ -612,7 +556,7 @@ def categorize_strings(
       continue
 
     # Classify the resolved result
-    classification = classify_class_name(result)
+    classification = utils.classify_class_name(result)
 
     if classification == Classification.SAFE:
       new_safe_results.add(result)
@@ -764,7 +708,9 @@ def genops_scan(
         "", shm_name=shm_name, pickle_length=len(pickle_bytes)
     )
   elif pickle_file_path:
-    genops_output = generate_ops_from_file(pickle_file_path)
+    genops_output = generate_ops_from_file(
+        pickle_file_path, pickle_length=len(pickle_bytes)
+    )
   else:
     genops_output = generate_ops(pickle_bytes)
   results = categorize_strings(genops_output)
@@ -868,6 +814,114 @@ def apply_approach(
 
 @functools.lru_cache(maxsize=None)
 def security_scan(
+    pickle_bytes: bytes,
+    force_scan: bool = False,
+    recursion_depth: int = 0,
+) -> Dict[str, int]:
+  """Security scan to detect malicious content in pickle files.
+
+  Args:
+    pickle_bytes: Pickle bytecode to scan.
+    force_scan: If True, force scan even if the file is not a pickle file.
+    recursion_depth: Current recursion depth for nested archives.
+
+  Returns:
+    A dictionary containing the scores for unsafe, suspicious, and unknown
+    results.
+  """
+  if recursion_depth > 10:
+    raise MaxRecursionDepthExceededError("Max recursion depth of 10 exceeded.")
+  if recursion_depth > 3:
+    logging.warning("Suspiciously deep recursion depth of %d", recursion_depth)
+
+  # Check for compression signatures
+  if utils.is_zip_bytes(pickle_bytes):
+    return _extract_and_scan_archive(pickle_bytes, "zip", recursion_depth)
+  elif utils.is_bz2_bytes(pickle_bytes):
+    return _extract_and_scan_archive(pickle_bytes, "bz2", recursion_depth)
+  elif utils.is_lzma_bytes(pickle_bytes):
+    return _extract_and_scan_archive(pickle_bytes, "lzma", recursion_depth)
+  elif utils.is_gzip_bytes(pickle_bytes):
+    return _extract_and_scan_archive(pickle_bytes, "gzip", recursion_depth)
+  elif utils.is_tar_bytes(pickle_bytes):
+    return _extract_and_scan_archive(pickle_bytes, "tar", recursion_depth)
+
+  return _security_scan_internal(pickle_bytes, force_scan)
+
+
+def _merge_scores(total: Dict[str, int], new: Dict[str, int]):
+  total["unsafe"] += new.get("unsafe", 0)
+  total["suspicious"] += new.get("suspicious", 0)
+  total["unknown"] += new.get("unknown", 0)
+
+
+def _extract_and_scan_archive(
+    data: bytes, archive_type: str, recursion_depth: int
+) -> Dict[str, int]:
+  """Extracts and scans contents of an archive."""
+  all_scores = {"unsafe": 0, "suspicious": 0, "unknown": 0}
+
+  try:
+    if archive_type == "zip":
+      with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        for name in zf.namelist():
+          if ".." in name or name.startswith("/"):
+            # Zip slip detection
+            all_scores["unsafe"] += 1337  # High score for zip slip
+            logging.warning("Zip slip detected: %s", name)
+            continue
+
+          with zf.open(name) as f:
+            content = f.read()
+            scores = security_scan(content, recursion_depth=recursion_depth + 1)
+            _merge_scores(all_scores, scores)
+
+    elif archive_type == "bz2":
+      content = utils.extract_bz2_contents(data)
+      scores = security_scan(content, recursion_depth=recursion_depth + 1)
+      _merge_scores(all_scores, scores)
+
+    elif archive_type == "lzma":
+      content = utils.extract_lzma_contents(data)
+      scores = security_scan(content, recursion_depth=recursion_depth + 1)
+      _merge_scores(all_scores, scores)
+
+    elif archive_type == "gzip":
+      content = utils.extract_gzip_contents(data)
+      scores = security_scan(content, recursion_depth=recursion_depth + 1)
+      _merge_scores(all_scores, scores)
+
+    elif archive_type == "tar":
+      for name, content in utils.extract_tar_contents(data):
+        if ".." in name or name.startswith("/"):
+          all_scores["unsafe"] += 1337
+          logging.warning("Tar slip detected: %s", name)
+          continue
+        scores = security_scan(content, recursion_depth=recursion_depth + 1)
+        _merge_scores(all_scores, scores)
+
+    else:
+      logging.warning("Unsupported archive type: %s", archive_type)
+      return {"unsafe": 0, "suspicious": 0, "unknown": 1337}
+
+  except MaxRecursionDepthExceededError:
+    raise
+  except (
+      zipfile.BadZipFile,
+      tarfile.TarError,
+      lzma.LZMAError,
+      OSError,
+      EOFError,
+      ValueError,
+  ) as e:
+    logging.exception("Error processing %s archive: %s", archive_type, e)
+    # Fallback to normal scan if extraction fails
+    return _security_scan_internal(data, force_scan=False)
+
+  return all_scores
+
+
+def _security_scan_internal(
     pickle_bytes: bytes, force_scan: bool = False
 ) -> Dict[str, int]:
   """Security scan to detect malicious content in pickle files.
