@@ -22,12 +22,15 @@ import functools
 import importlib
 import io
 import math
+from multiprocessing import shared_memory
+import os
 import pickle
 import pickletools
 import re
 import sys
+import tempfile
 import threading
-from typing import Any, Callable, Dict, Iterator, Optional, Set, Tuple
+from typing import Any, BinaryIO, Callable, Dict, Iterator, Optional, Set, Tuple
 
 from absl import logging
 from third_party.corrupy import picklemagic
@@ -158,7 +161,7 @@ def _custom_genops(
 
 
 def _custom_chunked_genops(
-    pickle_bytes: bytes,
+    pickle_file: BinaryIO,
     chunk_range: Tuple[int, int],
 ) -> Iterator[tuple[pickletools.OpcodeInfo, Any | None]]:
   """Generates string-declaring opcodes and arguments from a chunk of pickle data.
@@ -168,18 +171,12 @@ def _custom_chunked_genops(
   arguments. It's designed to be used in parallel for large pickle files.
 
   Args:
-    pickle_bytes: The pickle data to generate opcodes from.
+    pickle_file: The pickle data stream to generate opcodes from.
     chunk_range: A tuple (start, end) defining the byte range to process.
 
   Yields:
     A tuple of (opcode, opcode_argument) for each string-declaring opcode.
   """
-
-  if isinstance(pickle_bytes, bytes):
-    pickle_file = io.BytesIO(pickle_bytes)
-  else:
-    pickle_file = pickle_bytes
-
   pickle_file.seek(chunk_range[0])
 
   while True:
@@ -269,42 +266,67 @@ def get_optimal_workers(file_size: int) -> int:
 
 
 def _process_chunk_for_generate_ops(
-    pickle_bytes: bytes, chunk_range: Tuple[int, int]
+    pickle_data_source: str | bytes,
+    chunk_range: Tuple[int, int],
+    is_shared_memory: bool = False,
 ) -> Set[str]:
   """Helper function for generate_ops to process a chunk of pickle data."""
   chunked_operands = set()
   try:
-    for _, operand in _custom_chunked_genops(pickle_bytes, chunk_range):
-      if operand is None:
-        continue
-      chunked_operands.add(str(operand))
+    if is_shared_memory:
+      shm = shared_memory.SharedMemory(name=pickle_data_source)
+      # Use BytesIO on the memoryview for compatibility with
+      # _custom_chunked_genops
+      data_view = shm.buf
+      with io.BytesIO(data_view) as f:
+        for _, operand in _custom_chunked_genops(f, chunk_range):
+          if operand is None:
+            continue
+          chunked_operands.add(str(operand))
+    else:
+      with open(pickle_data_source, "rb") as f:
+        for _, operand in _custom_chunked_genops(f, chunk_range):
+          if operand is None:
+            continue
+          chunked_operands.add(str(operand))
   except StopIteration:
     pass
   return chunked_operands
 
 
-def generate_ops(pickle_bytes: bytes) -> Set[str]:
-  """Returns opcodes that declare strings from a pickle file.
+def generate_ops_from_file(
+    pickle_file_path: str,
+    shm_name: Optional[str] = None,
+    pickle_length: Optional[int] = None,
+) -> Set[str]:
+  """Returns opcodes that declare strings from a pickle file path or shared memory.
 
   Args:
-    pickle_bytes: The pickle bytecode to yield opcode information for.
+    pickle_file_path: The path to the pickle file.
+    shm_name: Optional name of the shared memory block.
+    pickle_length: Optional length of the pickle data.
 
   Returns:
     genops_output: The operands associated with the opcodes that declare
     strings.
   """
-
   filtered_operands = set()
-  pickle_length = len(pickle_bytes)
-  num_workers = get_optimal_workers(pickle_length)
+  if shm_name and pickle_length:
+    length = pickle_length
+  else:
+    length = os.path.getsize(pickle_file_path)
+  num_workers = get_optimal_workers(length)
 
-  # If sys.executable does not have a value or is not a valid
-  # Python interpreter, we don't use multiprocessing.
   if (
-      pickle_length < constants.MIN_SIZE_FOR_CHUNKING
+      length < constants.MIN_SIZE_FOR_CHUNKING
       or not utils.is_sys_executable_patched()
   ):
-    # Use the original non-chunked version for smaller files
+    if shm_name:
+      shm = shared_memory.SharedMemory(name=shm_name)
+      pickle_bytes = bytes(shm.buf[:length])
+    else:
+      with open(pickle_file_path, "rb") as f:
+        pickle_bytes = f.read()
     try:
       for _, operand in _custom_genops(pickle_bytes):
         if operand is None:
@@ -315,17 +337,17 @@ def generate_ops(pickle_bytes: bytes) -> Set[str]:
     return filtered_operands
   else:
     # Divide into constants.MAX_NUM_CHUNKS for larger files
-    chunk_size = math.ceil(pickle_length / num_workers)
+    chunk_size = math.ceil(length / num_workers)
     ranges = []
     for chunk_index in range(num_workers):
       chunk_start_size = chunk_index * chunk_size
-      # Extend the chunk end by CHUNK_OVERLAP, but don't exceed pickle_length
+      # Extend the chunk end by CHUNK_OVERLAP, but don't exceed length
       chunk_end = min(
-          chunk_start_size + chunk_size + constants.CHUNK_OVERLAP, pickle_length
+          chunk_start_size + chunk_size + constants.CHUNK_OVERLAP, length
       )
-      if chunk_start_size < pickle_length:
+      if chunk_start_size < length:
         ranges.append((chunk_start_size, chunk_end))
-      if chunk_end == pickle_length:
+      if chunk_end == length:
         break  # Last chunk reaches the end
 
     ctx = multiprocessing.get_context("spawn")
@@ -334,7 +356,10 @@ def generate_ops(pickle_bytes: bytes) -> Set[str]:
     ) as executor:
       future_to_range_tuple = {
           executor.submit(
-              _process_chunk_for_generate_ops, pickle_bytes, range_tuple
+              _process_chunk_for_generate_ops,
+              shm_name if shm_name else pickle_file_path,
+              range_tuple,
+              is_shared_memory=bool(shm_name),
           ): range_tuple
           for range_tuple in ranges
       }
@@ -352,8 +377,29 @@ def generate_ops(pickle_bytes: bytes) -> Set[str]:
               future_to_range_tuple[future],
               exc,
           )
-
     return filtered_operands
+
+
+def generate_ops(pickle_bytes: bytes) -> Set[str]:
+  """Returns opcodes that declare strings from a pickle file.
+
+  Args:
+    pickle_bytes: The pickle bytecode to yield opcode information for.
+
+  Returns:
+    genops_output: The operands associated with the opcodes that declare
+    strings.
+  """
+
+  filtered_operands = set()
+  try:
+    for _, operand in _custom_genops(pickle_bytes):
+      if operand is None:
+        continue
+      filtered_operands.add(str(operand))
+  except StopIteration:
+    pass
+  return filtered_operands
 
 
 def get_class_instantiations(pickle_bytes: bytes) -> tuple[io.StringIO, bool]:
@@ -501,10 +547,10 @@ def categorize_strings(
                 suspicious_results.add(argument_find)
                 found_match = True
 
-            if not found_match and re.search(
-                utils.unknown_pattern, argument_find
-            ):
-              unknown_results.add(argument_find)
+              if not found_match and re.search(
+                  utils.unknown_pattern, argument_find
+              ):
+                unknown_results.add(argument_find)
 
   else:
     for line in filtered_output:
@@ -700,16 +746,27 @@ def picklemagic_scan(
 
 def genops_scan(
     pickle_bytes: bytes,
+    pickle_file_path: Optional[str] = None,
+    shm_name: Optional[str] = None,
 ) -> ScanResults:
   """Genops scan to detect malicious content in pickle files.
 
   Args:
     pickle_bytes: Pickle bytecode to scan.
+    pickle_file_path: Optional path to the pickle file for streaming scan.
+    shm_name: Optional name of the shared memory block.
 
   Returns:
     A ScanResults object.
   """
-  genops_output = generate_ops(pickle_bytes)
+  if shm_name:
+    genops_output = generate_ops_from_file(
+        "", shm_name=shm_name, pickle_length=len(pickle_bytes)
+    )
+  elif pickle_file_path:
+    genops_output = generate_ops_from_file(pickle_file_path)
+  else:
+    genops_output = generate_ops(pickle_bytes)
   results = categorize_strings(genops_output)
   return results
 
@@ -751,19 +808,28 @@ def score_results(
 
 
 def apply_approach(
-    scan_approach: Callable[[bytes], ScanResults],
+    scan_approach: Callable[..., ScanResults],
     pickle_bytes: bytes,
+    pickle_file_path: Optional[str] = None,
+    shm_name: Optional[str] = None,
 ) -> Dict[str, int]:
   """Applies the given scan approach to the data.
 
   Args:
     scan_approach: The scan approach to apply to the data.
     pickle_bytes: The data to scan.
+    pickle_file_path: Optional path to the pickle file for streaming scan.
+    shm_name: Optional name of the shared memory block.
 
   Returns:
     A dictionary of the resulting scores.
   """
-  results = scan_approach(pickle_bytes)
+  if scan_approach is genops_scan:
+    results = scan_approach(
+        pickle_bytes, pickle_file_path=pickle_file_path, shm_name=shm_name
+    )
+  else:
+    results = scan_approach(pickle_bytes)
 
   if DEBUG_MODE:
     logging.info("Scan approach: %s", scan_approach.__name__)
@@ -843,15 +909,37 @@ def security_scan(
   if not utils.is_pickle_file(pickle_bytes) and not force_scan:
     return {"unsafe": 0, "suspicious": 0, "unknown": 0}
 
-  final_scores = {"unsafe": 0, "suspicious": 0, "unknown": 0}
-  # Fastest to slowest scan (tiered approach)
-  for scan_approach in [picklemagic_scan, genops_scan]:
-    scores = apply_approach(scan_approach, pickle_bytes)
-    if scores["unsafe"] > 0 or scores["suspicious"] > 0:
-      return scores
-    final_scores["unknown"] += scores["unknown"]
+  pickle_file_path = None
+  shm = None
+  shm_name = None
+  if len(pickle_bytes) >= constants.MIN_SIZE_FOR_CHUNKING:
+    try:
+      shm = shared_memory.SharedMemory(create=True, size=len(pickle_bytes))
+      shm_name = shm.name
+      shm.buf[: len(pickle_bytes)] = pickle_bytes
+    except Exception:  # pylint: disable=broad-except
+      # Fallback to tempfile if shared memory fails
+      with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+        pickle_file_path = temp_file.name
+        temp_file.write(pickle_bytes)
 
-  return final_scores
+  try:
+    final_scores = {"unsafe": 0, "suspicious": 0, "unknown": 0}
+    # Fastest to slowest scan (tiered approach)
+    for scan_approach in [picklemagic_scan, genops_scan]:
+      scores = apply_approach(
+          scan_approach, pickle_bytes, pickle_file_path, shm_name
+      )
+      if scores["unsafe"] > 0 or scores["suspicious"] > 0:
+        return scores
+      final_scores["unknown"] += scores["unknown"]
+    return final_scores
+  finally:
+    if shm:
+      shm.close()
+      shm.unlink()
+    if pickle_file_path:
+      os.remove(pickle_file_path)
 
 
 _thread_local_storage_for_hooking = threading.local()

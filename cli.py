@@ -23,11 +23,14 @@ import saferpickle
 from lib import utils
 
 
-def security_scan_with_justifications(pickle_bytes: bytes) -> Dict[str, Any]:
+def security_scan_with_justifications(
+    pickle_bytes: bytes, file_path: str | None = None
+) -> Dict[str, Any]:
   """Analyzes pickle byte content and returns a detailed analysis result.
 
   Args:
     pickle_bytes: The bytes of the pickle file to analyze.
+    file_path: The path to the pickle file, for streaming scan.
 
   Returns:
     A dictionary containing the analysis result. It includes:
@@ -69,7 +72,9 @@ def security_scan_with_justifications(pickle_bytes: bytes) -> Dict[str, Any]:
   unknown_results.update(picklemagic_results.unknown_results)
 
   # Genops Scan
-  genops_results = safer_pickle.genops_scan(pickle_bytes)
+  genops_results = safer_pickle.genops_scan(
+      pickle_bytes, pickle_file_path=file_path
+  )
   safe_results.update(genops_results.safe_results)
   unsafe_results.update(genops_results.unsafe_results)
   suspicious_results.update(genops_results.suspicious_results)
@@ -174,7 +179,9 @@ def scan_directory(directory_path: str) -> List[Dict[str, Any]]:
         if not content:
           analysis_result = {"classification": "Not supported"}
         else:
-          analysis_result = security_scan_with_justifications(content)
+          analysis_result = security_scan_with_justifications(
+              content, file_path=file_path
+          )
 
         file_result = {
             "status": "success",
