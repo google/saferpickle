@@ -18,10 +18,16 @@ SaferPickle employs a two-tiered scanning approach:
 
 ## Installation
 
-You can install SaferPickle from PyPI:
+You may install saferpickle by cloning the repository and running pip:
 
 ```bash
-pip install saferpickle
+pip install -e .
+```
+
+Or alternatively install the requirements, then you may import the module:
+
+```bash
+pip install -r requirements.txt
 ```
 
 Alternatively, please use `requirements.txt` to install dependencies.
