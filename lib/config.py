@@ -20,7 +20,6 @@ from typing import Optional, Set
 from absl import logging
 
 
-
 class _ConfigManager:
   """Manages the configuration for the safer_pickle library."""
 
