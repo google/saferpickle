@@ -196,7 +196,7 @@ ERROR_STRING = string.Template(
     "ERROR: Loading this pickle file may result in code execution."
     " Only proceed if you trust the file.\nClassification: $classification\nIf"
     " this file was flagged inappropriately, please contact"
-    " ise-static-analysis@ with details."
+    " your system administrator with details."
 )
 
 # Combination of all the globals for exclusion to identify unknown method calls
