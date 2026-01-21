@@ -19,6 +19,7 @@ from typing import Optional, Set
 
 from absl import logging
 
+import io
 
 
 class _ConfigManager:

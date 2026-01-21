@@ -35,6 +35,7 @@ import zipfile
 
 from absl import logging
 
+import io
 from lib import constants
 
 
