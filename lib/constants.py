@@ -189,6 +189,7 @@ SAFE_STRINGS: FrozenSet[str] = frozenset([
     "reconstruct",
     "scipy",
     "set",
+    "shutil.disk_usage",
     "sklearn",
     "spacy",
     "str",
