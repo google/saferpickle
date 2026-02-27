@@ -136,6 +136,7 @@ UNSAFE_STRINGS: FrozenSet[str] = frozenset([
     "runpy",
     "safer_pickle",
     "saferpickle",
+    "shutil",
     "socket",
     "ssl",
     "stdin",
