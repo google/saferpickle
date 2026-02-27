@@ -85,6 +85,8 @@ UNSAFE_STRINGS: FrozenSet[str] = frozenset([
     "cProfile",
     "cloudpickle.load",
     "cloudpickle.loads",
+    "code.interact",
+    "code.InteractiveConsole",
     "code.InteractiveInterpreter",
     "codecs.decode",
     "codeop.compile_command",
@@ -101,6 +103,7 @@ UNSAFE_STRINGS: FrozenSet[str] = frozenset([
     "eval",
     "exec",
     "execfile",
+    "fileinput",
     "get_type_hints",
     "gzip",
     "hashlib",
@@ -134,7 +137,9 @@ UNSAFE_STRINGS: FrozenSet[str] = frozenset([
     "read",
     "requests",
     "runpy",
-    "safer_pickle_hook",
+    "safer_pickle",
+    "saferpickle",
+    "shutil",
     "socket",
     "ssl",
     "stdin",
@@ -184,6 +189,7 @@ SAFE_STRINGS: FrozenSet[str] = frozenset([
     "reconstruct",
     "scipy",
     "set",
+    "shutil.disk_usage",
     "sklearn",
     "spacy",
     "str",
@@ -313,3 +319,6 @@ WORKER_TIERS = [
 # Cap the number of workers at half the available CPU cores to avoid excessive
 # overhead and resource contention.
 MAX_NUM_CHUNKS = (os.cpu_count() or 1) // 2
+
+# High score to indicate definite unsafety due to a detected zip slip.
+HIGH_SEVERITY_ZIPSLIP = 1337
