@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Utility functions for safer_pickle."""
+"""Utility functions for saferpickle."""
 
 import ast
 import bz2

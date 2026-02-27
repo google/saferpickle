@@ -64,7 +64,7 @@ def security_scan_with_justifications(
 
   # Call the individual scan functions from SaferPickle to sets of results.
   # Picklemagic Scan
-  picklemagic_results = safer_pickle.picklemagic_scan(pickle_bytes)
+  picklemagic_results = saferpickle.picklemagic_scan(pickle_bytes)
 
   safe_results.update(picklemagic_results.safe_results)
   unsafe_results.update(picklemagic_results.unsafe_results)
@@ -72,7 +72,7 @@ def security_scan_with_justifications(
   unknown_results.update(picklemagic_results.unknown_results)
 
   # Genops Scan
-  genops_results = safer_pickle.genops_scan(
+  genops_results = saferpickle.genops_scan(
       pickle_bytes, pickle_file_path=file_path
   )
   safe_results.update(genops_results.safe_results)
@@ -97,7 +97,7 @@ def security_scan_with_justifications(
       num_unsafe,
       num_suspicious,
       _,  # The unknown_score is not used for classification, only reporting
-  ) = safer_pickle.score_results(
+  ) = saferpickle.score_results(
       final_safe_results,
       final_unsafe_results,
       final_suspicious_results,
@@ -105,7 +105,7 @@ def security_scan_with_justifications(
   )
 
   # Check for safety and return the results with justifications.
-  if safer_pickle.is_unsafe(num_safe, num_unsafe, num_suspicious):
+  if saferpickle.is_unsafe(num_safe, num_unsafe, num_suspicious):
     if num_unsafe > num_suspicious:
       classification = "unsafe"
       all_results = []
