@@ -319,3 +319,6 @@ WORKER_TIERS = [
 # Cap the number of workers at half the available CPU cores to avoid excessive
 # overhead and resource contention.
 MAX_NUM_CHUNKS = (os.cpu_count() or 1) // 2
+
+# High score to indicate definite unsafety due to a detected zip slip.
+HIGH_SEVERITY_ZIPSLIP = 1337
