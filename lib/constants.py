@@ -115,6 +115,7 @@ UNSAFE_STRINGS: FrozenSet[str] = frozenset([
     "load_module",
     "loads",
     "lzma.open",
+    "malicious",
     "marshal",
     "msvcrt",
     "open",
