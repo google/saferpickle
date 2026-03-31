@@ -20,6 +20,7 @@ import enum
 import functools
 import gzip
 import importlib
+import importlib.util
 import inspect
 import io
 import lzma
@@ -336,18 +337,16 @@ def get_module_members(module_name: str) -> Set[str] | None:
       return None
     return {member for member, _ in inspect.getmembers(imported_module)}
 
-  spec = importlib.util.find_spec(module_name)
-  if not spec:
+  if (spec := importlib.util.find_spec(module_name)) is None:
+    return None
+  if (origin := spec.origin) is None:
     return None
 
-  if not os.path.exists(spec.origin):
+  try:
+    with open(origin, "r") as f:
+      tree = ast.parse(f.read(), filename=origin)
+  except (IOError, ValueError, SyntaxError, RecursionError):
     return None
-
-  with open(spec.origin, "r") as f:
-    try:
-      tree = ast.parse(f.read(), filename=spec.origin)
-    except (ValueError, SyntaxError):
-      return None
 
   members = set()
   # This generates the list of methods and classes in the module from
