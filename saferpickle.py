@@ -36,13 +36,12 @@ import zipfile
 
 from absl import logging
 from third_party.corrupy import picklemagic
-
-import multiprocessing
 from lib import config
 from lib import constants
 from lib import exceptions
 from lib import utils
 
+import multiprocessing
 
 IllegalArgumentCombinationError = exceptions.IllegalArgumentCombinationError
 StrictCheckError = exceptions.StrictCheckError
