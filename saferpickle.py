@@ -236,14 +236,17 @@ def _process_chunk_for_generate_ops(
   try:
     if is_shared_memory:
       shm = shared_memory.SharedMemory(name=pickle_data_source)
-      # Use BytesIO on the memoryview for compatibility with
-      # _custom_chunked_genops
-      data_view = shm.buf
-      with io.BytesIO(data_view) as f:
-        for _, operand in _custom_chunked_genops(f, chunk_range):
-          if operand is None:
-            continue
-          chunked_operands.add(str(operand))
+      try:
+        # Use BytesIO on the memoryview for compatibility with
+        # _custom_chunked_genops
+        data_view = shm.buf
+        with io.BytesIO(data_view) as f:
+          for _, operand in _custom_chunked_genops(f, chunk_range):
+            if operand is None:
+              continue
+            chunked_operands.add(str(operand))
+      finally:
+        shm.close()
     else:
       with open(pickle_data_source, "rb") as f:
         f.seek(chunk_range[0])
@@ -508,10 +511,10 @@ def categorize_strings(
                 suspicious_results.add(argument_find)
                 found_match = True
 
-              if not found_match and re.search(
-                  utils.unknown_pattern, argument_find
-              ):
-                unknown_results.add(argument_find)
+            if not found_match and re.search(
+                utils.unknown_pattern, argument_find
+            ):
+              unknown_results.add(argument_find)
 
   else:
     for line in filtered_output:
@@ -827,7 +830,6 @@ def apply_approach(
   return scores
 
 
-@functools.lru_cache(maxsize=None)
 def security_scan(
     pickle_bytes: bytes,
     force_scan: bool = False,
@@ -996,7 +998,7 @@ def _security_scan_internal(
       shm = shared_memory.SharedMemory(create=True, size=len(pickle_bytes))
       shm_name = shm.name
       shm.buf[: len(pickle_bytes)] = pickle_bytes
-    except Exception:  # pylint: disable=broad-except
+    except OSError:
       # Fallback to tempfile if shared memory fails
       with tempfile.NamedTemporaryFile(delete=False) as temp_file:
         pickle_file_path = temp_file.name
