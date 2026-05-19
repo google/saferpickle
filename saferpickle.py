@@ -36,13 +36,12 @@ import zipfile
 
 from absl import logging
 from third_party.corrupy import picklemagic
-
-import multiprocessing
 from lib import config
 from lib import constants
 from lib import exceptions
 from lib import utils
 
+import multiprocessing
 
 IllegalArgumentCombinationError = exceptions.IllegalArgumentCombinationError
 StrictCheckError = exceptions.StrictCheckError
@@ -1149,7 +1148,11 @@ def _scan_and_load(
       logging.exception("Module was not found: %s", exc, exc_info=True)
     else:
       logging.exception("Unknown error during load: %s", exc, exc_info=True)
-    return
+
+    # It is assumed that the file is safe and any errors that occur
+    # are due to lacking imports/attributes for access. We return an empty
+    # byte if errors occur on loading a safe file normally with load_func
+    return b""
 
 
 def hook_pickle(
