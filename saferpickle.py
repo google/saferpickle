@@ -1136,19 +1136,12 @@ def _scan_and_load(
   try:
     return load_func(*load_args, *args, **kwargs)
   except (AttributeError, pickle.UnpicklingError, ModuleNotFoundError) as exc:
-    if "persistent load" in str(exc):
-      logging.info("Persistent load error: %s", exc)
-    elif "Can't get attribute" in str(exc):
-      logging.exception(
-          "Could not load an absent class: %s", exc, exc_info=True
-      )
-    elif "underflow" in str(exc):
-      logging.exception("Unpickling underflow error: %s", exc, exc_info=True)
-    elif "No module named" in str(exc):
-      logging.exception("Module was not found: %s", exc, exc_info=True)
-    else:
-      logging.exception("Unknown error during load: %s", exc, exc_info=True)
-    return
+    logging.debug(
+        "Safe pickle failed to load due to environmental constraints: %s",
+        exc,
+        exc_info=True,
+    )
+    raise
 
 
 def hook_pickle(
