@@ -1032,24 +1032,11 @@ def _report_or_raise(
 ):
   """Reports or raises an error based on classification and report_only flag."""
 
-  # This attempts to catch external exceptions raised by libraries
-  # using SaferPickle and re-raise them to maintain the original failures for
-  # unit tests.
-  exc_info = sys.exc_info()
-  external_exception_caught = (
-      exc_info[0] is not None and exc_info[1] is not None
-  )
-
   if report_only:
     logging_function = logging.info if log_info else logging.error
     logging_function(
         constants.ERROR_STRING.substitute(classification=classification.value)
     )
-    if external_exception_caught:
-      # Re-raise the exception that was active when _report_or_raise was called.
-      if exc_info[2] is not None:
-        raise exc_info[1].with_traceback(exc_info[2])
-      raise exc_info[1]
     return
   raise UnsafePickleDetectedError(
       constants.ERROR_STRING.substitute(classification=classification.value)
@@ -1137,7 +1124,13 @@ def _scan_and_load(
   # Load the pickle if report_only is True and no exceptions were raised earlier
   try:
     return load_func(*load_args, *args, **kwargs)
-  except (AttributeError, pickle.UnpicklingError, ModuleNotFoundError) as exc:
+  except (
+      AttributeError,
+      pickle.UnpicklingError,
+      ModuleNotFoundError,
+      EOFError,
+      ImportError,
+  ) as exc:
     logging.debug(
         "Safe pickle failed to load due to environmental constraints: %s",
         exc,
