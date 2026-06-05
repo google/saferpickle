@@ -2,6 +2,7 @@
 
 # This module provides tools for safely analyizing pickle files programmatically
 
+import logging
 import sys
 
 PY3 = sys.version_info >= (3, 0)
@@ -14,7 +15,7 @@ import struct
 try:
   # only available (and needed) from 3.4 onwards.
   from importlib.machinery import ModuleSpec
-except:
+except ImportError:
   pass
 
 
@@ -22,6 +23,9 @@ if PY3:
   from io import BytesIO as StringIO
 else:
   from cStringIO import StringIO
+
+logger = logging.getLogger("corrupy.picklemagic")
+logger.propagate = True
 
 __all__ = [
     "load",
@@ -135,14 +139,45 @@ class FakeClassType(type):
     )
 
 
+def _fake_class_getattr(self, name):
+  logger.info(
+      "FakeClass.__getattr__ called on %s with name=%s", self.__class__, name
+  )
+  return FakeClassType(
+      name,
+      (type(self),),
+      {},
+      module=f"{self.__class__.__module__}.{self.__class__.__name__}"
+      if self.__class__.__name__ != "FakeClass"
+      else self.__class__.__module__,
+  )()
+
+
+def _fake_class_call(self, *args, **kwargs):
+  logger.warning(
+      "FakeClass method %s called on %s with args=%s, kwargs=%s",
+      self.__class__.__name__,
+      self.__class__.__bases__[0] if self.__class__.__bases__ else "unknown",
+      args,
+      kwargs,
+  )
+  return self
+
+
 # PY2 doesn't like the PY3 way of metaclasses and PY3 doesn't support the PY2 way
 # so we call the metaclass directly
 FakeClass = FakeClassType(
     "FakeClass",
     (),
-    {"__doc__": """
+    {
+        "__doc__": (
+            """
 A barebones instance of :class:`FakeClassType`. Inherit from this to create fake classes.
-"""},
+"""
+        ),
+        "__getattr__": _fake_class_getattr,
+        "__call__": _fake_class_call,
+    },
     module=__name__,
 )
 
@@ -190,10 +225,11 @@ class FakeWarning(FakeClass, object):
   def __new__(cls, *args, **kwargs):
     self = FakeClass.__new__(cls)
     if args or kwargs:
-      print(
-          "{0} was instantiated with unexpected arguments {1}, {2}".format(
-              cls, args, kwargs
-          )
+      logger.warning(
+          "FakeWarning.__new__ called on %s with args=%s, kwargs=%s",
+          cls,
+          args,
+          kwargs,
       )
       self._new_args = args
     return self
@@ -212,10 +248,10 @@ class FakeWarning(FakeClass, object):
     if state:
       # Don't have to check for slotstate here since it's either None or a dict
       if not isinstance(state, dict):
-        print(
-            "{0}.__setstate__() got unexpected arguments {1}".format(
-                self.__class__, state
-            )
+        logger.warning(
+            "FakeWarning.__setstate__ called on %s with unexpected state=%s",
+            self.__class__,
+            state,
         )
         self._setstate_args = state
       else:
@@ -414,6 +450,12 @@ class FakeModule(types.ModuleType):
         self.__dict__[i]._remove()
         del self.__dict__[i]
     del sys.modules[self.__name__]
+
+  def __getattr__(self, name):
+    logger.info(
+        "FakeModule.__getattr__ called on %s with name=%s", self.__name__, name
+    )
+    return FakeClassType(name, (FakeClass,), {}, module=self.__name__)()
 
   def __eq__(self, other):
     if not hasattr(other, "__name__"):
@@ -657,8 +699,20 @@ class SafeUnpickler(FakeUnpickler):
     self.use_copyreg = use_copyreg
     self.has_blocked_unsafe_build_instr = False
 
-    # Hook the BUILD opcode to our custom method.
+    # Hook the opcodes to our custom methods.
     self.dispatch[pickle.BUILD[0]] = self.load_build
+    self.dispatch[pickle.REDUCE[0]] = self.load_reduce
+    if hasattr(pickle, "INST"):
+      self.dispatch[pickle.INST[0]] = self.load_inst
+    if hasattr(pickle, "OBJ"):
+      self.dispatch[pickle.OBJ[0]] = self.load_obj
+    if hasattr(pickle, "NEWOBJ"):
+      self.dispatch[pickle.NEWOBJ[0]] = self.load_newobj
+    if hasattr(pickle, "NEWOBJ_EX"):
+      self.dispatch[pickle.NEWOBJ_EX[0]] = self.load_newobj_ex
+    self.dispatch[pickle.GLOBAL[0]] = self.load_global
+    if hasattr(pickle, "STACK_GLOBAL"):
+      self.dispatch[pickle.STACK_GLOBAL[0]] = self.load_stack_global
 
   def find_class(self, module, name):
     # __main__ can be manipulated so it's
@@ -666,19 +720,50 @@ class SafeUnpickler(FakeUnpickler):
     if module == "__main__":
       return self.class_factory(name, module)
 
-    if (
-        module in self.unsafe_modules
-        or f"{module}.{name}" in self.unsafe_modules
-    ):
-      print(f"Warning: {module}.{name} is unsafe")
+    # Support submodule prefix matching for unsafe modules
+    is_unsafe_mod = module in self.unsafe_modules or any(
+        module.startswith(unsafe + ".") for unsafe in self.unsafe_modules
+    )
+    if is_unsafe_mod or f"{module}.{name}" in self.unsafe_modules:
+      logger.warning("Unsafe module/class invoked: %s.%s", module, name)
 
-    if module in self.safe_modules:
-      if not sys.modules.get(module):
+    # Support submodule prefix matching for safe modules AND exact fully qualified class matches
+    is_safe_mod = module in self.safe_modules or any(
+        module.startswith(safe + ".") for safe in self.safe_modules
+    )
+    is_safe_class = f"{module}.{name}" in self.safe_modules
+
+    if not is_safe_mod and not is_safe_class and not sys.modules.get(module):
+      try:
+        __import__(module)
+      except Exception:
+        logger.warning("Unknown module/class imported: %s", module)
+
+    if is_safe_mod or is_safe_class:
+      # Resolve base safe module name to check sys.modules
+      base_safe_mod = module
+      if not is_safe_class and module not in self.safe_modules:
+        for safe in self.safe_modules:
+          if module.startswith(safe + "."):
+            base_safe_mod = safe
+            break
+
+      if not sys.modules.get(base_safe_mod):
         return self.class_factory(name, module)
-      mod = sys.modules[module]
-      if not hasattr(mod, "__all__") or name in mod.__all__:
-        klass = getattr(mod, name)
-        return klass
+
+      # Try to import the actual submodule dynamically
+      try:
+        mod = sys.modules.get(module)
+        if not mod:
+          __import__(module)
+          mod = sys.modules[module]
+      except Exception:
+        return self.class_factory(name, module)
+
+      if not hasattr(mod, "__all__") or name in mod.__all__ or is_safe_class:
+        klass = getattr(mod, name, None)
+        if klass is not None:
+          return klass
 
     return self.class_factory(name, module)
 
@@ -688,21 +773,43 @@ class SafeUnpickler(FakeUnpickler):
     else:
       return self.class_factory("extension_code_{0}".format(code), "copyreg")
 
-  def _state_contains_fake_class(self, obj):
+  def _state_contains_fake_class(self, obj, visited=None):
     """Recursively check if an object or its contents are FakeClass instances."""
+    if visited is None:
+      visited = set()
+    obj_id = id(obj)
+    if obj_id in visited:
+      return False
+    visited.add(obj_id)
+
     if isinstance(obj, FakeClass):
       return True
     if isinstance(obj, (list, tuple, set)):
-      return any(self._state_contains_fake_class(item) for item in obj)
+      return any(self._state_contains_fake_class(item, visited) for item in obj)
     if isinstance(obj, dict):
       return any(
-          self._state_contains_fake_class(k)
-          or self._state_contains_fake_class(v)
+          self._state_contains_fake_class(k, visited)
+          or self._state_contains_fake_class(v, visited)
           for k, v in obj.items()
       )
+    if hasattr(obj, "__dict__"):
+      if any(
+          self._state_contains_fake_class(k, visited)
+          or self._state_contains_fake_class(v, visited)
+          for k, v in obj.__dict__.items()
+      ):
+        return True
+    if hasattr(obj, "__slots__"):
+      slots = obj.__slots__
+      if isinstance(slots, str):
+        slots = [slots]
+      for slot in slots:
+        if hasattr(obj, slot):
+          if self._state_contains_fake_class(getattr(obj, slot), visited):
+            return True
     return False
 
-  def load_build(self):
+  def load_build(self, *unused_args):
     """Custom handler for the BUILD opcode to prevent setting state of
     a real object with a fake object (potentially dangerous).
     """
@@ -720,7 +827,95 @@ class SafeUnpickler(FakeUnpickler):
       # Return to prevent inst.__setstate__(state) from being called.
       return
 
-    inst.__setstate__(state)
+    try:
+      inst.__setstate__(state)
+    except AttributeError:
+      logger.warning(
+          "Attribute __setstate__ is not available for object %s", type(inst)
+      )
+      # Standard pickle fallback: if __setstate__ is not defined,
+      # and state is a dict, update __dict__.
+      if isinstance(state, dict):
+        logger.info("Updating __dict__ of %s with state", type(inst))
+        inst.__dict__.update(state)
+      else:
+        logger.warning(
+            "Cannot update __dict__ of %s with non-dict state of type %s",
+            type(inst),
+            type(state),
+        )
+    except Exception as e:
+      logger.warning("Failed to set state on %s: %s", type(inst), e)
+      logger.info("Proceeding after state failure on %s", type(inst))
+
+  def load_reduce(self, *unused_args):
+    stack = self.stack
+    args = stack.pop()
+    func = stack[-1]
+    try:
+      stack[-1] = func(*args)
+    except Exception as e:
+      logger.warning("Failed to reduce %s with %s: %s", func, args, e)
+      stack[-1] = self.class_factory("failed_reduce", "picklemagic")()
+
+  def load_inst(self, *unused_args):
+    module = self.readline()[:-1].decode("ascii")
+    name = self.readline()[:-1].decode("ascii")
+    klass = self.find_class(module, name)
+    self._instantiate(klass, self.pop_mark())
+
+  def load_obj(self, *unused_args):
+    mark = self.pop_mark()
+    klass = mark.pop(0)
+    self._instantiate(klass, mark)
+
+  def load_newobj(self, *unused_args):
+    args = self.stack.pop()
+    cls = self.stack.pop()
+    try:
+      obj = cls.__new__(cls, *args)
+    except Exception as e:
+      logger.warning("Failed to newobj %s with %s: %s", cls, args, e)
+      obj = self.class_factory("failed_newobj", "picklemagic")()
+    self.stack.append(obj)
+
+  def load_newobj_ex(self, *unused_args):
+    kwargs = self.stack.pop()
+    args = self.stack.pop()
+    cls = self.stack.pop()
+    try:
+      obj = cls.__new__(cls, *args, **kwargs)
+    except Exception as e:
+      logger.warning(
+          "Failed to newobj_ex %s with %s, %s: %s", cls, args, kwargs, e
+      )
+      obj = self.class_factory("failed_newobj_ex", "picklemagic")()
+    self.stack.append(obj)
+
+  def _instantiate(self, klass, args):
+    """Internal helper to instantiate a class and append to stack."""
+    try:
+      value = klass(*args)
+    except Exception as e:
+      logger.warning("Failed to instantiate %s with %s: %s", klass, args, e)
+      value = self.class_factory("failed_instantiate", "picklemagic")()
+    self.stack.append(value)
+
+  def load_global(self, *args):
+    module = self.readline()[:-1].decode("utf-8")
+    name = self.readline()[:-1].decode("utf-8")
+    klass = self.find_class(module, name)
+    self.stack.append(klass)
+
+  def load_stack_global(self, *args):
+    name = self.stack.pop()
+    module = self.stack.pop()
+    if isinstance(name, bytes):
+      name = name.decode("utf-8")
+    if isinstance(module, bytes):
+      module = module.decode("utf-8")
+    klass = self.find_class(module, name)
+    self.stack.append(klass)
 
 
 class SafePickler(pickle.Pickler if PY2 else pickle._Pickler):

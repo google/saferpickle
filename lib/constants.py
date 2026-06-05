@@ -304,7 +304,7 @@ OPCODES_INFO_INT = immutabledict.immutabledict(
 
 MAX_BYTES_TO_CHECK = 128
 MIN_SIZE_FOR_CHUNKING = 30 * 1024 * 1024  # 30 MB
-CHUNK_OVERLAP = 16  # Bytes to overlap between chunks
+CHUNK_OVERLAP = 512  # Bytes to overlap between chunks
 
 # Tiers for dynamically scaling the number of workers based on file size.
 # Each tuple is (file_size_threshold, num_workers). The threshold is the upper
