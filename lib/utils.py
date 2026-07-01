@@ -35,6 +35,7 @@ from typing import FrozenSet, Set
 import zipfile
 
 from absl import logging
+from lib import config
 from lib import constants
 
 
@@ -399,6 +400,19 @@ def classify_class_name(class_name: str) -> Classification | None:
   if re.search(unknown_pattern, class_name):
     return Classification.UNKNOWN
   return None
+
+
+def is_unsafe_or_suspicious(class_name: str) -> bool:
+  allow_list = config.get_allow_list()
+  if any(
+      allowed_item.startswith(class_name)
+      or class_name.startswith(allowed_item)
+      or allowed_item.endswith(f".{class_name}")
+      for allowed_item in allow_list
+  ):
+    return False
+  classification = classify_class_name(class_name)
+  return classification == Classification.UNSAFE
 
 
 def resolve_library_modules_from_results(

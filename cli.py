@@ -73,7 +73,7 @@ def security_scan_with_justifications(
 
   # Genops Scan
   genops_results = saferpickle.genops_scan(
-      pickle_bytes, pickle_file_path=file_path
+      pickle_bytes, pickle_file_path=file_path, fail_fast=False
   )
   safe_results.update(genops_results.safe_results)
   unsafe_results.update(genops_results.unsafe_results)
