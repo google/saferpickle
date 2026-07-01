@@ -31,7 +31,7 @@ import subprocess
 import sys
 import tarfile
 import types
-from typing import FrozenSet, Set
+from typing import BinaryIO, FrozenSet, Generator, IO, Set, Tuple, cast
 import zipfile
 
 from absl import logging
@@ -154,6 +154,34 @@ def copy_module(original_name: str, new_name: str) -> types.ModuleType | None:
   return new_module
 
 
+def _peek_bytes(file_bytes: bytes | BinaryIO, size: int) -> bytes:
+  """Peeks at the first `size` bytes of a bytes object or file stream."""
+  if isinstance(file_bytes, bytes):
+    return file_bytes[:size]
+
+  try:
+    is_seekable = file_bytes.seekable()
+  except (AttributeError, ValueError):
+    is_seekable = False
+
+  if is_seekable:
+    try:
+      current_pos = file_bytes.tell()
+      peeked = file_bytes.read(size)
+      file_bytes.seek(current_pos)
+      return peeked
+    except (OSError, io.UnsupportedOperation):
+      pass
+
+  if hasattr(file_bytes, "peek"):
+    try:
+      return file_bytes.peek(size)[:size]
+    except (OSError, io.UnsupportedOperation, AttributeError):
+      pass
+
+  return b""
+
+
 def is_zip_bytes(file_bytes: bytes) -> bool:
   """Checks if the provided bytes represent a zip file.
 
@@ -189,57 +217,68 @@ def extract_zip_contents(file_bytes: bytes) -> list[tuple[str, bytes]]:
   return contents
 
 
-def is_bz2_bytes(file_bytes: bytes) -> bool:
+def is_bz2_bytes(file_bytes: bytes | BinaryIO) -> bool:
   """Checks if the provided bytes represent a bz2 file."""
-  return file_bytes.startswith(b"\x42\x5a\x68")
+  return _peek_bytes(file_bytes, 3).startswith(b"\x42\x5a\x68")
 
 
-def extract_bz2_contents(file_bytes: bytes) -> bytes:
-  """Extracts contents from bz2 bytes."""
-  return bz2.decompress(file_bytes)
+def extract_bz2_contents(file_bytes: bytes | BinaryIO) -> IO[bytes]:
+  """Extracts contents from bz2 bytes/stream as a stream."""
+  stream = (
+      io.BytesIO(file_bytes) if isinstance(file_bytes, bytes) else file_bytes
+  )
+  return bz2.open(stream)
 
 
-def is_lzma_bytes(file_bytes: bytes) -> bool:
+def is_lzma_bytes(file_bytes: bytes | BinaryIO) -> bool:
   """Checks if the provided bytes represent an lzma file."""
-  return file_bytes.startswith(b"\xfd\x37\x7a\x58\x5a\x00")
+  return _peek_bytes(file_bytes, 6).startswith(b"\xfd\x37\x7a\x58\x5a\x00")
 
 
-def extract_lzma_contents(file_bytes: bytes) -> bytes:
-  """Extracts contents from lzma bytes."""
-  return lzma.decompress(file_bytes)
+def extract_lzma_contents(file_bytes: bytes | BinaryIO) -> IO[bytes]:
+  """Extracts contents from lzma bytes/stream as a stream."""
+  stream = (
+      io.BytesIO(file_bytes) if isinstance(file_bytes, bytes) else file_bytes
+  )
+  return lzma.open(stream)
 
 
-def is_gzip_bytes(file_bytes: bytes) -> bool:
+def is_gzip_bytes(file_bytes: bytes | BinaryIO) -> bool:
   """Checks if the provided bytes represent a gzip file."""
-  return file_bytes.startswith(b"\x1f\x8b")
+  return _peek_bytes(file_bytes, 2).startswith(b"\x1f\x8b")
 
 
-def extract_gzip_contents(file_bytes: bytes) -> bytes:
-  """Extracts contents from gzip bytes."""
-  return gzip.decompress(file_bytes)
+def extract_gzip_contents(file_bytes: bytes | IO[bytes]) -> IO[bytes]:
+  """Extracts contents from gzip bytes/stream as a stream."""
+  stream = (
+      io.BytesIO(file_bytes) if isinstance(file_bytes, bytes) else file_bytes
+  )
+  return cast(IO[bytes], gzip.open(stream))
 
 
-def is_tar_bytes(file_bytes: bytes) -> bool:
+def is_tar_bytes(file_bytes: bytes | BinaryIO) -> bool:
   """Checks if the provided bytes represent a tar file."""
-  return len(file_bytes) > 262 and file_bytes[257:262] == b"ustar"
+  peeked = _peek_bytes(file_bytes, 262)
+  return len(peeked) >= 262 and peeked[257:262] == b"ustar"
 
 
-def extract_tar_contents(file_bytes: bytes) -> list[tuple[str, bytes]]:
-  """Extracts contents from tar bytes."""
-  contents = []
-  with tarfile.open(fileobj=io.BytesIO(file_bytes)) as tf:
+def extract_tar_contents(
+    file_bytes: bytes | BinaryIO,
+) -> Generator[Tuple[str, IO[bytes]], None, None]:
+  """Extracts contents from tar bytes/stream."""
+  stream = (
+      io.BytesIO(file_bytes) if isinstance(file_bytes, bytes) else file_bytes
+  )
+  with tarfile.open(fileobj=stream, mode="r:*") as tf:
     for member in tf.getmembers():
-      if ".." in member.name or member.name.startswith("/"):
-        # For now, just extract and let the caller handle this
-        pass
-      f = tf.extractfile(member)
-      if f:
-        contents.append((member.name, f.read()))
-  return contents
+      if member.isfile():
+        f = tf.extractfile(member)
+        if f is not None:
+          yield member.name, cast(IO[bytes], f)
 
 
 def is_pickle_file(
-    pickle_bytes: bytes | io.BytesIO, return_num_bytes_read: bool = False
+    pickle_bytes: bytes | IO[bytes], return_num_bytes_read: bool = False
 ) -> bool | tuple[bool, int]:
   """Checks if the provided bytes represent a valid pickle file.
 
@@ -249,7 +288,7 @@ def is_pickle_file(
   Do note that this is not foolproof and false positives are possible.
 
   Args:
-      pickle_bytes: The bytes to check.
+      pickle_bytes: The bytes or stream to check.
       return_num_bytes_read: If True, returns a tuple containing a boolean
         indicating if the file is a valid pickle file and the number of bytes
         read. Otherwise, it returns only the boolean.
@@ -264,13 +303,36 @@ def is_pickle_file(
         - True if the input is likely a valid pickle file.
         - False if the input is not a valid pickle file.
   """
+  original_pos = None
+  is_seekable = True
   if isinstance(pickle_bytes, bytes):
     raw_bytes = pickle_bytes
-    pickle_bytes = io.BytesIO(pickle_bytes)
+    pickle_stream = io.BytesIO(pickle_bytes)
   else:
-    raw_bytes = pickle_bytes.getvalue()
+    try:
+      original_pos = pickle_bytes.tell()
+    except (OSError, io.UnsupportedOperation, AttributeError):
+      is_seekable = False
 
-  pickle_file_is_ascii = pickle_bytes.getvalue().isascii()
+    if is_seekable:
+      # Read a chunk to check text-based and non-pickle-magic prefixes safely
+      raw_bytes = pickle_bytes.read(1024)
+      pickle_bytes.seek(original_pos)
+      pickle_stream = pickle_bytes
+    else:
+      # Fallback for non-seekable stream: try to peek without advancing pointer
+      if hasattr(pickle_bytes, "peek"):
+        try:
+          raw_bytes = pickle_bytes.peek(1024)
+          pickle_stream = pickle_bytes
+        except (OSError, io.UnsupportedOperation):
+          raw_bytes = pickle_bytes.read(1024)
+          pickle_stream = io.BytesIO(raw_bytes)
+      else:
+        raw_bytes = pickle_bytes.read(1024)
+        pickle_stream = io.BytesIO(raw_bytes)
+
+  pickle_file_is_ascii = raw_bytes.isascii()
 
   if pickle_file_is_ascii:
     stripped_bytes = raw_bytes.lstrip()
@@ -287,31 +349,35 @@ def is_pickle_file(
     return False
 
   num_of_bytes_read = 0
-  while True:
-    charcode = pickle_bytes.read(1)
+  try:
+    while True:
+      charcode = pickle_stream.read(1)
 
-    num_of_bytes_read += 1
-    if num_of_bytes_read > constants.MAX_BYTES_TO_CHECK:
-      if return_num_bytes_read:
-        return (True, num_of_bytes_read)
-      return True
-
-    opcode = constants.OPCODES_INFO.get(charcode.decode("latin-1"))
-    if opcode is None:
-      if not charcode:  # Indicates exhaustion of the data stream
+      num_of_bytes_read += 1
+      if num_of_bytes_read > constants.MAX_BYTES_TO_CHECK:
         if return_num_bytes_read:
           return (True, num_of_bytes_read)
         return True
-      continue
 
-    if opcode.arg is None:
-      continue
-    try:
-      _ = opcode.arg.reader(pickle_bytes)
-    except (ValueError, TypeError, IndexError):
-      if return_num_bytes_read:
-        return (False, num_of_bytes_read)
-      return False
+      opcode = constants.OPCODES_INFO.get(charcode.decode("latin-1"))
+      if opcode is None:
+        if not charcode:  # Indicates exhaustion of the data stream
+          if return_num_bytes_read:
+            return (True, num_of_bytes_read)
+          return True
+        continue
+
+      if opcode.arg is None:
+        continue
+      try:
+        _ = opcode.arg.reader(pickle_stream)
+      except (ValueError, TypeError, IndexError):
+        if return_num_bytes_read:
+          return (False, num_of_bytes_read)
+        return False
+  finally:
+    if original_pos is not None:
+      pickle_stream.seek(original_pos)
 
 
 @functools.lru_cache(maxsize=None)
