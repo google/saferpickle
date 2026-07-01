@@ -279,7 +279,9 @@ def extract_tar_contents(
 
 
 def is_pickle_file(
-    pickle_bytes: bytes | IO[bytes], return_num_bytes_read: bool = False
+    pickle_bytes: bytes | IO[bytes],
+    return_num_bytes_read: bool = False,
+    check_magic_bytes: bool = True,
 ) -> bool | tuple[bool, int]:
   """Checks if the provided bytes represent a valid pickle file.
 
@@ -293,6 +295,8 @@ def is_pickle_file(
       return_num_bytes_read: If True, returns a tuple containing a boolean
         indicating if the file is a valid pickle file and the number of bytes
         read. Otherwise, it returns only the boolean.
+      check_magic_bytes: If True, checks for text-based or archive magic bytes
+        to fast-path reject files that are not pickles.
 
   Returns:
       If `return_num_bytes_read` is True:
@@ -333,52 +337,91 @@ def is_pickle_file(
         raw_bytes = pickle_bytes.read(1024)
         pickle_stream = io.BytesIO(raw_bytes)
 
-  pickle_file_is_ascii = raw_bytes.isascii()
-
-  if pickle_file_is_ascii:
-    stripped_bytes = raw_bytes.lstrip()
-    if stripped_bytes.startswith(
-        constants.TEXT_BASED_PREFIXES
-    ) or stripped_bytes.startswith(constants.CODE_KEYWORDS):
+  if raw_bytes:
+    first_byte = raw_bytes[0]
+    if first_byte not in constants.OPCODES_INFO_INT:
       if return_num_bytes_read:
         return (False, 0)
       return False
 
-  if raw_bytes.startswith(constants.NON_PICKLE_MAGIC_BYTES):
-    if return_num_bytes_read:
-      return (False, 0)
-    return False
+  if check_magic_bytes:
+    pickle_file_is_ascii = raw_bytes.isascii()
 
-  num_of_bytes_read = 0
+    if pickle_file_is_ascii:
+      stripped_bytes = raw_bytes.lstrip()
+      if stripped_bytes.startswith(
+          constants.TEXT_BASED_PREFIXES
+      ) or stripped_bytes.startswith(constants.CODE_KEYWORDS):
+        if return_num_bytes_read:
+          return (False, 0)
+        return False
+
+    if raw_bytes.startswith(constants.NON_PICKLE_MAGIC_BYTES):
+      if raw_bytes[0] not in constants.OPCODES_INFO_INT:
+        if return_num_bytes_read:
+          return (False, 0)
+        return False
+
+  valid_opcodes_count = 0
   try:
     while True:
       charcode = pickle_stream.read(1)
-
-      num_of_bytes_read += 1
-      if num_of_bytes_read > constants.MAX_BYTES_TO_CHECK:
+      if not charcode:  # EOF reached without STOP
+        is_suspected_pickle = valid_opcodes_count >= 3
         if return_num_bytes_read:
-          return (True, num_of_bytes_read)
+          return (is_suspected_pickle, valid_opcodes_count)
+        return is_suspected_pickle
+
+      decoded_char = charcode.decode("latin-1")
+      if decoded_char == ".":  # STOP opcode found
+        valid_opcodes_count += 1
+        if return_num_bytes_read:
+          return (True, valid_opcodes_count)
         return True
 
-      opcode = constants.OPCODES_INFO.get(charcode.decode("latin-1"))
-      if opcode is None:
-        if not charcode:  # Indicates exhaustion of the data stream
-          if return_num_bytes_read:
-            return (True, num_of_bytes_read)
-          return True
-        continue
+      opcode = constants.OPCODES_INFO.get(decoded_char)
+      if opcode is None:  # Invalid opcode before STOP
+        is_suspected_pickle = valid_opcodes_count >= 3
+        if return_num_bytes_read:
+          return (is_suspected_pickle, valid_opcodes_count)
+        return is_suspected_pickle
+
+      valid_opcodes_count += 1
+      if valid_opcodes_count > constants.MAX_BYTES_TO_CHECK:
+        if return_num_bytes_read:
+          return (True, valid_opcodes_count)
+        return True
 
       if opcode.arg is None:
         continue
       try:
         _ = opcode.arg.reader(pickle_stream)
-      except (ValueError, TypeError, IndexError):
+      except ValueError:
+        is_suspected_pickle = valid_opcodes_count >= 3
         if return_num_bytes_read:
-          return (False, num_of_bytes_read)
-        return False
+          return (is_suspected_pickle, valid_opcodes_count)
+        return is_suspected_pickle
   finally:
     if original_pos is not None:
       pickle_stream.seek(original_pos)
+
+
+def find_pickle_start_offset(pickle_bytes: bytes) -> int:
+  """Finds the start offset of a valid pickle payload in the bytes."""
+  max_search_len = min(len(pickle_bytes), 1024)
+  for offset in range(max_search_len):
+    char = pickle_bytes[offset : offset + 1]
+    if not char:
+      break
+    try:
+      decoded_char = char.decode("latin-1")
+    except UnicodeDecodeError:
+      continue
+    if decoded_char not in constants.OPCODES_INFO:
+      continue
+    if is_pickle_file(pickle_bytes[offset:]):
+      return offset
+  return 0
 
 
 @functools.lru_cache(maxsize=None)
