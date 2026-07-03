@@ -634,7 +634,7 @@ def is_sys_executable_to_path_set(path: str | None) -> bool:
     return True
 
   logging.warning("sys.executable is not set to a valid interpreter.")
-  sys.executable = None
+  sys.executable = None  # pyrefly: ignore[bad-assignment]
   return False
 
 

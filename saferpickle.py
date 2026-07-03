@@ -239,12 +239,12 @@ def _process_chunk_for_generate_ops(
   chunked_operands = set()
   try:
     if is_shared_memory:
-      shm = shared_memory.SharedMemory(name=pickle_data_source)
+      shm = shared_memory.SharedMemory(name=pickle_data_source)  # pyrefly: ignore[bad-argument-type]
       try:
         # Use BytesIO on the memoryview for compatibility with
         # _custom_chunked_genops
         data_view = shm.buf
-        with io.BytesIO(data_view) as f:
+        with io.BytesIO(data_view) as f:  # pyrefly: ignore[bad-argument-type]
           for _, operand in _custom_chunked_genops(f, chunk_range):
             if abort_event and abort_event.is_set():
               break
@@ -300,15 +300,15 @@ def generate_ops_from_file(
     strings.
   """
   filtered_operands = set()
-  num_workers = utils.get_optimal_workers(pickle_length)
+  num_workers = utils.get_optimal_workers(pickle_length)  # pyrefly: ignore[bad-argument-type]
 
   if (
-      pickle_length < constants.MIN_SIZE_FOR_CHUNKING
+      pickle_length < constants.MIN_SIZE_FOR_CHUNKING  # pyrefly: ignore[unsupported-operation]
       or not utils.is_sys_executable_patched()
   ):
     if shm_name:
       shm = shared_memory.SharedMemory(name=shm_name)
-      pickle_bytes = bytes(shm.buf[:pickle_length])
+      pickle_bytes = bytes(shm.buf[:pickle_length])  # pyrefly: ignore[unsupported-operation]
     else:
       with open(pickle_file_path, "rb") as f:
         pickle_bytes = f.read()
@@ -326,15 +326,15 @@ def generate_ops_from_file(
     return filtered_operands
   else:
     # Divide into constants.MAX_NUM_CHUNKS for larger files
-    chunk_size = math.ceil(pickle_length / num_workers)
+    chunk_size = math.ceil(pickle_length / num_workers)  # pyrefly: ignore[unsupported-operation]
     ranges = []
     for chunk_index in range(num_workers):
       chunk_start_size = chunk_index * chunk_size
       # Extend the chunk end by CHUNK_OVERLAP, but don't exceed pickle_length
-      chunk_end = min(
+      chunk_end = min(  # pyrefly: ignore[bad-specialization]
           chunk_start_size + chunk_size + constants.CHUNK_OVERLAP, pickle_length
       )
-      if chunk_start_size < pickle_length:
+      if chunk_start_size < pickle_length:  # pyrefly: ignore[unsupported-operation]
         ranges.append((chunk_start_size, chunk_end))
       if chunk_end == pickle_length:
         break  # Last chunk reaches the end
@@ -529,7 +529,7 @@ def categorize_strings(
   deny_list = config.get_deny_list()
 
   if use_picklemagic and isinstance(filtered_output, io.StringIO):
-    filtered_output = filtered_output.getvalue().split("\n")
+    filtered_output = filtered_output.getvalue().split("\n")  # pyrefly: ignore[bad-assignment]
     for picklemagic_warning in filtered_output:
       if not picklemagic_warning:
         continue
@@ -1245,7 +1245,7 @@ def _security_scan_internal(
         finally:
           pickle_bytes.seek(current_pos)
       else:
-        shm.buf[:pickle_length] = pickle_bytes
+        shm.buf[:pickle_length] = pickle_bytes  # pyrefly: ignore[unsupported-operation]
     except OSError:
       # Fallback to tempfile with chunked buffering
       with tempfile.NamedTemporaryFile(delete=False) as temp_file:
@@ -1381,10 +1381,10 @@ def _scan_and_load(
     loader_mod = pickle_copy
 
   if is_load:
-    load_func = loader_mod.load
+    load_func = loader_mod.load  # pyrefly: ignore[missing-attribute]
     load_args = (pickle_file,)
   else:
-    load_func = loader_mod.loads
+    load_func = loader_mod.loads  # pyrefly: ignore[missing-attribute]
     load_args = (data_bytes,)
 
   if strict_check and allow_unsafe:
@@ -1641,7 +1641,7 @@ def unhook_pickle() -> None:
 
 
 # To avoid creating __pycache__ files
-sys.dont_write_bytecode: bool = True
+sys.dont_write_bytecode: bool = True  # pyrefly: ignore[bad-assignment]
 
 # Makes copies for the libraries we wish to hook to avoid recursion conflicts
 pickle_copy = utils.copy_module("_pickle", "pickle_copy")
