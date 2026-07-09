@@ -51,7 +51,8 @@ def security_scan_with_justifications(
   if utils.is_zip_bytes(pickle_bytes):
     unzipped_files = utils.extract_zip_contents(pickle_bytes)
     for unzipped_file in unzipped_files:
-      _, file_bytes = unzipped_file
+      _, file_stream = unzipped_file
+      file_bytes = file_stream.read()
 
       if not utils.is_pickle_file(file_bytes) or not file_bytes:
         continue

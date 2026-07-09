@@ -182,39 +182,40 @@ def _peek_bytes(file_bytes: bytes | BinaryIO, size: int) -> bytes:
   return b""
 
 
-def is_zip_bytes(file_bytes: bytes) -> bool:
-  """Checks if the provided bytes represent a zip file.
+def is_zip_bytes(file_bytes: bytes | BinaryIO) -> bool:
+  """Checks if the provided bytes/stream represent a zip file.
 
   Args:
-    file_bytes: The bytes to check.
+    file_bytes: The bytes or stream to check.
 
   Returns:
     True if the input is a zip file, False otherwise.
   """
   if not file_bytes:
     return False
-  try:
-    with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
-      zf.namelist()
-    return True
-  except zipfile.BadZipFile:
-    return False
+  return _peek_bytes(file_bytes, 4).startswith(
+      (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+  )
 
 
-def extract_zip_contents(file_bytes: bytes) -> list[tuple[str, bytes]]:
-  """Extracts the list of files and their contents from a zip file.
+def extract_zip_contents(
+    file_bytes: bytes | BinaryIO,
+) -> Generator[Tuple[str, IO[bytes]], None, None]:
+  """Extracts the list of files and their contents from a zip file/stream.
 
   Args:
-    file_bytes: The bytes of the zip file.
+    file_bytes: The bytes or stream to check.
 
-  Returns:
-    A list of tuples, where each tuple contains the filename and its content.
+  Yields:
+    A tuple containing the file name and its stream.
   """
-  contents = []
-  with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
-    for filename in zf.namelist():
-      contents.append((filename, zf.read(filename)))
-  return contents
+  stream = (
+      io.BytesIO(file_bytes) if isinstance(file_bytes, bytes) else file_bytes
+  )
+  with zipfile.ZipFile(stream) as zf:
+    for name in zf.namelist():
+      with zf.open(name) as f:
+        yield name, f
 
 
 def is_bz2_bytes(file_bytes: bytes | BinaryIO) -> bool:
