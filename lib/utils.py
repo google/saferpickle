@@ -406,11 +406,37 @@ def is_pickle_file(
       pickle_stream.seek(original_pos)
 
 
-def find_pickle_start_offset(pickle_bytes: bytes) -> int:
+def find_pickle_start_offset(pickle_bytes: bytes | IO[bytes]) -> int:
   """Finds the start offset of a valid pickle payload in the bytes."""
-  max_search_len = min(len(pickle_bytes), 1024)
+  if isinstance(pickle_bytes, bytes):
+    max_search_len = min(len(pickle_bytes), 1024)
+    for offset in range(max_search_len):
+      char = pickle_bytes[offset : offset + 1]
+      if not char:
+        break
+      try:
+        decoded_char = char.decode("latin-1")
+      except UnicodeDecodeError:
+        continue
+      if decoded_char not in constants.OPCODES_INFO:
+        continue
+      if is_pickle_file(pickle_bytes[offset:]):
+        return offset
+    return 0
+
+  # It is a stream
+  stream = pickle_bytes
+  try:
+    original_pos = stream.tell()
+    # Read 1024 bytes to find candidates
+    header_bytes = stream.read(1024)
+    stream.seek(original_pos)
+  except (OSError, AttributeError, io.UnsupportedOperation):
+    return 0
+
+  max_search_len = len(header_bytes)
   for offset in range(max_search_len):
-    char = pickle_bytes[offset : offset + 1]
+    char = header_bytes[offset : offset + 1]
     if not char:
       break
     try:
@@ -419,8 +445,20 @@ def find_pickle_start_offset(pickle_bytes: bytes) -> int:
       continue
     if decoded_char not in constants.OPCODES_INFO:
       continue
-    if is_pickle_file(pickle_bytes[offset:]):
-      return offset
+
+    # Verify candidate offset using the stream
+    try:
+      stream.seek(original_pos + offset)
+      if is_pickle_file(stream):
+        return offset
+    except (OSError, AttributeError, io.UnsupportedOperation):
+      pass
+    finally:
+      try:
+        stream.seek(original_pos)
+      except (OSError, AttributeError, io.UnsupportedOperation):
+        pass  # If we can't seek back, it poses an issue
+
   return 0
 
 

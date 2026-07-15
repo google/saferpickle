@@ -845,10 +845,11 @@ def picklemagic_scan(
 
 
 def genops_scan(
-    pickle_bytes: bytes,
+    pickle_bytes: bytes | IO[bytes],
     pickle_file_path: Optional[str] = None,
     shm_name: Optional[str] = None,
     fail_fast: Optional[bool] = DEFAULT_FAIL_FAST,
+    pickle_length: Optional[int] = None,
 ) -> ScanResults:
   """Genops scan for malicious content in pickle files.
 
@@ -857,20 +858,26 @@ def genops_scan(
     pickle_file_path: Optional path to the pickle file for streaming scan.
     shm_name: Optional name of the shared memory block.
     fail_fast: Whether to fail fast on first unsafe or suspicious match.
+    pickle_length: Optional length of the pickle data.
 
   Returns:
     A ScanResults object.
   """
+  resolved_pickle_length = (
+      pickle_length if pickle_length is not None else len(pickle_bytes)
+  )
   if shm_name:
     genops_output = generate_ops_from_file(
         "",
         shm_name=shm_name,
-        pickle_length=len(pickle_bytes),
+        pickle_length=resolved_pickle_length,
         fail_fast=fail_fast,
     )
   elif pickle_file_path:
     genops_output = generate_ops_from_file(
-        pickle_file_path, pickle_length=len(pickle_bytes), fail_fast=fail_fast
+        pickle_file_path,
+        pickle_length=resolved_pickle_length,
+        fail_fast=fail_fast,
     )
   else:
     genops_output = generate_ops(pickle_bytes, fail_fast=fail_fast)
@@ -916,10 +923,11 @@ def score_results(
 
 def apply_approach(
     scan_approach: Callable[..., ScanResults],
-    pickle_bytes: bytes,
+    pickle_bytes: bytes | IO[bytes],
     pickle_file_path: Optional[str] = None,
     shm_name: Optional[str] = None,
     fail_fast: Optional[bool] = DEFAULT_FAIL_FAST,
+    pickle_length: Optional[int] = None,
 ) -> Dict[str, int]:
   """Applies the given scan approach to the data.
 
@@ -929,6 +937,7 @@ def apply_approach(
     pickle_file_path: Optional path to the pickle file for streaming scan.
     shm_name: Optional name of the shared memory block.
     fail_fast: Whether to fail fast on first unsafe or suspicious match.
+    pickle_length: Optional length of the pickle data.
 
   Returns:
     A dictionary of the resulting scores.
@@ -939,6 +948,7 @@ def apply_approach(
         pickle_file_path=pickle_file_path,
         shm_name=shm_name,
         fail_fast=fail_fast,
+        pickle_length=pickle_length,
     )
   else:
     results = scan_approach(pickle_bytes)
@@ -1254,63 +1264,60 @@ def _security_scan_internal(
     A dictionary containing the scores for unsafe, suspicious, and unknown
     finds.
   """
-  is_stream = isinstance(pickle_bytes, io.IOBase)
-
-  # Get pickle length safely without loading all into memory
-  if is_stream:
-    try:
-      current_pos = pickle_bytes.tell()
-      pickle_bytes.seek(0, io.SEEK_END)
-      pickle_length = pickle_bytes.tell()
-      pickle_bytes.seek(current_pos)
-    except (OSError, AttributeError, io.UnsupportedOperation):
-      # Read only on unsupported seek fallback
-      data = pickle_bytes.read()
-      pickle_bytes = io.BytesIO(data)
-      pickle_length = len(data)
-      is_stream = True
-  else:
+  # Normalize to seekable stream and get length
+  if isinstance(pickle_bytes, bytes):
+    stream = io.BytesIO(pickle_bytes)
     pickle_length = len(pickle_bytes)
-
-  if is_stream:
-    try:
-      current_pos = pickle_bytes.tell()
-      header_bytes = pickle_bytes.read(1024)
-      pickle_bytes.seek(current_pos)
-      is_pickle = utils.is_pickle_file(
-          header_bytes, check_magic_bytes=check_magic_bytes
-      )
-    except (OSError, AttributeError, io.UnsupportedOperation, ValueError):
-      is_pickle = False
   else:
+    stream = pickle_bytes
+    try:
+      is_seekable = stream.seekable()
+    except (AttributeError, ValueError):
+      is_seekable = False
+
+    if not is_seekable:
+      data = stream.read()
+      stream = io.BytesIO(data)
+      pickle_length = len(data)
+    else:
+      current_pos = stream.tell()
+      stream.seek(0, io.SEEK_END)
+      pickle_length = stream.tell()
+      stream.seek(current_pos)
+
+  # Check if pickle (always stream now)
+  try:
     is_pickle = utils.is_pickle_file(
-        pickle_bytes, check_magic_bytes=check_magic_bytes
+        stream, check_magic_bytes=check_magic_bytes
     )
+  except (OSError, AttributeError, io.UnsupportedOperation, ValueError):
+    is_pickle = False
 
   if not is_pickle and not force_scan:
     return {"unsafe": 0, "suspicious": 0, "unknown": 0}
 
-  # Determine start offset to omit leading garbage safely
-  # without loading into memory
+  # Find actual start of valid pickle payload if it has leading garbage
   start_offset = 0
-  if is_stream:
-    try:
-      current_pos = pickle_bytes.tell()
-      pickle_bytes.seek(0)
-      header_bytes = pickle_bytes.read(1024)
-      start_offset = utils.find_pickle_start_offset(header_bytes)
-      if start_offset > 0:
-        pickle_length -= start_offset
-        pickle_bytes.seek(start_offset)
-      else:
-        pickle_bytes.seek(current_pos)
-    except (OSError, AttributeError, io.UnsupportedOperation):
-      pass
-  else:
-    start_offset = utils.find_pickle_start_offset(pickle_bytes)
+  try:
+    current_pos = stream.tell()
+    stream.seek(0)
+    header_bytes = stream.read(1024)
+    stream.seek(current_pos)
+    is_archive = header_bytes.startswith(
+        (b"PK\x03\x04", b"BZh", b"\xfd7zXZ\x00", b"\x1f\x8b")
+    ) or (len(header_bytes) >= 262 and header_bytes[257:262] == b"ustar")
+    if not is_archive:
+      start_offset = utils.find_pickle_start_offset(stream)
+    else:
+      start_offset = 0
+
     if start_offset > 0:
-      pickle_bytes = pickle_bytes[start_offset:]
-      pickle_length = len(pickle_bytes)
+      stream.seek(start_offset)
+      pickle_length -= start_offset
+    else:
+      stream.seek(current_pos)
+  except (OSError, AttributeError, io.UnsupportedOperation):
+    pass
 
   pickle_file_path = None
   shm = None
@@ -1321,65 +1328,65 @@ def _security_scan_internal(
       shm = shared_memory.SharedMemory(create=True, size=pickle_length)
       shm_name = shm.name
 
-      # Copy to shared memory in 1MB chunks
-      if is_stream:
+      # Fast path for BytesIO, chunked fallback for other streams
+      if isinstance(stream, io.BytesIO):
+        shm.buf[:pickle_length] = stream.getbuffer()[
+            start_offset : start_offset + pickle_length
+        ]
+      else:
         offset = 0
-        current_pos = pickle_bytes.tell()
-        pickle_bytes.seek(start_offset)
+        current_pos = stream.tell()
+        stream.seek(start_offset)
         try:
           while True:
-            chunk = pickle_bytes.read(1024 * 1024)
+            chunk = stream.read(1024 * 1024)
             if not chunk:
               break
             shm.buf[offset : offset + len(chunk)] = chunk
             offset += len(chunk)
         finally:
-          pickle_bytes.seek(current_pos)
-      else:
-        shm.buf[:pickle_length] = pickle_bytes  # pyrefly: ignore[unsupported-operation]
+          stream.seek(current_pos)
     except OSError:
       # Fallback to tempfile with chunked buffering
       with tempfile.NamedTemporaryFile(delete=False) as temp_file:
         pickle_file_path = temp_file.name
-        if is_stream:
-          current_pos = pickle_bytes.tell()
-          pickle_bytes.seek(start_offset)
+        if isinstance(stream, io.BytesIO):
+          temp_file.write(
+              stream.getbuffer()[start_offset : start_offset + pickle_length]
+          )
+        else:
+          current_pos = stream.tell()
+          stream.seek(start_offset)
           try:
             while True:
-              chunk = pickle_bytes.read(1024 * 1024)
+              chunk = stream.read(1024 * 1024)
               if not chunk:
                 break
               temp_file.write(chunk)
           finally:
-            pickle_bytes.seek(current_pos)
-        else:
-          temp_file.write(pickle_bytes)
+            stream.seek(current_pos)
 
   original_stream_pos = None
-  if is_stream:
-    try:
-      original_stream_pos = pickle_bytes.tell()
-    except (OSError, AttributeError, io.UnsupportedOperation):
-      pass
+  try:
+    original_stream_pos = stream.tell()
+  except (OSError, AttributeError, io.UnsupportedOperation):
+    pass
 
   try:
     final_scores = {"unsafe": 0, "suspicious": 0, "unknown": 0}
     for scan_approach in [picklemagic_scan, genops_scan]:
       scores = apply_approach(
           scan_approach,
-          pickle_bytes,
+          stream,
           pickle_file_path,
           shm_name,
           fail_fast=fail_fast,
+          pickle_length=pickle_length,
       )
       # Restore stream pointer after each scan approach to prevent EOF errors
-      if (
-          is_stream
-          and original_stream_pos is not None
-          and hasattr(pickle_bytes, "seek")
-      ):
+      if original_stream_pos is not None and hasattr(stream, "seek"):
         try:
-          pickle_bytes.seek(original_stream_pos)
+          stream.seek(original_stream_pos)
         except (OSError, AttributeError, io.UnsupportedOperation):
           logging.debug("Failed to restore stream pointer inside scan loop.")
 
@@ -1390,13 +1397,9 @@ def _security_scan_internal(
   finally:
     # Ensure stream is seeked back before exiting so load_func gets
     # a clean stream
-    if (
-        is_stream
-        and original_stream_pos is not None
-        and hasattr(pickle_bytes, "seek")
-    ):
+    if original_stream_pos is not None and hasattr(stream, "seek"):
       try:
-        pickle_bytes.seek(original_stream_pos)
+        stream.seek(original_stream_pos)
       except (OSError, AttributeError, io.UnsupportedOperation):
         logging.debug("Failed to restore stream pointer before exiting scan.")
 
@@ -1770,9 +1773,6 @@ def unhook_pickle() -> None:
     # Empty stored methods to avoid re-unhooking on a second unhook call
     _ORIG_METHODS_BEFORE_HOOKING.clear()
 
-
-# To avoid creating __pycache__ files
-sys.dont_write_bytecode: bool = True  # pyrefly: ignore[bad-assignment]
 
 # Makes copies for the libraries we wish to hook to avoid recursion conflicts
 pickle_copy = utils.copy_module("_pickle", "pickle_copy")
