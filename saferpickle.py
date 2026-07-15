@@ -27,6 +27,7 @@ import os
 import pickle
 import pickletools
 import re
+import struct
 import sys
 import tarfile
 import tempfile
@@ -73,6 +74,14 @@ class ScanResults:
   is_denylisted: bool = False
 
 
+_OPCODES_4BYTE_LEN = (b"B",)
+_OPCODES_8BYTE_LEN = (b"\x8e", b"\x96")
+_OPCODES_1BYTE_LEN = (b"C",)
+_LENGTH_PREFIXED_OPCODES = (
+    _OPCODES_4BYTE_LEN + _OPCODES_8BYTE_LEN + _OPCODES_1BYTE_LEN
+)
+
+
 def _custom_genops(
     pickle_bytes: bytes,
 ) -> Iterator[tuple[pickletools.OpcodeInfo, Any | None]]:
@@ -106,19 +115,48 @@ def _custom_genops(
 
     opcode_argument = None
     if opcode.arg is not None:
-      try:
-        opcode_argument = opcode.arg.reader(pickle_file)
-      except (
-          ValueError,
-          IndexError,
-          AttributeError,
-          EOFError,
-          TypeError,
-          ImportError,
-          pickle.UnpicklingError,
-      ):
-        # Continue if we can't read the argument
-        continue
+      if charcode in _LENGTH_PREFIXED_OPCODES:
+        try:
+          match charcode:
+            case c if c in _OPCODES_4BYTE_LEN:
+              length = int.from_bytes(pickle_file.read(4), byteorder="little")
+            case c if c in _OPCODES_8BYTE_LEN:
+              length = int.from_bytes(pickle_file.read(8), byteorder="little")
+            case c if c in _OPCODES_1BYTE_LEN:
+              length = int.from_bytes(pickle_file.read(1), byteorder="little")
+            case _:
+              length = 0
+          pickle_file.seek(length, os.SEEK_CUR)
+        except (AttributeError, io.UnsupportedOperation, OSError):
+          try:
+            opcode_argument = opcode.arg.reader(pickle_file)
+          except (ValueError, pickle.UnpicklingError) as e:
+            raise UnsafePickleDetectedError(
+                f"Parser error during security scan: {e}"
+            ) from e
+          except (
+              IndexError,
+              AttributeError,
+              EOFError,
+              TypeError,
+              ImportError,
+          ):
+            continue
+      else:
+        try:
+          opcode_argument = opcode.arg.reader(pickle_file)
+        except (ValueError, pickle.UnpicklingError) as e:
+          raise UnsafePickleDetectedError(
+              f"Parser error during security scan: {e}"
+          ) from e
+        except (
+            IndexError,
+            AttributeError,
+            EOFError,
+            TypeError,
+            ImportError,
+        ):
+          continue
 
     # We only yield opcodes that declare strings and have arguments
     should_yield = False
@@ -193,14 +231,16 @@ def _custom_chunked_genops(
           pickle_file.seek(pos_before_arg_read)
           continue
 
+      except (ValueError, pickle.UnpicklingError) as e:
+        raise UnsafePickleDetectedError(
+            f"Parser error during security scan: {e}"
+        ) from e
       except (
-          ValueError,
           IndexError,
           AttributeError,
           EOFError,
           TypeError,
           ImportError,
-          pickle.UnpicklingError,
       ):
         # Continue if we can't read the argument within the chunk
         pickle_file.seek(pos_before_arg_read)
@@ -492,6 +532,7 @@ def get_class_instantiations(
         IndexError,
         EOFError,
         KeyError,
+        struct.error,
     ):
       pass
     finally:
@@ -949,6 +990,7 @@ def security_scan(
     force_scan: bool = False,
     recursion_depth: int = 0,
     fail_fast: Optional[bool] = DEFAULT_FAIL_FAST,
+    check_magic_bytes: bool = True,
 ) -> Dict[str, int]:
   """Security scan to detect malicious content in pickle files.
 
@@ -957,6 +999,7 @@ def security_scan(
     force_scan: If True, force scan even if the file is not a pickle file.
     recursion_depth: Current recursion depth for nested archives.
     fail_fast: Whether to fail fast on first unsafe or suspicious match.
+    check_magic_bytes: Whether to perform magic byte checks.
 
   Returns:
     A dictionary containing the scores for unsafe, suspicious, and unknown
@@ -1002,6 +1045,7 @@ def security_scan(
           recursion_depth,
           force_scan,
           fail_fast=fail_fast,
+          check_magic_bytes=check_magic_bytes,
       )
 
     # Check for compression signatures if input was raw bytes
@@ -1013,6 +1057,7 @@ def security_scan(
             recursion_depth,
             force_scan,
             fail_fast=fail_fast,
+            check_magic_bytes=check_magic_bytes,
         )
       elif pickle_bytes.startswith(b"BZh"):
         return _extract_and_scan_archive(
@@ -1021,6 +1066,7 @@ def security_scan(
             recursion_depth,
             force_scan,
             fail_fast=fail_fast,
+            check_magic_bytes=check_magic_bytes,
         )
       elif pickle_bytes.startswith(b"\xfd7zXZ\x00"):
         return _extract_and_scan_archive(
@@ -1029,6 +1075,7 @@ def security_scan(
             recursion_depth,
             force_scan,
             fail_fast=fail_fast,
+            check_magic_bytes=check_magic_bytes,
         )
       elif pickle_bytes.startswith(b"\x1f\x8b"):
         return _extract_and_scan_archive(
@@ -1037,6 +1084,7 @@ def security_scan(
             recursion_depth,
             force_scan,
             fail_fast=fail_fast,
+            check_magic_bytes=check_magic_bytes,
         )
       elif len(pickle_bytes) >= 262 and pickle_bytes[257:262] == b"ustar":
         return _extract_and_scan_archive(
@@ -1045,10 +1093,14 @@ def security_scan(
             recursion_depth,
             force_scan,
             fail_fast=fail_fast,
+            check_magic_bytes=check_magic_bytes,
         )
 
     return _security_scan_internal(
-        pickle_bytes, force_scan, fail_fast=fail_fast
+        pickle_bytes,
+        force_scan,
+        fail_fast=fail_fast,
+        check_magic_bytes=check_magic_bytes,
     )
   finally:
     if original_pos is not None:
@@ -1067,6 +1119,7 @@ def _extract_and_scan_archive(
     recursion_depth: int,
     force_scan: bool = False,
     fail_fast: Optional[bool] = DEFAULT_FAIL_FAST,
+    check_magic_bytes: bool = True,
 ) -> Dict[str, int]:
   """Extracts and scans contents of an archive."""
   if not isinstance(data, bytes):
@@ -1076,26 +1129,35 @@ def _extract_and_scan_archive(
 
   try:
     if archive_type == "zip":
-      with zipfile.ZipFile(io.BytesIO(data)) as zf:
-        for name in zf.namelist():
-          if ".." in name or name.startswith("/"):
-            # Zip slip detection
-            logging.warning("Zip slip detected: %s", name)
-            return {
-                "unsafe": constants.HIGH_SEVERITY_ZIPSLIP,
-                "suspicious": 0,
-                "unknown": 0,
-            }  # Return early
+      try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+          for name in zf.namelist():
+            if ".." in name or name.startswith("/"):
+              # Zip slip detection
+              logging.warning("Zip slip detected: %s", name)
+              return {
+                  "unsafe": constants.HIGH_SEVERITY_ZIPSLIP,
+                  "suspicious": 0,
+                  "unknown": 0,
+              }  # Return early
 
-          with zf.open(name) as f:
-            content = f.read()
-            scores = security_scan(
-                content,
-                force_scan=force_scan,
-                recursion_depth=recursion_depth + 1,
-                fail_fast=fail_fast,
-            )
-            _merge_scores(all_scores, scores)
+            with zf.open(name) as f:
+              content = f.read()
+              scores = security_scan(
+                  content,
+                  force_scan=force_scan,
+                  recursion_depth=recursion_depth + 1,
+                  fail_fast=fail_fast,
+                  check_magic_bytes=check_magic_bytes,
+              )
+              _merge_scores(all_scores, scores)
+      except zipfile.BadZipFile as e:
+        logging.warning("Error processing zip archive: %s", e)
+        return {
+            "unsafe": constants.HIGH_SEVERITY_ZIPSLIP,
+            "suspicious": 0,
+            "unknown": 0,
+        }
 
     elif archive_type == "bz2":
       content = utils.extract_bz2_contents(data)
@@ -1141,6 +1203,7 @@ def _extract_and_scan_archive(
             force_scan=force_scan,
             recursion_depth=recursion_depth + 1,
             fail_fast=fail_fast,
+            check_magic_bytes=check_magic_bytes,
         )
         _merge_scores(all_scores, scores)
 
@@ -1162,7 +1225,7 @@ def _extract_and_scan_archive(
       EOFError,
       ValueError,
   ) as e:
-    logging.exception("Error processing %s archive: %s", archive_type, e)
+    logging.warning("Error processing %s archive: %s", archive_type, e)
     # Block file if extraction fails to prevent security bypass
     return {
         "unsafe": constants.HIGH_SEVERITY_ZIPSLIP,
@@ -1177,6 +1240,7 @@ def _security_scan_internal(
     pickle_bytes: bytes | IO[bytes],
     force_scan: bool = False,
     fail_fast: Optional[bool] = DEFAULT_FAIL_FAST,
+    check_magic_bytes: bool = True,
 ) -> Dict[str, int]:
   """Security scan to detect malicious content in pickle files.
 
@@ -1184,6 +1248,7 @@ def _security_scan_internal(
     pickle_bytes: Pickle bytecode or stream to scan.
     force_scan: If True, force scan even if the file is not a pickle file.
     fail_fast: Whether to fail fast on first unsafe or suspicious match.
+    check_magic_bytes: Whether to perform magic byte checks.
 
   Returns:
     A dictionary containing the scores for unsafe, suspicious, and unknown
@@ -1212,14 +1277,40 @@ def _security_scan_internal(
       current_pos = pickle_bytes.tell()
       header_bytes = pickle_bytes.read(1024)
       pickle_bytes.seek(current_pos)
-      is_pickle = utils.is_pickle_file(header_bytes)
+      is_pickle = utils.is_pickle_file(
+          header_bytes, check_magic_bytes=check_magic_bytes
+      )
     except (OSError, AttributeError, io.UnsupportedOperation, ValueError):
       is_pickle = False
   else:
-    is_pickle = utils.is_pickle_file(pickle_bytes)
+    is_pickle = utils.is_pickle_file(
+        pickle_bytes, check_magic_bytes=check_magic_bytes
+    )
 
   if not is_pickle and not force_scan:
     return {"unsafe": 0, "suspicious": 0, "unknown": 0}
+
+  # Determine start offset to omit leading garbage safely
+  # without loading into memory
+  start_offset = 0
+  if is_stream:
+    try:
+      current_pos = pickle_bytes.tell()
+      pickle_bytes.seek(0)
+      header_bytes = pickle_bytes.read(1024)
+      start_offset = utils.find_pickle_start_offset(header_bytes)
+      if start_offset > 0:
+        pickle_length -= start_offset
+        pickle_bytes.seek(start_offset)
+      else:
+        pickle_bytes.seek(current_pos)
+    except (OSError, AttributeError, io.UnsupportedOperation):
+      pass
+  else:
+    start_offset = utils.find_pickle_start_offset(pickle_bytes)
+    if start_offset > 0:
+      pickle_bytes = pickle_bytes[start_offset:]
+      pickle_length = len(pickle_bytes)
 
   pickle_file_path = None
   shm = None
@@ -1234,7 +1325,7 @@ def _security_scan_internal(
       if is_stream:
         offset = 0
         current_pos = pickle_bytes.tell()
-        pickle_bytes.seek(0)
+        pickle_bytes.seek(start_offset)
         try:
           while True:
             chunk = pickle_bytes.read(1024 * 1024)
@@ -1252,7 +1343,7 @@ def _security_scan_internal(
         pickle_file_path = temp_file.name
         if is_stream:
           current_pos = pickle_bytes.tell()
-          pickle_bytes.seek(0)
+          pickle_bytes.seek(start_offset)
           try:
             while True:
               chunk = pickle_bytes.read(1024 * 1024)
@@ -1345,6 +1436,7 @@ def _scan_and_load(
     hooked_mod_name: str,
     is_load: bool,
     log_info: bool,
+    check_magic_bytes: bool = True,
     *args: Any,
     **kwargs: Any,
 ):
@@ -1368,11 +1460,40 @@ def _scan_and_load(
       data_bytes = pickle_file.read()
       pickle_file = io.BytesIO(data_bytes)
 
+    try:
+      current_pos = pickle_file.tell()
+      pickle_file.seek(0)
+      header_bytes = pickle_file.read(1024)
+      is_archive = header_bytes.startswith(
+          (b"PK\x03\x04", b"BZh", b"\xfd7zXZ\x00", b"\x1f\x8b")
+      ) or (len(header_bytes) >= 262 and header_bytes[257:262] == b"ustar")
+      if not is_archive:
+        start_offset = utils.find_pickle_start_offset(header_bytes)
+      else:
+        start_offset = 0
+
+      if start_offset > 0:
+        pickle_file.seek(start_offset)
+      else:
+        pickle_file.seek(current_pos)
+    except (OSError, AttributeError, io.UnsupportedOperation):
+      pass
+
     scan_source = pickle_file
   else:
     if not isinstance(pickle_file_or_bytes, bytes):
       raise TypeError("pickle_file_or_bytes must be bytes when is_load=False")
     data_bytes = pickle_file_or_bytes
+    is_archive = data_bytes.startswith(
+        (b"PK\x03\x04", b"BZh", b"\xfd7zXZ\x00", b"\x1f\x8b")
+    ) or (len(data_bytes) >= 262 and data_bytes[257:262] == b"ustar")
+    if not is_archive:
+      start_offset = utils.find_pickle_start_offset(data_bytes)
+    else:
+      start_offset = 0
+
+    if start_offset > 0:
+      data_bytes = data_bytes[start_offset:]
     scan_source = data_bytes
     pickle_file = None
 
@@ -1407,7 +1528,9 @@ def _scan_and_load(
       raise StrictCheckError(error_string_strict_check)
   else:
     # Default scanning routines
-    scan_scores = security_scan(scan_source, force_scan=force_scan)
+    scan_scores = security_scan(
+        scan_source, force_scan=force_scan, check_magic_bytes=check_magic_bytes
+    )
     number_of_unsafe_results = scan_scores["unsafe"]
     number_of_suspicious_results = scan_scores["suspicious"]
     number_of_unknown_results = scan_scores["unknown"]
@@ -1458,6 +1581,7 @@ def hook_pickle(
       report_only: bool = False,
       force_scan: bool = False,
       hooked_mod_name: str = "",
+      check_magic_bytes: bool = True,
       *args: Any,
       **kwargs: Any,
   ) -> Any:
@@ -1470,6 +1594,8 @@ def hook_pickle(
       report_only: If True, only report errors and do not raise them.
       force_scan: If True, force scan even if the file is not a pickle file.
       hooked_mod_name: The name of the hooked module that called this function.
+      check_magic_bytes: Whether to perform magic byte checks to fast path
+        reject files.
       *args: Additional arguments to pass to pickle.loads.
       **kwargs: Additional keyword arguments to pass to pickle.loads.
 
@@ -1499,29 +1625,33 @@ def hook_pickle(
         hooked_mod_name,
         False,
         log_info,
+        check_magic_bytes,
         *args,
         **kwargs,
     )
 
   def custom_load(
-      pickle_file: io.IOBase,
+      pickle_file: Any,
       allow_unsafe: bool = False,
       strict_check: bool = False,
       report_only: bool = False,
       force_scan: bool = False,
       hooked_mod_name: str = "",
+      check_magic_bytes: bool = True,
       *args: Any,
       **kwargs: Any,
   ) -> Any:
     """Custom load function for pickle to security scan before loading pickle files.
 
     Args:
-      pickle_file: The file-like object to load from.
+      pickle_file: The pickle file to load.
       allow_unsafe: If True, allow unsafe pickle files to be loaded.
       strict_check: If True, perform a strict security check on the pickle file.
       report_only: If True, only report errors and do not raise them.
       force_scan: If True, force scan even if the file is not a pickle file.
       hooked_mod_name: The name of the hooked module that called this function.
+      check_magic_bytes: Whether to perform magic byte checks to fast path
+        reject files.
       *args: Additional arguments to pass to pickle.load.
       **kwargs: Additional keyword arguments to pass to pickle.load.
 
@@ -1551,6 +1681,7 @@ def hook_pickle(
         hooked_mod_name,
         True,
         log_info,
+        check_magic_bytes,
         *args,
         **kwargs,
     )
@@ -1684,6 +1815,7 @@ def load(
     report_only: bool = False,
     force_scan: bool = False,
     log_info: bool = False,
+    check_magic_bytes: bool = True,
     *args: Any,
     **kwargs: Any,
 ) -> Any:
@@ -1699,6 +1831,8 @@ def load(
     report_only: If True, only report errors and do not raise them.
     force_scan: If True, force scan even if the file is not a pickle file.
     log_info: If True, use logging.info instead of logging.error for reporting.
+    check_magic_bytes: Whether to perform magic byte checks to fast path reject
+      files.
     *args: Additional arguments to pass to torch.load.
     **kwargs: Additional keyword arguments to pass to torch.load.
 
@@ -1718,6 +1852,7 @@ def load(
       "torch",
       True,
       log_info,
+      check_magic_bytes,
       *args,
       **kwargs,
   )
@@ -1734,6 +1869,7 @@ class Unpickler(pickle.Unpickler):
       report_only: bool = False,
       force_scan: bool = False,
       log_info: bool = False,
+      check_magic_bytes: bool = True,
       *args: Any,
       **kwargs: Any,
   ):
@@ -1746,6 +1882,7 @@ class Unpickler(pickle.Unpickler):
     self._report_only = report_only
     self._force_scan = force_scan
     self._log_info = log_info
+    self._check_magic_bytes = check_magic_bytes
 
   def load(self) -> Any:
     """Security scan before loading pickle files."""
@@ -1758,6 +1895,7 @@ class Unpickler(pickle.Unpickler):
         "pickle",
         True,
         self._log_info,
+        self._check_magic_bytes,
         *self.args,
         **self.kwargs,
     )
