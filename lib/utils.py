@@ -30,8 +30,9 @@ import re
 import subprocess
 import sys
 import tarfile
+import threading
 import types
-from typing import BinaryIO, FrozenSet, Generator, IO, Set, Tuple, cast
+from typing import BinaryIO, Dict, FrozenSet, Generator, IO, Set, Tuple, cast
 import zipfile
 
 from absl import logging
@@ -152,6 +153,44 @@ def copy_module(original_name: str, new_name: str) -> types.ModuleType | None:
   sys.modules[new_name] = new_module
 
   return new_module
+
+
+_COPIED_MODS_CACHE: Dict[str, types.ModuleType] = {}
+_COPIED_MODS_LOCK = threading.Lock()
+
+
+def get_copied_module(name: str) -> types.ModuleType:
+  """Get or create a copy of the module, caching it to avoid re-copying."""
+  with _COPIED_MODS_LOCK:
+    if name in _COPIED_MODS_CACHE:
+      return _COPIED_MODS_CACHE[name]
+
+    if name in ("pickle", "_pickle"):
+      # We always copy _pickle for both pickle and _pickle
+      if "_pickle" in _COPIED_MODS_CACHE:
+        mod_copied = _COPIED_MODS_CACHE["_pickle"]
+      else:
+        mod_copied = copy_module("_pickle", "pickle_copy")
+        if mod_copied is None:
+          logging.error("Failed to copy critical module _pickle")
+          sys.exit(1)
+        _COPIED_MODS_CACHE["_pickle"] = mod_copied
+        _COPIED_MODS_CACHE["pickle"] = mod_copied
+    else:
+      # Try to copy the module
+      mod_copied = copy_module(name, f"{name}_copy")
+      if mod_copied is None:
+        # Fallback to pickle copy
+        logging.warning(
+            "%s could not be imported/copied, falling back to pickle_copy", name
+        )
+        if "_pickle" not in _COPIED_MODS_CACHE:
+          _ = get_copied_module("_pickle")
+        mod_copied = _COPIED_MODS_CACHE["_pickle"]
+
+      _COPIED_MODS_CACHE[name] = mod_copied
+
+    return mod_copied
 
 
 def _peek_bytes(file_bytes: bytes | BinaryIO, size: int) -> bytes:

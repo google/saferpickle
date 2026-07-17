@@ -60,9 +60,6 @@ IS_COLAB_ENABLED = "google.colab" in sys.modules
 DEFAULT_FAIL_FAST = True
 
 
-Classification = utils.Classification
-
-
 @dataclasses.dataclass
 class ScanResults:
   """Results from a pickle security scan."""
@@ -72,14 +69,6 @@ class ScanResults:
   suspicious_results: Set[str] = dataclasses.field(default_factory=set)
   unknown_results: Set[str] = dataclasses.field(default_factory=set)
   is_denylisted: bool = False
-
-
-_OPCODES_4BYTE_LEN = (b"B",)
-_OPCODES_8BYTE_LEN = (b"\x8e", b"\x96")
-_OPCODES_1BYTE_LEN = (b"C",)
-_LENGTH_PREFIXED_OPCODES = (
-    _OPCODES_4BYTE_LEN + _OPCODES_8BYTE_LEN + _OPCODES_1BYTE_LEN
-)
 
 
 def _custom_genops(
@@ -115,14 +104,14 @@ def _custom_genops(
 
     opcode_argument = None
     if opcode.arg is not None:
-      if charcode in _LENGTH_PREFIXED_OPCODES:
+      if charcode in constants.LENGTH_PREFIXED_OPCODES:
         try:
           match charcode:
-            case c if c in _OPCODES_4BYTE_LEN:
+            case c if c in constants.OPCODES_4BYTE_LEN:
               length = int.from_bytes(pickle_file.read(4), byteorder="little")
-            case c if c in _OPCODES_8BYTE_LEN:
+            case c if c in constants.OPCODES_8BYTE_LEN:
               length = int.from_bytes(pickle_file.read(8), byteorder="little")
-            case c if c in _OPCODES_1BYTE_LEN:
+            case c if c in constants.OPCODES_1BYTE_LEN:
               length = int.from_bytes(pickle_file.read(1), byteorder="little")
             case _:
               length = 0
@@ -597,13 +586,13 @@ def categorize_strings(
         class_name_classification = utils.classify_class_name(class_name)
 
         match class_name_classification:
-          case Classification.SAFE:
+          case utils.Classification.SAFE:
             safe_results.add(class_name)
-          case Classification.UNSAFE:
+          case utils.Classification.UNSAFE:
             unsafe_results.add(class_name)
-          case Classification.SUSPICIOUS:
+          case utils.Classification.SUSPICIOUS:
             suspicious_results.add(class_name)
-          case Classification.UNKNOWN:
+          case utils.Classification.UNKNOWN:
             unknown_results.add(class_name)
 
         class_args = class_args_match.group(2)
@@ -694,13 +683,13 @@ def categorize_strings(
     # Classify the resolved result
     classification = utils.classify_class_name(result)
 
-    if classification == Classification.SAFE:
+    if classification == utils.Classification.SAFE:
       new_safe_results.add(result)
-    elif classification == Classification.UNSAFE:
+    elif classification == utils.Classification.UNSAFE:
       new_unsafe_results.add(result)
-    elif classification == Classification.SUSPICIOUS:
+    elif classification == utils.Classification.SUSPICIOUS:
       new_suspicious_results.add(result)
-    elif classification == Classification.UNKNOWN:
+    elif classification == utils.Classification.UNKNOWN:
       # Fallback: Check against original categories if
       # classify_class_name returns UNKNOWN.
       if result in unsafe_results:
@@ -1415,7 +1404,7 @@ _HOOKING_LOCK = threading.Lock()
 
 
 def _report_or_raise(
-    classification: Classification, report_only: bool, log_info=False
+    classification: utils.Classification, report_only: bool, log_info=False
 ):
   """Reports or raises an error based on classification and report_only flag."""
 
@@ -1500,9 +1489,7 @@ def _scan_and_load(
     scan_source = data_bytes
     pickle_file = None
 
-  loader_mod = COPIED_MODS_MAP.get(hooked_mod_name)
-  if not loader_mod:
-    loader_mod = pickle_copy
+  loader_mod = utils.get_copied_module(hooked_mod_name or "_pickle")
 
   if is_load:
     load_func = loader_mod.load  # pyrefly: ignore[missing-attribute]
@@ -1547,9 +1534,9 @@ def _scan_and_load(
               number_of_unknown_results,
           )
     elif number_of_unsafe_results > number_of_suspicious_results:
-      _report_or_raise(Classification.UNSAFE, report_only, log_info)
+      _report_or_raise(utils.Classification.UNSAFE, report_only, log_info)
     else:
-      _report_or_raise(Classification.SUSPICIOUS, report_only, log_info)
+      _report_or_raise(utils.Classification.SUSPICIOUS, report_only, log_info)
 
   # Load the pickle if report_only is True and no exceptions were raised earlier
   try:
@@ -1712,6 +1699,9 @@ def hook_pickle(
         logging.debug("Failed to import %s", hookable_mod)
         continue
 
+    # Force copy before patching to ensure we copy the unhooked version
+    _ = utils.get_copied_module(hookable_mod)
+
     with _HOOKING_LOCK:
       if hookable_mod not in _ORIG_METHODS_BEFORE_HOOKING:
         _ORIG_METHODS_BEFORE_HOOKING[hookable_mod] = {}
@@ -1772,40 +1762,6 @@ def unhook_pickle() -> None:
         continue
     # Empty stored methods to avoid re-unhooking on a second unhook call
     _ORIG_METHODS_BEFORE_HOOKING.clear()
-
-
-# Makes copies for the libraries we wish to hook to avoid recursion conflicts
-pickle_copy = utils.copy_module("_pickle", "pickle_copy")
-dill_copy = utils.copy_module("dill", "dill_copy")
-joblib_copy = utils.copy_module("joblib", "joblib_copy")
-cloudpickle_copy = utils.copy_module("cloudpickle", "cloudpickle_copy")
-torch_copy = utils.copy_module("torch", "torch_copy")
-
-# This must succeed, otherwise we cannot continue with any hooking
-if pickle_copy is None:
-  sys.exit(1)
-
-# This is a map of modules to their copies, if the copy fails, we fall back to
-# the pickle copy.
-COPIED_MODS_MAP = {
-    "pickle": pickle_copy,
-    "_pickle": pickle_copy,
-    "dill": dill_copy if dill_copy else pickle_copy,
-    "joblib": joblib_copy if joblib_copy else pickle_copy,
-    "cloudpickle": cloudpickle_copy if cloudpickle_copy else pickle_copy,
-    "torch": torch_copy if torch_copy else pickle_copy,
-}
-
-REQUIRED_COPIES = frozenset(["pickle", "_pickle"])
-
-for mod_name, mod_copy in COPIED_MODS_MAP.items():
-  if mod_copy is None:
-    if mod_name in REQUIRED_COPIES:
-      sys.exit(1)
-    else:
-      logging.warning(
-          "%s could not be imported, functionality may be limited.", mod_name
-      )
 
 
 def load(

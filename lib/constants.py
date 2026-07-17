@@ -323,3 +323,11 @@ MAX_NUM_CHUNKS = (os.cpu_count() or 1) // 2
 
 # High score to indicate definite unsafety due to a detected zip slip.
 HIGH_SEVERITY_ZIPSLIP = 1337
+
+
+OPCODES_4BYTE_LEN = (b"B",)
+OPCODES_8BYTE_LEN = (b"\x8e", b"\x96")
+OPCODES_1BYTE_LEN = (b"C",)
+LENGTH_PREFIXED_OPCODES = (
+    OPCODES_4BYTE_LEN + OPCODES_8BYTE_LEN + OPCODES_1BYTE_LEN
+)
