@@ -20,6 +20,7 @@ import dataclasses
 import functools
 import importlib
 import io
+import logging as std_logging
 import lzma
 import math
 from multiprocessing import shared_memory
@@ -460,7 +461,7 @@ def generate_ops(
 
 def get_class_instantiations(
     pickle_bytes: bytes | BinaryIO,
-) -> tuple[io.StringIO, bool]:
+) -> tuple[io.StringIO, bool, bool]:
   """Gets the class instantiations from a pickle file/stream.
 
   Args:
@@ -471,9 +472,22 @@ def get_class_instantiations(
       - picklemagic_output: Suspicious function calls from picklemagic.
       - was_unsafe_build_blocked: A boolean indicating if a dangerous
         state assignment was blocked by the custom load_build hook.
+      - has_scan_error: A boolean indicating if the sandbox unpickler raised
+        an exception.
   """
   picklemagic_output = io.StringIO()
   unpickler = None
+  has_scan_error = False
+
+  # Configure temporary log handler to capture picklemagic logs safely
+  handler = std_logging.StreamHandler(picklemagic_output)
+  handler.setFormatter(std_logging.Formatter("%(message)s"))
+  logger = std_logging.getLogger("corrupy.picklemagic")
+  logger.addHandler(handler)
+  original_level = logger.level
+  logger.setLevel(std_logging.WARNING)
+  original_propagate = logger.propagate
+  logger.propagate = False
 
   # Handle stream seek-back if necessary
   original_pos = None
@@ -483,7 +497,7 @@ def get_class_instantiations(
     original_pos = pickle_bytes.tell()
     pickle_stream = pickle_bytes
 
-  with contextlib.redirect_stdout(picklemagic_output):
+  try:
     try:
       factory = picklemagic.FakeClassFactory([], picklemagic.FakeWarning)
 
@@ -496,22 +510,8 @@ def get_class_instantiations(
           unsafe_modules=constants.UNSAFE_STRINGS,
       )
       factory.default.unpickler = unpickler
-
-      # Monkey-patch load_build so that we don't miss
-      # BUILD instructions due to differing Pickle implementations.
-      original_load_build = unpickler.load_build
-
-      def fixed_load_build(*unused_args):
-        return original_load_build()
-
-      unpickler.load_build = fixed_load_build
-      unpickler.dispatch[pickle.BUILD[0]] = unpickler.load_build
-
       unpickler.load()
 
-    # These errors are expected and should not be raised.
-    # Even if errors are encountered, we still get the class instantiations
-    # before errors occur.
     except (
         ValueError,
         AttributeError,
@@ -522,136 +522,91 @@ def get_class_instantiations(
         EOFError,
         KeyError,
         struct.error,
-    ):
-      pass
-    finally:
-      if original_pos is not None:
-        pickle_bytes.seek(original_pos)
+    ) as e:
+      logging.warning("Sandbox unpickling failed: %s", e)
+      has_scan_error = True
+  finally:
+    logger.removeHandler(handler)
+    logger.setLevel(original_level)
+    logger.propagate = original_propagate
+    if original_pos is not None:
+      pickle_bytes.seek(original_pos)
 
-  is_build_instr_blocked = False
+  was_unsafe_build_blocked = False
   if unpickler:
-    is_build_instr_blocked = getattr(
+    was_unsafe_build_blocked = getattr(
         unpickler, "has_blocked_unsafe_build_instr", False
     )
-  return picklemagic_output, is_build_instr_blocked
+
+  return picklemagic_output, was_unsafe_build_blocked, has_scan_error
 
 
 def categorize_strings(
     filtered_output: Set[str] | io.StringIO,
     use_picklemagic: bool = False,
 ) -> ScanResults:
-  """Counts strings from filtered output and categorizes them.
+  """Counts strings from filtered output and categorizes them."""
+  if use_picklemagic and isinstance(filtered_output, io.StringIO):
+    safe, unsafe, suspicious, unknown = utils.categorize_picklemagic(
+        filtered_output
+    )
+  else:
+    safe, unsafe, suspicious, unknown = _categorize_genops(filtered_output)
+  return _reclassify_with_resolution(safe, unsafe, suspicious, unknown)
 
-  Args:
-    filtered_output: The series of statements filtered by string declarations.
-    use_picklemagic: If True, the filtered output is from picklemagic, otherwise
-      it is from genops or disassembly.
 
-  Returns:
-    A ScanResults object.
-  """
-
-  unsafe_results: Set[str] = set()
+def _categorize_genops(
+    filtered_output: Set[str],
+) -> Tuple[Set[str], Set[str], Set[str], Set[str]]:
+  """Helper to categorize genops output."""
   safe_results: Set[str] = set()
+  unsafe_results: Set[str] = set()
   suspicious_results: Set[str] = set()
   unknown_results: Set[str] = set()
+
+  for line in filtered_output:
+    line_in_lowercase = line.lower()
+    unsafe_match = any(
+        unsafe_string in line_in_lowercase
+        for unsafe_string in constants.UNSAFE_STRINGS
+    ) and re.findall(utils.unsafe_pattern, line_in_lowercase)
+    safe_match = any(
+        safe_string in line_in_lowercase
+        for safe_string in constants.SAFE_STRINGS
+    ) and re.findall(utils.safe_pattern, line_in_lowercase)
+    suspicious_match = any(
+        suspicious_string in line_in_lowercase
+        for suspicious_string in constants.SUSPICIOUS_STRINGS
+    ) and re.findall(utils.suspicious_pattern, line_in_lowercase)
+
+    if unsafe_match:
+      for match in unsafe_match:
+        unsafe_results.add(match)
+    elif safe_match:
+      for match in safe_match:
+        safe_results.add(match)
+    elif suspicious_match:
+      for match in suspicious_match:
+        suspicious_results.add(match)
+    else:
+      # Only check for unknown if no other categories matched
+      unknown_match = re.findall(utils.unknown_pattern, line_in_lowercase)
+      if unknown_match:
+        for match in unknown_match:
+          unknown_results.add(match)
+
+  return safe_results, unsafe_results, suspicious_results, unknown_results
+
+
+def _reclassify_with_resolution(
+    safe_results: Set[str],
+    unsafe_results: Set[str],
+    suspicious_results: Set[str],
+    unknown_results: Set[str],
+) -> ScanResults:
+  """Helper to resolve modules and re-classify results."""
   allow_list = config.get_allow_list()
   deny_list = config.get_deny_list()
-
-  if use_picklemagic and isinstance(filtered_output, io.StringIO):
-    filtered_output = filtered_output.getvalue().split("\n")  # pyrefly: ignore[bad-assignment]
-    for picklemagic_warning in filtered_output:
-      if not picklemagic_warning:
-        continue
-
-      picklemagic_warning_lower = picklemagic_warning.lower()
-
-      # Printable warning sourced from every suspicious invocation of
-      # find_class()
-      if picklemagic_warning_lower.startswith("warning"):
-        unsafe_module_match = utils.EXTRACT_UNSAFE_MODULE_REGEX.search(
-            picklemagic_warning_lower
-        )
-        if unsafe_module_match:
-          unsafe_results.add(unsafe_module_match.group(1))
-
-      # Printable warning for suspicious class instantiations
-      if picklemagic_warning_lower.startswith("<"):
-        class_args_match = utils.ARGS_REGEX.search(picklemagic_warning_lower)
-
-        if not class_args_match:
-          continue
-
-        class_name = class_args_match.group(1)
-        class_name_classification = utils.classify_class_name(class_name)
-
-        match class_name_classification:
-          case utils.Classification.SAFE:
-            safe_results.add(class_name)
-          case utils.Classification.UNSAFE:
-            unsafe_results.add(class_name)
-          case utils.Classification.SUSPICIOUS:
-            suspicious_results.add(class_name)
-          case utils.Classification.UNKNOWN:
-            unknown_results.add(class_name)
-
-        class_args = class_args_match.group(2)
-
-        for method_pattern in utils.PYTHON_METHOD_PATTERNS:
-          argument_finds = method_pattern.findall(class_args)
-          if not argument_finds:
-            continue
-          for argument_find in argument_finds:
-            found_match = False
-            for unsafe_string in constants.UNSAFE_STRINGS:
-              if unsafe_string in argument_find:
-                unsafe_results.add(argument_find)
-                found_match = True
-            for safe_string in constants.SAFE_STRINGS:
-              if safe_string in argument_find:
-                safe_results.add(argument_find)
-                found_match = True
-            for suspicious_string in constants.SUSPICIOUS_STRINGS:
-              if suspicious_string in argument_find:
-                suspicious_results.add(argument_find)
-                found_match = True
-
-            if not found_match and re.search(
-                utils.unknown_pattern, argument_find
-            ):
-              unknown_results.add(argument_find)
-
-  else:
-    for line in filtered_output:
-      line_in_lowercase = line.lower()
-      unsafe_match = any(
-          unsafe_string in line_in_lowercase
-          for unsafe_string in constants.UNSAFE_STRINGS
-      ) and re.findall(utils.unsafe_pattern, line_in_lowercase)
-      safe_match = any(
-          safe_string in line_in_lowercase
-          for safe_string in constants.SAFE_STRINGS
-      ) and re.findall(utils.safe_pattern, line_in_lowercase)
-      suspicious_match = any(
-          suspicious_string in line_in_lowercase
-          for suspicious_string in constants.SUSPICIOUS_STRINGS
-      ) and re.findall(utils.suspicious_pattern, line_in_lowercase)
-
-      if unsafe_match:
-        for match in unsafe_match:
-          unsafe_results.add(match)
-      elif safe_match:
-        for match in safe_match:
-          safe_results.add(match)
-      elif suspicious_match:
-        for match in suspicious_match:
-          suspicious_results.add(match)
-      else:
-        # Only check for unknown if no other categories matched
-        unknown_match = re.findall(utils.unknown_pattern, line_in_lowercase)
-        if unknown_match:
-          for match in unknown_match:
-            unknown_results.add(match)
 
   # Combine results for `resolve_library_modules_from_results` call.
   all_results = safe_results.union(
@@ -744,11 +699,11 @@ def strict_security_scan(pickle_bytes: bytes | BinaryIO) -> bool:
         logging.debug("Failed to seek back stream before picklemagic scan.")
 
     # The below handles catching cases of unknown imports and state attacks.
-    instantiations_output, was_unsafe_build_blocked = get_class_instantiations(
-        pickle_bytes
+    instantiations_output, was_unsafe_build_blocked, has_scan_error = (
+        get_class_instantiations(pickle_bytes)
     )
 
-    if was_unsafe_build_blocked:
+    if was_unsafe_build_blocked or has_scan_error:
       return True
 
     instantiations = instantiations_output.getvalue().split("\n")
@@ -819,16 +774,18 @@ def picklemagic_scan(
   Returns:
     A ScanResults object.
   """
-  picklemagic_output, was_unsafe_build_blocked = get_class_instantiations(
-      pickle_bytes
+  picklemagic_output, was_unsafe_build_blocked, has_scan_error = (
+      get_class_instantiations(pickle_bytes)
   )
 
   results = categorize_strings(picklemagic_output, use_picklemagic=True)
 
   if was_unsafe_build_blocked:
-    # Temporary addition to increase number of suspicious results given the
+    # Temporary addition to increase suspicious results count given the
     # current scoring implementation. This will be removed in the future.
     results.suspicious_results.add("unsafe_state_assignment")
+  if has_scan_error:
+    results.suspicious_results.add("sandbox_unpickling_error")
 
   return results
 

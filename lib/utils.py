@@ -32,7 +32,7 @@ import sys
 import tarfile
 import threading
 import types
-from typing import BinaryIO, Dict, FrozenSet, Generator, IO, Set, Tuple, cast
+from typing import BinaryIO, Callable, Dict, FrozenSet, Generator, IO, Set, Tuple, cast
 import zipfile
 
 from absl import logging
@@ -112,6 +112,67 @@ PYTHON_METHOD_PATTERNS = frozenset({
     re.compile(r"(\w+)\("),  # Function Calls (a())
     re.compile(r"[b]?['\"](\w+)['\"]"),  # String Arguments (like 'system')
 })
+
+
+PICKLEMAGIC_PATTERNS = [
+    (
+        "FakeWarning.__new__",
+        re.compile(
+            r"FakeWarning\.__new__ called on <class '(?P<class_name>.*?)'> with"
+            r" args=(?P<args>.*), kwargs=(?P<kwargs>.*)"
+        ),
+        False,
+    ),
+    (
+        "FakeWarning.__setstate__",
+        re.compile(
+            r"FakeWarning\.__setstate__ called on <class '(?P<class_name>.*?)'>"
+            r" with unexpected state=(?P<state>.*)"
+        ),
+        True,
+    ),
+    (
+        "FakeClass.__getattr__",
+        re.compile(
+            r"FakeClass\.__getattr__ called on <class '(?P<class_name>.*?)'>"
+            r" with name=(?P<attr_name>.*)"
+        ),
+        False,
+    ),
+    (
+        "FakeClass method",
+        re.compile(
+            r"FakeClass method (?P<method_name>.*?) called on <class"
+            r" '(?P<class_name>.*?)'> with args=(?P<args>.*),"
+            r" kwargs=(?P<kwargs>.*)"
+        ),
+        False,
+    ),
+    (
+        "FakeClass.__call__",
+        re.compile(
+            r"FakeClass\.__call__ called on <class '(?P<class_name>.*?)'> with"
+            r" args=(?P<args>.*), kwargs=(?P<kwargs>.*)"
+        ),
+        False,
+    ),
+    (
+        "FakeModule.__getattr__",
+        re.compile(
+            r"FakeModule\.__getattr__ called on (?P<module_name>.*?) with"
+            r" name=(?P<attr_name>.*)"
+        ),
+        False,
+    ),
+    (
+        "Failed to ",
+        re.compile(
+            r"Failed to (?:reduce|set state|newobj|newobj_ex|instantiate)"
+            r" <class '(?P<class_name>.*?)'> with (?P<args>.*?):"
+        ),
+        False,
+    ),
+]
 
 
 # Creates a copy of the module
@@ -790,3 +851,142 @@ def is_sys_executable_patched() -> bool:
 
   logging.warning("Warning: sys.executable is not set to a valid interpreter.")
   return False
+
+
+def _classify_item(item: str) -> Classification | None:
+  """Classifies a single item string into a Classification enum."""
+  if not item:
+    return None
+  if item in constants.UNSAFE_STRINGS:
+    return Classification.UNSAFE
+  if item in constants.SUSPICIOUS_STRINGS:
+    return Classification.SUSPICIOUS
+  if item in constants.SAFE_STRINGS:
+    return Classification.SAFE
+  return classify_class_name(item)
+
+
+def _parse_and_process_pattern(
+    line: str,
+    pattern: re.Pattern[str],
+    register_item: Callable[..., None],
+    is_suspicious_override: bool = False,
+) -> bool:
+  """Parses a log line using a named group regex and processes matches directly."""
+  match = pattern.search(line)
+  if not match:
+    return False
+
+  groups = match.groupdict()
+  class_name = groups.get("class_name")
+  method_name = groups.get("method_name")
+  attr_name = groups.get("attr_name")
+  module_name = groups.get("module_name")
+  args = groups.get("args", "")
+  kwargs = groups.get("kwargs", "")
+  state = groups.get("state", "")
+
+  if class_name:
+    register_item(
+        class_name,
+        Classification.SUSPICIOUS if is_suspicious_override else None,
+    )
+    if method_name:
+      register_item(f"{class_name}.{method_name}")
+  if attr_name:
+    register_item(attr_name)
+  if module_name:
+    register_item(module_name)
+
+  combined_args = (args or state) + " " + kwargs
+  if combined_args.strip():
+    for group in re.findall(
+        r"['\"](.*?)['\"]|([a-zA-Z_][a-zA-Z0-9_.]*(?:\(.*?\))?)", combined_args
+    ):
+      for token in group:
+        if token:
+          register_item(token)
+
+  return True
+
+
+def categorize_picklemagic(
+    filtered_output: io.StringIO,
+) -> Tuple[Set[str], Set[str], Set[str], Set[str]]:
+  """Parses and categorizes picklemagic log output."""
+  results: dict[Classification, Set[str]] = {
+      Classification.SAFE: set(),
+      Classification.UNSAFE: set(),
+      Classification.SUSPICIOUS: set(),
+      Classification.UNKNOWN: set(),
+  }
+
+  def register_item(item: str, override: Classification | None = None):
+    cls = override or _classify_item(item)
+    if cls is not None:
+      results[cls].add(item)
+
+  lines = filtered_output.getvalue().split("\n")
+  for line in lines:
+    if not line:
+      continue
+
+    if "Unsafe module/class invoked:" in line:
+      match = re.search(
+          r"Unsafe module/class invoked:\s*([a-zA-Z0-9_.]+)", line
+      )
+      if match:
+        full_name = match.group(1)
+        results[Classification.UNSAFE].add(full_name)
+        if "." in full_name:
+          results[Classification.UNSAFE].add(full_name.split(".", 1)[0])
+      continue
+
+    if "Unknown module/class imported:" in line:
+      match = re.search(
+          r"Unknown module/class imported:\s*([a-zA-Z0-9_.]+)", line
+      )
+      if match:
+        results[Classification.UNKNOWN].add(match.group(1))
+      continue
+
+    matched = False
+    for keyword, pattern, is_override in PICKLEMAGIC_PATTERNS:
+      if keyword in line:
+        if _parse_and_process_pattern(
+            line,
+            pattern,
+            register_item,
+            is_suspicious_override=is_override,
+        ):
+          matched = True
+          break
+
+    if matched:
+      continue
+
+    # Legacy fallback parsing
+    if line.lower().startswith("warning"):
+      match = re.search(
+          r"Unsafe module/class invoked:\s*([a-zA-Z0-9_.]+)", line
+      )
+      if match:
+        full_name = match.group(1)
+        results[Classification.UNSAFE].add(full_name)
+        if "." in full_name:
+          results[Classification.UNSAFE].add(full_name.split(".", 1)[0])
+    elif line.lower().startswith("<"):
+      class_args_match = ARGS_REGEX.search(line.lower())
+      if class_args_match:
+        register_item(class_args_match.group(1))
+        class_args = class_args_match.group(2)
+        for method_pattern in PYTHON_METHOD_PATTERNS:
+          for argument_find in method_pattern.findall(class_args):
+            register_item(argument_find)
+
+  return (
+      results[Classification.SAFE],
+      results[Classification.UNSAFE],
+      results[Classification.SUSPICIOUS],
+      results[Classification.UNKNOWN],
+  )
