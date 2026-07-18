@@ -217,7 +217,7 @@ def copy_module(original_name: str, new_name: str) -> types.ModuleType | None:
 
 
 _COPIED_MODS_CACHE: Dict[str, types.ModuleType] = {}
-_COPIED_MODS_LOCK = threading.Lock()
+_COPIED_MODS_LOCK = threading.RLock()
 
 
 def get_copied_module(name: str) -> types.ModuleType:
