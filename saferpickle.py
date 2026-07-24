@@ -443,7 +443,7 @@ def generate_ops(
 
   try:
     try:
-      for _, operand in _custom_genops(pickle_bytes):
+      for _, operand in _custom_genops(pickle_bytes):  # pyrefly: ignore[bad-argument-type]
         if operand is None:
           continue
         operand_str = str(operand)
@@ -456,7 +456,7 @@ def generate_ops(
     return filtered_operands
   finally:
     if original_pos is not None:
-      pickle_bytes.seek(original_pos)
+      pickle_bytes.seek(original_pos)  # pyrefly: ignore[missing-attribute]
 
 
 def get_class_instantiations(
@@ -530,7 +530,7 @@ def get_class_instantiations(
     logger.setLevel(original_level)
     logger.propagate = original_propagate
     if original_pos is not None:
-      pickle_bytes.seek(original_pos)
+      pickle_bytes.seek(original_pos)  # pyrefly: ignore[missing-attribute]
 
   was_unsafe_build_blocked = False
   if unpickler:
@@ -551,7 +551,7 @@ def categorize_strings(
         filtered_output
     )
   else:
-    safe, unsafe, suspicious, unknown = _categorize_genops(filtered_output)
+    safe, unsafe, suspicious, unknown = _categorize_genops(filtered_output)  # pyrefly: ignore[bad-argument-type]
   return _reclassify_with_resolution(safe, unsafe, suspicious, unknown)
 
 
@@ -683,7 +683,7 @@ def strict_security_scan(pickle_bytes: bytes | BinaryIO) -> bool:
     unsafe_and_suspicious_strings = constants.UNSAFE_STRINGS.union(
         constants.SUSPICIOUS_STRINGS
     )
-    for _, operand in _custom_genops(pickle_bytes):
+    for _, operand in _custom_genops(pickle_bytes):  # pyrefly: ignore[bad-argument-type]
       if operand is None:
         continue
       stmt = str(operand)
@@ -810,7 +810,7 @@ def genops_scan(
     A ScanResults object.
   """
   resolved_pickle_length = (
-      pickle_length if pickle_length is not None else len(pickle_bytes)
+      pickle_length if pickle_length is not None else len(pickle_bytes)  # pyrefly: ignore[bad-argument-type]
   )
   if shm_name:
     genops_output = generate_ops_from_file(
@@ -984,7 +984,7 @@ def security_scan(
 
     if is_archive:
       # Temporarily archive streams fully to bytes
-      archive_bytes = pickle_bytes.read()
+      archive_bytes = pickle_bytes.read()  # pyrefly: ignore[missing-attribute]
       if archive_bytes.startswith(b"PK\x03\x04"):
         archive_type = "zip"
       elif archive_bytes.startswith(b"BZh"):
@@ -1060,7 +1060,7 @@ def security_scan(
     )
   finally:
     if original_pos is not None:
-      pickle_bytes.seek(original_pos)
+      pickle_bytes.seek(original_pos)  # pyrefly: ignore[missing-attribute]
 
 
 def _merge_scores(total: Dict[str, int], new: Dict[str, int]):
@@ -1276,7 +1276,7 @@ def _security_scan_internal(
 
       # Fast path for BytesIO, chunked fallback for other streams
       if isinstance(stream, io.BytesIO):
-        shm.buf[:pickle_length] = stream.getbuffer()[
+        shm.buf[:pickle_length] = stream.getbuffer()[  # pyrefly: ignore[unsupported-operation]
             start_offset : start_offset + pickle_length
         ]
       else:
@@ -1288,7 +1288,7 @@ def _security_scan_internal(
             chunk = stream.read(1024 * 1024)
             if not chunk:
               break
-            shm.buf[offset : offset + len(chunk)] = chunk
+            shm.buf[offset : offset + len(chunk)] = chunk  # pyrefly: ignore[unsupported-operation]
             offset += len(chunk)
         finally:
           stream.seek(current_pos)
@@ -1453,7 +1453,7 @@ def _scan_and_load(
     load_args = (pickle_file,)
   else:
     load_func = loader_mod.loads  # pyrefly: ignore[missing-attribute]
-    load_args = (data_bytes,)
+    load_args = (data_bytes,)  # pyrefly: ignore[unbound-name]
 
   if strict_check and allow_unsafe:
     error_string_illegal_combination = (
@@ -1467,7 +1467,7 @@ def _scan_and_load(
     if report_only:
       logging.info("Loading pickle file with allow_unsafe set to True.")
   elif strict_check:
-    if strict_security_scan(scan_source):
+    if strict_security_scan(scan_source):  # pyrefly: ignore[bad-argument-type]
       error_string_strict_check = "Pickle file failed strict security check."
       if report_only:
         logging.error(error_string_strict_check)
@@ -1476,7 +1476,7 @@ def _scan_and_load(
   else:
     # Default scanning routines
     scan_scores = security_scan(
-        scan_source, force_scan=force_scan, check_magic_bytes=check_magic_bytes
+        scan_source, force_scan=force_scan, check_magic_bytes=check_magic_bytes  # pyrefly: ignore[bad-argument-type]
     )
     number_of_unsafe_results = scan_scores["unsafe"]
     number_of_suspicious_results = scan_scores["suspicious"]

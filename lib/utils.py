@@ -422,7 +422,7 @@ def is_pickle_file(
     if is_seekable:
       # Read a chunk to check text-based and non-pickle-magic prefixes safely
       raw_bytes = pickle_bytes.read(1024)
-      pickle_bytes.seek(original_pos)
+      pickle_bytes.seek(original_pos)  # pyrefly: ignore[bad-argument-type]
       pickle_stream = pickle_bytes
     else:
       # Fallback for non-seekable stream: try to peek without advancing pointer
