@@ -336,6 +336,42 @@ def is_lzma_bytes(file_bytes: bytes | BinaryIO) -> bool:
   return _peek_bytes(file_bytes, 6).startswith(b"\xfd\x37\x7a\x58\x5a\x00")
 
 
+def is_lzma_alone_bytes(file_bytes: bytes | BinaryIO) -> bool:
+  """Checks if the bytes/stream represent a legacy LZMA (.lzma) alone stream.
+
+  The XZ container carries the b"\\xfd7zXZ\\x00" magic, but the older
+  FORMAT_ALONE (.lzma) container has no magic bytes. lzma.open() decodes both
+  formats, so an alone-format stream has to be recognised from the structure of
+  its 13-byte header or it slips past archive routing.
+
+  Args:
+    file_bytes: The bytes or stream to check.
+
+  Returns:
+    True if the header matches a legacy LZMA alone stream, False otherwise.
+  """
+  peeked = _peek_bytes(file_bytes, 13)
+  if len(peeked) < 13:
+    return False
+  # Properties byte encodes (pb * 5 + lp) * 9 + lc; its maximum valid value is
+  # (4 * 5 + 4) * 9 + 8 == 224.
+  if peeked[0] > 224:
+    return False
+  dict_size = int.from_bytes(peeked[1:5], "little")
+  # Real encoders always pick a power-of-two dictionary size within the LZMA
+  # range of 4 KiB to 2 GiB.
+  if (
+      dict_size < (1 << 12)
+      or dict_size > (1 << 31)
+      or (dict_size & (dict_size - 1)) != 0
+  ):
+    return False
+  uncompressed_size = int.from_bytes(peeked[5:13], "little")
+  # The size field is either the streaming "unknown" sentinel or the real
+  # length, which comfortably fits in six bytes.
+  return uncompressed_size == 0xFFFFFFFFFFFFFFFF or uncompressed_size < (1 << 48)
+
+
 def extract_lzma_contents(file_bytes: bytes | BinaryIO) -> IO[bytes]:
   """Extracts contents from lzma bytes/stream as a stream."""
   stream = (
