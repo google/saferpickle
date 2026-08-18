@@ -565,19 +565,23 @@ def _categorize_genops(
   unknown_results: Set[str] = set()
 
   for line in filtered_output:
-    line_in_lowercase = line.lower()
+    # Match against the operand as-is. Python module and attribute names are
+    # case-sensitive and the string lists / patterns are case-sensitive too, so
+    # lowercasing here hides the mixed-case unsafe names (VirtualAlloc,
+    # CreateThread, RtlMoveMemory, WaitForSingleObject, Crypto, ...) that a
+    # global can carry.
     unsafe_match = any(
-        unsafe_string in line_in_lowercase
+        unsafe_string in line
         for unsafe_string in constants.UNSAFE_STRINGS
-    ) and re.findall(utils.unsafe_pattern, line_in_lowercase)
+    ) and re.findall(utils.unsafe_pattern, line)
     safe_match = any(
-        safe_string in line_in_lowercase
+        safe_string in line
         for safe_string in constants.SAFE_STRINGS
-    ) and re.findall(utils.safe_pattern, line_in_lowercase)
+    ) and re.findall(utils.safe_pattern, line)
     suspicious_match = any(
-        suspicious_string in line_in_lowercase
+        suspicious_string in line
         for suspicious_string in constants.SUSPICIOUS_STRINGS
-    ) and re.findall(utils.suspicious_pattern, line_in_lowercase)
+    ) and re.findall(utils.suspicious_pattern, line)
 
     if unsafe_match:
       for match in unsafe_match:
@@ -590,7 +594,7 @@ def _categorize_genops(
         suspicious_results.add(match)
     else:
       # Only check for unknown if no other categories matched
-      unknown_match = re.findall(utils.unknown_pattern, line_in_lowercase)
+      unknown_match = re.findall(utils.unknown_pattern, line)
       if unknown_match:
         for match in unknown_match:
           unknown_results.add(match)
