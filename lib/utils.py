@@ -293,9 +293,7 @@ def is_zip_bytes(file_bytes: bytes | BinaryIO) -> bool:
   """
   if not file_bytes:
     return False
-  return _peek_bytes(file_bytes, 4).startswith(
-      (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
-  )
+  return _peek_bytes(file_bytes, 4).startswith(constants.ZIP_MAGIC_BYTES)
 
 
 def extract_zip_contents(

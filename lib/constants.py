@@ -216,6 +216,11 @@ ERROR_STRING = string.Template(
 # Combination of all the globals for exclusion to identify unknown method calls
 ALL_STRINGS = UNSAFE_STRINGS.union(SUSPICIOUS_STRINGS).union(SAFE_STRINGS)
 
+# ZIP local file header, empty-archive end-of-central-directory record, and the
+# spanned-archive marker. zipfile opens archives beginning with any of these
+# since it reads the central directory at the end of the file.
+ZIP_MAGIC_BYTES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+
 NON_PICKLE_MAGIC_BYTES = (
     b"\x7fELF",  # ELF executable
     b"MZ",  # PE executable
