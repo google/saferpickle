@@ -1122,6 +1122,7 @@ def _extract_and_scan_archive(
           force_scan=force_scan,
           recursion_depth=recursion_depth + 1,
           fail_fast=fail_fast,
+          check_magic_bytes=check_magic_bytes,
       )
       _merge_scores(all_scores, scores)
 
@@ -1132,6 +1133,7 @@ def _extract_and_scan_archive(
           force_scan=force_scan,
           recursion_depth=recursion_depth + 1,
           fail_fast=fail_fast,
+          check_magic_bytes=check_magic_bytes,
       )
       _merge_scores(all_scores, scores)
 
@@ -1142,6 +1144,7 @@ def _extract_and_scan_archive(
           force_scan=force_scan,
           recursion_depth=recursion_depth + 1,
           fail_fast=fail_fast,
+          check_magic_bytes=check_magic_bytes,
       )
       _merge_scores(all_scores, scores)
 
