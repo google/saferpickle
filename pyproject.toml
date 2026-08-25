@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "saferpickle"
+version = "0.1.0"
+description = "A safer alternative to Python's pickle module."
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "The SaferPickle Authors", email = "saferpickle-dev@google.com" },
+]
+dependencies = [
+    "absl-py>=2.5.0",
+    "immutabledict>=4.3.1",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://github.com/google/saferpickle"
+
+[project.scripts]
+safer_pickle_cli = "cli:run"
+
+[dependency-groups]
+dev = [
+    "black>=26.5.1",
+    "isort>=8.0.1",
+    "pytest>=8.0.0",
+]
+
+[tool.setuptools]
+py-modules = ["saferpickle", "cli"]
+
+[tool.setuptools.packages.find]
+include = ["lib*", "third_party*"]
+
+[tool.black]
+target-version = ["py313"]
+extend-exclude = "third_party"
+
+[tool.isort]
+profile = "black"
+skip = ["third_party"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

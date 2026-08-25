@@ -36,7 +36,7 @@ You can use the `security_scan` function to scan a pickle file and get a report
 of the findings.
 
 ```py
-import safer_pickle
+import saferpickle
 import pickle
 
 class MyObject:
@@ -46,7 +46,7 @@ class MyObject:
 my_object = MyObject("some data")
 pickle_bytes = pickle.dumps(my_object)
 
-scan_results = safer_pickle.security_scan(pickle_bytes)
+scan_results = saferpickle.security_scan(pickle_bytes)
 
 if scan_results["unsafe"] > 0:
     print("Unsafe content found!")
@@ -67,47 +67,47 @@ security scan to all the standard pickle-like libraries (`pickle`, `_pickle`,
 application from unsafe pickles.
 
 ```py
-import safer_pickle
+import saferpickle
 import pickle
 
-safer_pickle.hook_pickle()
+saferpickle.hook_pickle()
 
 # Now, any call to pickle.load() or pickle.loads() will be protected.
 # For example, if you try to load a malicious pickle file, it will raise
-# a safer_pickle.UnsafePickleDetectedError.
+# a saferpickle.UnsafePickleDetectedError.
 
 try:
     # malicious_pickle_bytes is a pickle file that contains malicious code
     pickle.loads(malicious_pickle_bytes)
-except safer_pickle.UnsafePickleDetectedError as e:
+except saferpickle.UnsafePickleDetectedError as e:
     print(f"Blocked malicious pickle file: {e}")
 ```
 
-### 3. Use `safer_pickle.load()` and `safer_pickle.loads()`
+### 3. Use `saferpickle.load()` and `saferpickle.loads()`
 
-You can also use `safer_pickle.load()` and `safer_pickle.loads()` as direct
+You can also use `saferpickle.load()` and `saferpickle.loads()` as direct
 replacements for `pickle.load()` and `pickle.loads()`. These functions provide
 more control over the security scan.
 
 ```py
-import safer_pickle
+import saferpickle
 
-# This will raise a safer_pickle.UnsafePickleDetectedError if the pickle is unsafe
+# This will raise a saferpickle.UnsafePickleDetectedError if the pickle is unsafe
 try:
-    obj = safer_pickle.loads(malicious_pickle_bytes)
-except safer_pickle.UnsafePickleDetectedError as e:
+    obj = saferpickle.loads(malicious_pickle_bytes)
+except saferpickle.UnsafePickleDetectedError as e:
     print(f"Blocked malicious pickle file: {e}")
 
 # You can also use a strict check, which is more aggressive in detecting
 # potentially malicious content.
 try:
-    obj = safer_pickle.loads(malicious_pickle_bytes, strict_check=True)
-except safer_pickle.StrictCheckError as e:
+    obj = saferpickle.loads(malicious_pickle_bytes, strict_check=True)
+except saferpickle.StrictCheckError as e:
     print(f"Blocked by strict check: {e}")
 
 # If you trust the source of the pickle file, you can bypass the security scan.
 
-obj = safer_pickle.loads(pickle_bytes, allow_unsafe=True)
+obj = saferpickle.loads(pickle_bytes, allow_unsafe=True)
 ```
 
 ### 4. Command-Line Interface (CLI)
