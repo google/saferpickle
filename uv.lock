@@ -187,7 +187,6 @@ source = { editable = "." }
 dependencies = [
     { name = "absl-py" },
     { name = "immutabledict" },
-    { name = "pytest" },
 ]
 
 [package.dev-dependencies]
@@ -201,7 +200,6 @@ dev = [
 requires-dist = [
     { name = "absl-py", specifier = ">=2.5.0" },
     { name = "immutabledict", specifier = ">=4.3.1" },
-    { name = "pytest", specifier = ">=9.1.1" },
 ]
 
 [package.metadata.requires-dev]

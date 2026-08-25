@@ -15,7 +15,6 @@ authors = [
 dependencies = [
     "absl-py>=2.5.0",
     "immutabledict>=4.3.1",
-    "pytest>=9.1.1",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
