@@ -1,0 +1,10 @@
+[project]
+name = "saferpickle"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "absl-py>=2.5.0",
+    "immutabledict>=4.3.1",
+]
