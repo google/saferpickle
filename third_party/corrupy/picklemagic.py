@@ -841,29 +841,45 @@ class SafeUnpickler(FakeUnpickler):
       return
 
     try:
-      inst.__setstate__(state)
-    except AttributeError:
+      setstate = getattr(inst, "__setstate__", None)
+      if setstate is not None:
+        setstate(state)
+        return
+
       logger.warning(
           "Attribute __setstate__ is not available for object %s", type(inst)
       )
       # Standard pickle fallback: if __setstate__ is not defined,
       # update __dict__ or slots.
+      dict_state = state
+      slots_state = None
       if isinstance(state, tuple) and len(state) == 2:
         dict_state, slots_state = state
-        if isinstance(dict_state, dict):
-          inst.__dict__.update(dict_state)
-        if isinstance(slots_state, dict):
-          for slot, val in slots_state.items():
-            setattr(inst, slot, val)
-      elif isinstance(state, dict):
-        logger.info("Updating __dict__ of %s with state", type(inst))
-        inst.__dict__.update(state)
-      else:
+
+      if isinstance(dict_state, dict):
+        inst_dict = getattr(inst, "__dict__", None)
+        if isinstance(inst_dict, dict):
+          logger.info("Updating __dict__ of %s with state", type(inst))
+          inst_dict.update(dict_state)
+        elif inst_dict is not None:
+          for k, v in dict_state.items():
+            try:
+              setattr(inst, k, v)
+            except Exception:
+              pass
+      elif dict_state is not None:
         logger.warning(
             "Cannot update state of %s with state of type %s",
             type(inst),
-            type(state),
+            type(dict_state),
         )
+
+      if isinstance(slots_state, dict):
+        for slot, val in slots_state.items():
+          try:
+            setattr(inst, slot, val)
+          except Exception:
+            pass
     except Exception as e:  # pylint: disable=broad-exception-caught
       logger.warning("Failed to set state on %s: %s", type(inst), e)
       logger.info("Proceeding after state failure on %s", type(inst))
