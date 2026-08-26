@@ -639,6 +639,17 @@ def get_optimal_workers(file_size: int) -> int:
 @functools.lru_cache(maxsize=None)
 def classify_class_name(class_name: str) -> Classification | None:
   """Classifies a class name based on the safe, unsafe, and suspicious patterns."""
+  # An exact list membership is more specific than a pattern match, so honor it
+  # first (most dangerous wins). Otherwise a specific unsafe entry like
+  # "pydoc.pipepager" is masked by the safe pattern for its module ("pydoc"),
+  # while a specific safe entry like "shutil.disk_usage" still beats the unsafe
+  # pattern for its module ("shutil"). This matches _classify_item's ordering.
+  if class_name in constants.UNSAFE_STRINGS:
+    return Classification.UNSAFE
+  if class_name in constants.SUSPICIOUS_STRINGS:
+    return Classification.SUSPICIOUS
+  if class_name in constants.SAFE_STRINGS:
+    return Classification.SAFE
   if re.search(safe_pattern, class_name):
     return Classification.SAFE
   if re.search(unsafe_pattern, class_name):
