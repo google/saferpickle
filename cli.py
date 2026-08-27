@@ -107,7 +107,7 @@ def security_scan_with_justifications(
 
   # Check for safety and return the results with justifications.
   if saferpickle.is_unsafe(num_safe, num_unsafe, num_suspicious):
-    if num_unsafe > num_suspicious:
+    if num_unsafe > 0:
       classification = "unsafe"
       all_results = []
       if unsafe_results:
