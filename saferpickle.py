@@ -24,15 +24,12 @@ import logging as std_logging
 import lzma
 import math
 import mmap
-from multiprocessing import shared_memory
-import os
 import pickle
 import pickletools
 import re
 import struct
 import sys
 import tarfile
-import tempfile
 import threading
 from typing import (
     Any,
@@ -83,6 +80,75 @@ class ScanResults:
   is_denylisted: bool = False
 
 
+def _get_stream_pos(stream: Any) -> Optional[int]:
+  """Safely retrieves the current byte offset of a stream if supported.
+
+  Attempts to call `stream.tell()` and catches unsupported stream or OS errors
+  so non-seekable streams return `None` instead of raising.
+
+  Args:
+    stream: A file-like stream object.
+
+  Returns:
+    The current integer byte position of `stream`, or None if unavailable.
+  """
+  try:
+    return stream.tell()
+  except (OSError, AttributeError, io.UnsupportedOperation):
+    return None
+
+
+def _resolve_pickle_length(
+    pickle_bytes: Any,
+    pickle_length: Optional[int],
+) -> int:
+  """Resolves the remaining byte length of a pickle buffer or stream.
+
+  Computes the exact remaining byte count for in-memory buffers (`bytes`,
+  `bytearray`, `memoryview`, `mmap.mmap`, `io.BytesIO`) and seekable streams
+  while preserving stream position, returning `0` for non-seekable streams.
+
+  Args:
+    pickle_bytes: In-memory byte buffer or binary stream to inspect.
+    pickle_length: Explicit byte length override, if already known.
+
+  Returns:
+    The non-negative byte length, or `0` if `pickle_bytes` is non-seekable.
+  """
+  if pickle_length is not None:
+    return pickle_length
+
+  if isinstance(pickle_bytes, (bytes, bytearray, memoryview, mmap.mmap)):
+    return len(pickle_bytes)
+
+  if isinstance(pickle_bytes, io.BytesIO):
+    return max(0, len(pickle_bytes.getbuffer()) - pickle_bytes.tell())
+
+  seekable_fn = getattr(pickle_bytes, "seekable", None)
+  if callable(seekable_fn):
+    try:
+      if not seekable_fn():
+        return 0
+    except (OSError, AttributeError, io.UnsupportedOperation):
+      return 0
+
+  cur_pos = _get_stream_pos(pickle_bytes)
+  if cur_pos is None:
+    return 0
+
+  try:
+    end_pos = pickle_bytes.seek(0, io.SEEK_END)
+    pickle_bytes.seek(cur_pos)
+  except (OSError, AttributeError, io.UnsupportedOperation):
+    try:
+      pickle_bytes.seek(cur_pos)
+    except (OSError, AttributeError, io.UnsupportedOperation):
+      pass
+    return 0
+
+  return max(0, end_pos - cur_pos)
+
+
 def _custom_genops(
     pickle_bytes: bytes | BinaryIO,
 ) -> Iterator[tuple[Optional[pickletools.OpcodeInfo], Any | None]]:
@@ -109,11 +175,7 @@ def _custom_genops(
       )
       return
 
-  start_position = None
-  try:
-    start_position = pickle_bytes.tell()
-  except (OSError, AttributeError, io.UnsupportedOperation):
-    pass
+  start_position = _get_stream_pos(pickle_bytes)
   try:
     data_bytes = pickle_bytes.read(-1)
   finally:
@@ -171,7 +233,7 @@ def _scan_byte_slice(
     if operand is not None:
       operand_string = str(operand)
       discovered_operands.add(operand_string)
-      if fail_fast and utils.is_unsafe_or_suspicious(operand_string):
+      if fail_fast and utils.is_unsafe_for_fail_fast(operand_string):
         if abort_event is not None:
           abort_event.set()
         break
@@ -180,104 +242,99 @@ def _scan_byte_slice(
 
 def generate_ops_from_file(
     pickle_file_path: str,
-    shared_memory_name: Optional[str] = None,
     pickle_length: Optional[int] = None,
     fail_fast: Optional[bool] = DEFAULT_FAIL_FAST,
-    shm_name: Optional[str] = None,
+    data_buffer: Optional[bytes | mmap.mmap] = None,
 ) -> Set[str]:
-  """Returns opcodes that declare strings from a path or shared memory.
+  """Returns opcodes that declare strings from a path or in-memory buffer.
 
   Reads pickle bytecode and partitions large payloads for parallel
   scanning using threads.
 
   Args:
     pickle_file_path: The filesystem path to the pickle file.
-    shared_memory_name: Optional name of the shared memory block.
     pickle_length: Optional length of the pickle data in bytes.
     fail_fast: Whether to fail fast on first unsafe or suspicious match.
-    shm_name: Deprecated alias for shared_memory_name.
+    data_buffer: Optional in-memory bytes or mmap buffer for zero-copy scanning.
 
   Returns:
     The operands associated with opcodes declaring strings.
   """
-  target_shared_memory_name = shared_memory_name or shm_name
-  shared_memory_block = None
-  try:
-    if target_shared_memory_name:
-      shared_memory_block = shared_memory.SharedMemory(
-          name=target_shared_memory_name
+  if data_buffer is not None:
+    pickle_bytes = data_buffer
+  else:
+    with open(pickle_file_path, "rb") as file_handle:
+      pickle_bytes = (
+          file_handle.read(pickle_length)
+          if pickle_length is not None
+          else file_handle.read()
       )
-      pickle_bytes = getattr(shared_memory_block, "_mmap")
-    else:
-      with open(pickle_file_path, "rb") as file_handle:
-        pickle_bytes = file_handle.read()
 
-    effective_length = (
-        pickle_length if pickle_length is not None else len(pickle_bytes)
-    )
-    num_workers = utils.get_optimal_workers(effective_length)
+  effective_length = (
+      min(pickle_length, len(pickle_bytes))
+      if pickle_length is not None
+      else len(pickle_bytes)
+  )
+  num_workers = utils.get_optimal_workers(effective_length)
 
-    if (
-        effective_length < constants.MIN_SIZE_FOR_CHUNKING
-        or num_workers <= 1
-        or not utils.is_sys_executable_patched()
-    ):
-      all_operands = set()
-      for _, operand in utils.custom_genops_from_bytes(
-          pickle_bytes, end=effective_length
-      ):
-        if operand is not None:
-          operand_string = str(operand)
-          all_operands.add(operand_string)
-          if fail_fast and utils.is_unsafe_or_suspicious(operand_string):
-            break
-      return all_operands
-
-    target_chunk_size = max(
-        constants.MIN_SIZE_FOR_CHUNKING, effective_length // num_workers
-    )
-    chunk_ranges = utils.partition_pickle_chunks(
-        pickle_bytes,
-        target_chunk_size,
-        end=effective_length,
-        include_memo=True,
-    )
-
+  if (
+      effective_length < constants.MIN_SIZE_FOR_CHUNKING
+      or num_workers <= 1
+      or not utils.is_sys_executable_patched()
+  ):
     all_operands = set()
-    abort_event = threading.Event() if fail_fast else None
-
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=len(chunk_ranges)
-    ) as executor:
-      futures = [
-          executor.submit(
-              _scan_byte_slice,
-              pickle_bytes,
-              start_offset,
-              end_offset,
-              seed_stack,
-              bool(fail_fast),
-              abort_event,
-              seed_memo,
-          )
-          for start_offset, end_offset, seed_stack, seed_memo in chunk_ranges
-      ]
-      for future in concurrent.futures.as_completed(futures):
-        chunk_results = future.result()
-        all_operands.update(chunk_results)
-        if fail_fast and any(
-            utils.is_unsafe_or_suspicious(item) for item in chunk_results
-        ):
-          if abort_event:
-            abort_event.set()
-          for running_future in futures:
-            running_future.cancel()
+    for _, operand in utils.custom_genops_from_bytes(
+        pickle_bytes, end=effective_length
+    ):
+      if operand is not None:
+        operand_string = str(operand)
+        all_operands.add(operand_string)
+        if fail_fast and utils.is_unsafe_for_fail_fast(operand_string):
           break
-
     return all_operands
-  finally:
-    if shared_memory_block is not None:
-      shared_memory_block.close()
+
+  target_chunk_size = max(
+      constants.MIN_SIZE_FOR_CHUNKING, effective_length // num_workers
+  )
+  chunk_ranges = utils.partition_pickle_chunks(
+      pickle_bytes,
+      target_chunk_size,
+      end=effective_length,
+      include_memo=True,
+  )
+
+  all_operands = set()
+  abort_event = threading.Event() if fail_fast else None
+
+  with concurrent.futures.ThreadPoolExecutor(
+      max_workers=len(chunk_ranges)
+  ) as executor:
+    futures = [
+        executor.submit(
+            _scan_byte_slice,
+            pickle_bytes,
+            start_offset,
+            end_offset,
+            seed_stack,
+            bool(fail_fast),
+            abort_event,
+            seed_memo,
+        )
+        for start_offset, end_offset, seed_stack, seed_memo in chunk_ranges
+    ]
+    for future in concurrent.futures.as_completed(futures):
+      chunk_results = future.result()
+      all_operands.update(chunk_results)
+      if fail_fast and any(
+          utils.is_unsafe_for_fail_fast(item) for item in chunk_results
+      ):
+        if abort_event:
+          abort_event.set()
+        for running_future in futures:
+          running_future.cancel()
+        break
+
+  return all_operands
 
 
 def generate_ops(
@@ -295,9 +352,11 @@ def generate_ops(
     strings.
   """
   filtered_operands = set()
-  original_pos = None
-  if not isinstance(pickle_bytes, bytes):
-    original_pos = pickle_bytes.tell()
+  original_pos = (
+      None
+      if isinstance(pickle_bytes, (bytes, bytearray, memoryview, mmap.mmap))
+      else _get_stream_pos(pickle_bytes)
+  )
 
   try:
     try:
@@ -306,15 +365,17 @@ def generate_ops(
           continue
         operand_str = str(operand)
         filtered_operands.add(operand_str)
-        if fail_fast:
-          if utils.is_unsafe_or_suspicious(operand_str):
-            break
+        if fail_fast and utils.is_unsafe_for_fail_fast(operand_str):
+          break
     except StopIteration:
       pass
     return filtered_operands
   finally:
     if original_pos is not None:
-      pickle_bytes.seek(original_pos)  # pyrefly: ignore[missing-attribute]
+      try:
+        pickle_bytes.seek(original_pos)  # pyrefly: ignore[missing-attribute]
+      except (OSError, AttributeError, io.UnsupportedOperation):
+        pass
 
 
 class SaferUnpickler(picklemagic.SafeUnpickler):
@@ -325,21 +386,200 @@ class SaferUnpickler(picklemagic.SafeUnpickler):
   untrusted classes.
   """
 
-  def _state_contains_fake_class(
+  def __init__(self, file: Any, *args: Any, **kwargs: Any) -> None:
+    """Initializes `SaferUnpickler` with CRLF normalization and byte loaders.
+
+    Wraps `self._file_readline` to normalize trailing CRLF sequences to LF for
+    Protocol 0 opcodes and registers fast dispatch handlers for binary byte
+    opcodes (`BINBYTES`, `BINSTRING`, `BINBYTES8`, `BYTEARRAY8`).
+
+    Args:
+      file: Binary file-like stream containing pickle bytecode.
+      *args: Additional positional arguments forwarded to `SafeUnpickler`.
+      **kwargs: Additional keyword arguments forwarded to `SafeUnpickler`.
+
+    Returns:
+      None.
+    """
+    super().__init__(file, *args, **kwargs)
+    self._raw_stream = file
+
+    original_file_readline = self._file_readline
+
+    def _normalized_readline() -> bytes:
+      """Reads a single line from the stream and normalizes CRLF to LF.
+
+      Calls the underlying unpickler's `_file_readline` and strips any carriage
+      return immediately preceding the terminating newline.
+
+      Returns:
+        The line bytes with a trailing CRLF normalized to LF.
+      """
+      line = original_file_readline()
+      if line.endswith(b"\r\n"):
+        return line[:-2] + b"\n"
+      return line
+
+    self._file_readline = _normalized_readline
+
+    self.dispatch = self.dispatch.copy()
+    self.dispatch[pickle.BINBYTES[0]] = self._load_binbytes_fast
+    if hasattr(pickle, "BINBYTES8"):
+      self.dispatch[pickle.BINBYTES8[0]] = self._load_binbytes8_fast
+    if hasattr(pickle, "BYTEARRAY8"):
+      self.dispatch[pickle.BYTEARRAY8[0]] = self._load_bytearray8_fast
+
+  def _skip_or_read_bytes(
+      self, length: int, as_bytearray: bool = False
+  ) -> None:
+    """Reads small byte payloads or skips payloads larger than 4096 bytes.
+
+    Reads and pushes the exact payload onto the unpickler stack when
+    `length <= 4096`, or advances the stream and pushes an empty `bytes` or
+    `bytearray` placeholder when `length > 4096`.
+
+    Args:
+      length: Number of bytes in the opcode payload.
+      as_bytearray: Whether to push a `bytearray` instead of `bytes` onto the
+        unpickler stack.
+
+    Returns:
+      None.
+
+    Raises:
+      pickle.UnpicklingError: If `length` is negative.
+      EOFError: If the stream is truncated before `length` bytes.
+    """
+    if length < 0:
+      raise pickle.UnpicklingError("BINBYTES/BYTEARRAY count < 0")
+
+    unframer = getattr(self, "_unframer", None)
+    current_frame = getattr(unframer, "current_frame", None)
+    if (
+        length > 4096
+        and current_frame is None
+        and hasattr(self._raw_stream, "seek")
+        and hasattr(self._raw_stream, "tell")
+    ):
+      cur_pos = self._raw_stream.tell()
+      self._raw_stream.seek(0, io.SEEK_END)
+      end_pos = self._raw_stream.tell()
+      if cur_pos + length > end_pos:
+        self._raw_stream.seek(end_pos)
+        raise EOFError("Truncated binary payload in pickle stream")
+
+      self._raw_stream.seek(cur_pos + length)
+      self.append(bytearray() if as_bytearray else b"")
+      return
+
+    data = self.read(length)
+    if len(data) != length:
+      raise EOFError("Truncated binary payload in pickle stream")
+
+    self.append(bytearray(data) if as_bytearray else data)
+
+  def _load_binbytes_fast(self, *unused_args: Any) -> None:
+    """Dispatches `BINBYTES` using a 4-byte unsigned little-endian length.
+
+    Reads the 4-byte length prefix from the stream and delegates payload
+    handling to `_skip_or_read_bytes`.
+
+    Args:
+      *unused_args: Unused dispatch arguments passed by the unpickler loop.
+
+    Returns:
+      None.
+    """
+    self._skip_or_read_bytes(struct.unpack("<I", self.read(4))[0])
+
+  def _load_binbytes8_fast(self, *unused_args: Any) -> None:
+    """Dispatches `BINBYTES8` using an 8-byte unsigned little-endian length.
+
+    Reads the 8-byte length prefix from the stream and delegates payload
+    handling to `_skip_or_read_bytes`.
+
+    Args:
+      *unused_args: Unused dispatch arguments passed by the unpickler loop.
+
+    Returns:
+      None.
+    """
+    self._skip_or_read_bytes(struct.unpack("<Q", self.read(8))[0])
+
+  def _load_bytearray8_fast(self, *unused_args: Any) -> None:
+    """Dispatches `BYTEARRAY8` using an 8-byte unsigned little-endian length.
+
+    Reads the 8-byte length prefix from the stream and delegates payload
+    handling to `_skip_or_read_bytes` with `as_bytearray=True`.
+
+    Args:
+      *unused_args: Unused dispatch arguments passed by the unpickler loop.
+
+    Returns:
+      None.
+    """
+    self._skip_or_read_bytes(
+        struct.unpack("<Q", self.read(8))[0], as_bytearray=True
+    )
+
+  def load_reduce(self, *unused_args: Any) -> None:
+    """Executes the `REDUCE` opcode safely within the `picklemagic` sandbox.
+
+    Flags `REDUCE` instructions whose argument tuple contains `UNSAFE`,
+    `SUSPICIOUS`, or deny-listed `FakeClass` objects while allowing `UNKNOWN`
+    sandbox placeholders, and replaces failed reductions with a
+    `picklemagic.failed_reduce` placeholder.
+
+    Args:
+      *unused_args: Unused dispatch arguments passed by the unpickler loop.
+
+    Returns:
+      None.
+    """
+    stack = self.stack
+    args = stack.pop()
+    func = stack[-1]
+
+    if self._state_contains_fake_class(args, only_suspicious=True):
+      self.has_blocked_unsafe_build_instr = True
+
+    try:
+      stack[-1] = func(*args)
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      std_logging.getLogger("corrupy.picklemagic").warning(
+          "Failed to reduce %s with %s: %s", func, args, e
+      )
+      stack[-1] = self.class_factory("failed_reduce", "picklemagic")()
+
+  def _state_contains_fake_class(  # pyrefly: ignore[bad-override]
       self,
       object_to_inspect: Any,
       visited_object_ids: Optional[Set[int]] = None,
+      only_suspicious: bool = False,
+      inspection_depth: int = 0,
   ) -> bool:
     """Recursively inspects an object to detect FakeClass instances or types.
+
+    Traverses containers, `__dict__` attributes, and `__slots__` while tracking
+    visited object IDs to prevent infinite recursion on cyclic object graphs.
 
     Args:
       object_to_inspect: The candidate object, container, or state dictionary.
       visited_object_ids: Set of memory addresses visited to prevent infinite
         cycles in self-referential structures.
+      only_suspicious: If True, only flags `FakeClass` symbols classified as
+        `UNSAFE`, `SUSPICIOUS`, deny-listed, or `picklemagic` error placeholders
+        rather than `UNKNOWN` symbols.
+      inspection_depth: Current recursion depth within the inspected object
+        graph.
 
     Returns:
-      True if the object contains a FakeClass instance or type, False otherwise.
+      True if the object contains a matching FakeClass instance or type, or
+      False otherwise.
     """
+    if inspection_depth > 64:
+      return True
+
     # Primitive immutable types cannot harbor custom objects so we quickly
     # return
     if isinstance(
@@ -379,9 +619,6 @@ class SaferUnpickler(picklemagic.SafeUnpickler):
       return False
     visited_object_ids.add(current_object_id)
 
-    # Multiple checks below involve checking FakeClasses, dicts, sets,
-    # lists, __slots__ and tuples
-
     # Check if target object is an unapproved sandbox FakeClass or
     # FakeClassType.
     if isinstance(
@@ -390,18 +627,68 @@ class SaferUnpickler(picklemagic.SafeUnpickler):
         isinstance(object_to_inspect, type)
         and issubclass(object_to_inspect, picklemagic.FakeClass)
     ):
-      return True
+      if isinstance(object_to_inspect, picklemagic.FakeClass):
+        module_name = object_to_inspect.__class__.__module__
+        attribute_name = object_to_inspect.__class__.__name__
+      else:
+        module_name = getattr(object_to_inspect, "__module__", "")
+        attribute_name = getattr(object_to_inspect, "__name__", "")
+
+      full_symbol_name = (
+          f"{module_name}.{attribute_name}"
+          if module_name and attribute_name
+          else (module_name or attribute_name)
+      )
+      if (
+          not full_symbol_name
+          or module_name == "picklemagic"
+          or utils.matches_symbol_prefix_list(
+              full_symbol_name, config.get_deny_list()
+          )
+      ):
+        return True
+
+      if is_self_protected := utils.is_self_protected_symbol(full_symbol_name):
+        return True
+
+      if not is_self_protected and not utils.matches_symbol_prefix_list(
+          full_symbol_name, config.get_allow_list()
+      ):
+        cls_verdict = utils.classify_symbol(full_symbol_name)
+        if only_suspicious:
+          if cls_verdict in (
+              utils.Classification.UNSAFE,
+              utils.Classification.SUSPICIOUS,
+          ):
+            return True
+        elif cls_verdict != utils.Classification.SAFE:
+          return True
 
     if isinstance(object_to_inspect, (list, tuple, set, frozenset)):
       return any(
-          self._state_contains_fake_class(element, visited_object_ids)
+          self._state_contains_fake_class(
+              element,
+              visited_object_ids,
+              only_suspicious,
+              inspection_depth + 1,
+          )
           for element in object_to_inspect
       )
 
     if isinstance(object_to_inspect, dict):
       return any(
-          self._state_contains_fake_class(dict_key, visited_object_ids)
-          or self._state_contains_fake_class(dict_value, visited_object_ids)
+          self._state_contains_fake_class(
+              dict_key,
+              visited_object_ids,
+              only_suspicious,
+              inspection_depth + 1,
+          )
+          or self._state_contains_fake_class(
+              dict_value,
+              visited_object_ids,
+              only_suspicious,
+              inspection_depth + 1,
+          )
           for dict_key, dict_value in object_to_inspect.items()
       )
 
@@ -410,22 +697,35 @@ class SaferUnpickler(picklemagic.SafeUnpickler):
     ):
       instance_attributes = getattr(object_to_inspect, "__dict__")
       if any(
-          self._state_contains_fake_class(attribute_name, visited_object_ids)
+          self._state_contains_fake_class(
+              attribute_name,
+              visited_object_ids,
+              only_suspicious,
+              inspection_depth + 1,
+          )
           or self._state_contains_fake_class(
-              attribute_value, visited_object_ids
+              attribute_value,
+              visited_object_ids,
+              only_suspicious,
+              inspection_depth + 1,
           )
           for attribute_name, attribute_value in instance_attributes.items()
       ):
         return True
 
-    if hasattr(object_to_inspect, "__slots__"):
-      slot_names = getattr(object_to_inspect, "__slots__")
-      if isinstance(slot_names, str):
-        slot_names = [slot_names]
+    slot_names = getattr(type(object_to_inspect), "__slots__", None)
+    if isinstance(slot_names, str):
+      slot_names = (slot_names,)
+    if isinstance(slot_names, (list, tuple, set, frozenset)):
       for slot_name in slot_names:
-        if hasattr(object_to_inspect, slot_name):
+        if isinstance(slot_name, str) and hasattr(object_to_inspect, slot_name):
           slot_value = getattr(object_to_inspect, slot_name)
-          if self._state_contains_fake_class(slot_value, visited_object_ids):
+          if self._state_contains_fake_class(
+              slot_value,
+              visited_object_ids,
+              only_suspicious,
+              inspection_depth + 1,
+          ):
             return True
 
     return False
@@ -531,43 +831,18 @@ def _categorize_genops(
     filtered_output: Set[str],
 ) -> Tuple[Set[str], Set[str], Set[str], Set[str]]:
   """Helper to categorize genops output."""
-  safe_results: Set[str] = set()
-  unsafe_results: Set[str] = set()
-  suspicious_results: Set[str] = set()
-  unknown_results: Set[str] = set()
-
+  results: dict[utils.Classification, Set[str]] = {
+      cls: set() for cls in utils.Classification
+  }
   for line in filtered_output:
-    line_in_lowercase = line.lower()
-    unsafe_match = any(
-        unsafe_string in line_in_lowercase
-        for unsafe_string in constants.UNSAFE_STRINGS
-    ) and re.findall(utils.unsafe_pattern, line_in_lowercase)
-    safe_match = any(
-        safe_string in line_in_lowercase
-        for safe_string in constants.SAFE_STRINGS
-    ) and re.findall(utils.safe_pattern, line_in_lowercase)
-    suspicious_match = any(
-        suspicious_string in line_in_lowercase
-        for suspicious_string in constants.SUSPICIOUS_STRINGS
-    ) and re.findall(utils.suspicious_pattern, line_in_lowercase)
+    results[utils.classify_symbol(line)].add(line)
 
-    if unsafe_match:
-      for match in unsafe_match:
-        unsafe_results.add(match)
-    elif safe_match:
-      for match in safe_match:
-        safe_results.add(match)
-    elif suspicious_match:
-      for match in suspicious_match:
-        suspicious_results.add(match)
-    else:
-      # Only check for unknown if no other categories matched
-      unknown_match = re.findall(utils.unknown_pattern, line_in_lowercase)
-      if unknown_match:
-        for match in unknown_match:
-          unknown_results.add(match)
-
-  return safe_results, unsafe_results, suspicious_results, unknown_results
+  return (
+      results[utils.Classification.SAFE],
+      results[utils.Classification.UNSAFE],
+      results[utils.Classification.SUSPICIOUS],
+      results[utils.Classification.UNKNOWN],
+  )
 
 
 def _reclassify_with_resolution(
@@ -582,15 +857,16 @@ def _reclassify_with_resolution(
 
   # Only resolve qualified symbols (e.g. 'pkg.mod') to avoid plain words.
   candidate_results = safe_results.union(unsafe_results, suspicious_results)
-  dotted_unknowns = {
+  resolvable_unknowns = {
       unknown_symbol
       for unknown_symbol in unknown_results
       if "." in unknown_symbol
+      or utils.classify_symbol(unknown_symbol) != utils.Classification.UNKNOWN
   }
-  all_candidates = candidate_results.union(dotted_unknowns)
+  all_candidates = candidate_results.union(resolvable_unknowns)
 
   resolved_results = utils.resolve_library_modules_from_results(all_candidates)
-  resolved_results.update(unknown_results - dotted_unknowns)
+  resolved_results.update(unknown_results - resolvable_unknowns)
 
   # Re-categorize the resolved results
   new_safe_results = set()
@@ -600,12 +876,14 @@ def _reclassify_with_resolution(
   is_denylisted = False
 
   for result in resolved_results:
-    if any(result.startswith(denied_item) for denied_item in deny_list):
+    if utils.matches_symbol_prefix_list(result, deny_list):
       new_unsafe_results.add(result)
       is_denylisted = True
       continue
 
-    if any(result.startswith(allowed_item) for allowed_item in allow_list):
+    if not utils.is_self_protected_symbol(
+        result
+    ) and utils.matches_symbol_prefix_list(result, allow_list):
       new_safe_results.add(result)
       continue
 
@@ -614,7 +892,7 @@ def _reclassify_with_resolution(
       continue
 
     # Classify the resolved result
-    classification = utils.classify_class_name(result)
+    classification = utils.classify_symbol(result)
 
     if classification == utils.Classification.SAFE:
       new_safe_results.add(result)
@@ -624,7 +902,6 @@ def _reclassify_with_resolution(
       new_suspicious_results.add(result)
     elif classification == utils.Classification.UNKNOWN:
       # Fallback: Check against original categories if
-      # classify_class_name returns UNKNOWN.
       if result in unsafe_results:
         new_unsafe_results.add(result)
       elif result in suspicious_results:
@@ -684,15 +961,11 @@ def strict_security_scan(pickle_bytes: bytes | BinaryIO) -> bool:
     if was_unsafe_build_blocked or has_scan_error:
       return True
 
-    instantiations = instantiations_output.getvalue().split("\n")
-    for instantiation in instantiations:
-      if re.search(utils.unknown_pattern, instantiation):
-        return True
-      # This is a noisy but necessary check for a small number of cases where
-      # a library is not explicitly imported but is used in a
-      # class instantiation in a suspicious manner.
-      if re.search(utils.suspicious_pattern, instantiation):
-        return True
+    _, unsafe_items, suspicious_items, unknown_items = (
+        utils.categorize_picklemagic(instantiations_output)
+    )
+    if unsafe_items or suspicious_items or unknown_items:
+      return True
   finally:
     if original_pos is not None and hasattr(pickle_bytes, "seek"):
       try:
@@ -704,14 +977,15 @@ def strict_security_scan(pickle_bytes: bytes | BinaryIO) -> bool:
 
 
 def is_unsafe(
-    number_of_safe_results: int,
+    unused_number_of_safe_results: int,
     number_of_unsafe_results: int,
     number_of_suspicious_results: int,
 ) -> bool:
   """Conditional check for safeness.
 
   Args:
-    number_of_safe_results: Number of safe results from the security scan.
+    unused_number_of_safe_results: Number of safe results from the security
+      scan.
     number_of_unsafe_results: Number of unsafe results from the security scan.
     number_of_suspicious_results: Number of suspicious results from the security
       scan.
@@ -719,26 +993,7 @@ def is_unsafe(
   Returns:
     True if the pickle file is dangerous, False otherwise.
   """
-  if number_of_unsafe_results == 0 and number_of_suspicious_results == 0:
-    return False
-
-  # We halve the weight of suspicious results to lower false positives
-  # caused by greedy matches of unknown method-like strings (Ex. "google.com")
-  if (
-      number_of_suspicious_results + number_of_unsafe_results
-      >= number_of_safe_results
-  ):
-    return True
-
-  sum_of_unsafe_and_suspicious_results = (
-      number_of_unsafe_results + 0.5 * number_of_suspicious_results
-  )
-
-  unsafe = (sum_of_unsafe_and_suspicious_results > number_of_safe_results) or (
-      number_of_safe_results == 0 and sum_of_unsafe_and_suspicious_results >= 1
-  )
-
-  return unsafe
+  return number_of_unsafe_results > 0 or number_of_suspicious_results > 0
 
 
 def picklemagic_scan(
@@ -771,43 +1026,58 @@ def picklemagic_scan(
 def genops_scan(
     pickle_bytes: bytes | IO[bytes],
     pickle_file_path: Optional[str] = None,
-    shared_memory_name: Optional[str] = None,
     fail_fast: Optional[bool] = DEFAULT_FAIL_FAST,
     pickle_length: Optional[int] = None,
-    shm_name: Optional[str] = None,
 ) -> ScanResults:
   """Genops scan for malicious content in pickle files.
 
   Args:
     pickle_bytes: Pickle bytecode to scan.
     pickle_file_path: Optional path to the pickle file for streaming scan.
-    shared_memory_name: Optional name of the shared memory block.
     fail_fast: Whether to fail fast on first unsafe or suspicious match.
     pickle_length: Optional length of the pickle data in bytes.
-    shm_name: Deprecated alias for shared_memory_name.
 
   Returns:
     A ScanResults object.
   """
-  resolved_pickle_length = (
-      pickle_length if pickle_length is not None else len(pickle_bytes)  # pyrefly: ignore[bad-argument-type]
-  )
-  target_shared_memory_name = shared_memory_name or shm_name
-  if target_shared_memory_name:
-    genops_output = generate_ops_from_file(
-        "",
-        shared_memory_name=target_shared_memory_name,
-        pickle_length=resolved_pickle_length,
-        fail_fast=fail_fast,
-    )
-  elif pickle_file_path:
+  if pickle_file_path:
     genops_output = generate_ops_from_file(
         pickle_file_path,
+        pickle_length=pickle_length,
+        fail_fast=fail_fast,
+    )
+    return categorize_strings(genops_output)
+
+  resolved_pickle_length = _resolve_pickle_length(pickle_bytes, pickle_length)
+  if resolved_pickle_length >= constants.MIN_SIZE_FOR_CHUNKING:
+    if isinstance(pickle_bytes, (bytes, mmap.mmap)):
+      data_buffer = pickle_bytes
+    elif isinstance(pickle_bytes, (bytearray, memoryview)):
+      data_buffer = bytes(pickle_bytes)
+    elif isinstance(pickle_bytes, io.BytesIO):
+      cur_pos = pickle_bytes.tell()
+      full_bytes = pickle_bytes.getvalue()
+      data_buffer = full_bytes if cur_pos == 0 else full_bytes[cur_pos:]
+    else:
+      cur_pos = _get_stream_pos(pickle_bytes)
+      try:
+        data_buffer = pickle_bytes.read()
+      finally:
+        if cur_pos is not None:
+          try:
+            pickle_bytes.seek(cur_pos)
+          except (OSError, AttributeError, io.UnsupportedOperation):
+            pass
+
+    genops_output = generate_ops_from_file(
+        "",
         pickle_length=resolved_pickle_length,
         fail_fast=fail_fast,
+        data_buffer=data_buffer,
     )
   else:
     genops_output = generate_ops(pickle_bytes, fail_fast=fail_fast)
+
   results = categorize_strings(genops_output)
   return results
 
@@ -852,7 +1122,6 @@ def apply_approach(
     scan_approach: Callable[..., ScanResults],
     pickle_bytes: bytes | IO[bytes],
     pickle_file_path: Optional[str] = None,
-    shm_name: Optional[str] = None,
     fail_fast: Optional[bool] = DEFAULT_FAIL_FAST,
     pickle_length: Optional[int] = None,
 ) -> Dict[str, int]:
@@ -862,7 +1131,6 @@ def apply_approach(
     scan_approach: The scan approach to apply to the data.
     pickle_bytes: The data to scan.
     pickle_file_path: Optional path to the pickle file for streaming scan.
-    shm_name: Optional name of the shared memory block.
     fail_fast: Whether to fail fast on first unsafe or suspicious match.
     pickle_length: Optional length of the pickle data.
 
@@ -873,7 +1141,6 @@ def apply_approach(
     results = scan_approach(
         pickle_bytes,
         pickle_file_path=pickle_file_path,
-        shm_name=shm_name,
         fail_fast=fail_fast,
         pickle_length=pickle_length,
     )
@@ -888,7 +1155,7 @@ def apply_approach(
     logging.info("  Unknown results: %s\n", results.unknown_results)
 
   (
-      number_of_safe_results,
+      _,
       number_of_unsafe_results,
       number_of_suspicious_results,
       number_of_unknown_results,
@@ -910,9 +1177,9 @@ def apply_approach(
       results.is_denylisted
       or should_fail_fast
       or is_unsafe(
-          number_of_safe_results,
-          number_of_unsafe_results,
-          number_of_suspicious_results,
+          len(results.safe_results),
+          len(results.unsafe_results),
+          len(results.suspicious_results),
       )
   ):
     return scores
@@ -1225,79 +1492,26 @@ def _security_scan_internal(
 
   # Find actual start of valid pickle payload if it has leading garbage
   start_offset = 0
-  try:
-    current_pos = stream.tell()
-    stream.seek(0)
-    header_bytes = stream.read(1024)
-    stream.seek(current_pos)
-    is_archive = header_bytes.startswith(
-        (b"PK\x03\x04", b"BZh", b"\xfd7zXZ\x00", b"\x1f\x8b")
-    ) or (len(header_bytes) >= 262 and header_bytes[257:262] == b"ustar")
-    if not is_archive:
-      start_offset = utils.find_pickle_start_offset(stream)
-    else:
-      start_offset = 0
-
-    if start_offset > 0:
-      stream.seek(start_offset)
-      pickle_length -= start_offset
-    else:
-      stream.seek(current_pos)
-  except (OSError, AttributeError, io.UnsupportedOperation):
-    pass
-
-  pickle_file_path = None
-  shm = None
-  shm_name = None
-
-  if pickle_length >= constants.MIN_SIZE_FOR_CHUNKING:
+  if not is_pickle:
     try:
-      shm = shared_memory.SharedMemory(create=True, size=pickle_length)
-      shm_name = shm.name
+      current_pos = stream.tell()
+      header_bytes = stream.read(262)
+      stream.seek(current_pos)
+      is_archive = header_bytes.startswith(
+          (b"PK\x03\x04", b"BZh", b"\xfd7zXZ\x00", b"\x1f\x8b")
+      ) or (len(header_bytes) >= 262 and header_bytes[257:262] == b"ustar")
+      if not is_archive:
+        start_offset = utils.find_pickle_start_offset(stream)
 
-      # Fast path for BytesIO, chunked fallback for other streams
-      if isinstance(stream, io.BytesIO):
-        shm.buf[:pickle_length] = stream.getbuffer()[  # pyrefly: ignore[unsupported-operation]
-            start_offset : start_offset + pickle_length
-        ]
+      if start_offset > 0:
+        stream.seek(current_pos + start_offset)
+        pickle_length -= current_pos + start_offset
       else:
-        offset = 0
-        current_pos = stream.tell()
-        stream.seek(start_offset)
-        try:
-          while True:
-            chunk = stream.read(1024 * 1024)
-            if not chunk:
-              break
-            shm.buf[offset : offset + len(chunk)] = chunk  # pyrefly: ignore[unsupported-operation]
-            offset += len(chunk)
-        finally:
-          stream.seek(current_pos)
-    except OSError:
-      # Fallback to tempfile with chunked buffering
-      with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-        pickle_file_path = temp_file.name
-        if isinstance(stream, io.BytesIO):
-          temp_file.write(
-              stream.getbuffer()[start_offset : start_offset + pickle_length]
-          )
-        else:
-          current_pos = stream.tell()
-          stream.seek(start_offset)
-          try:
-            while True:
-              chunk = stream.read(1024 * 1024)
-              if not chunk:
-                break
-              temp_file.write(chunk)
-          finally:
-            stream.seek(current_pos)
+        stream.seek(current_pos)
+    except (OSError, AttributeError, io.UnsupportedOperation):
+      pass
 
-  original_stream_pos = None
-  try:
-    original_stream_pos = stream.tell()
-  except (OSError, AttributeError, io.UnsupportedOperation):
-    pass
+  original_stream_pos = _get_stream_pos(stream)
 
   try:
     final_scores = {"unsafe": 0, "suspicious": 0, "unknown": 0}
@@ -1305,11 +1519,10 @@ def _security_scan_internal(
       scores = apply_approach(
           scan_approach,
           stream,
-          pickle_file_path,
-          shm_name,
           fail_fast=fail_fast,
           pickle_length=pickle_length,
       )
+
       # Restore stream pointer after each scan approach to prevent EOF errors
       if original_stream_pos is not None and hasattr(stream, "seek"):
         try:
@@ -1320,6 +1533,7 @@ def _security_scan_internal(
       if scores["unsafe"] > 0 or scores["suspicious"] > 0:
         return scores
       final_scores["unknown"] += scores["unknown"]
+
     return final_scores
   finally:
     # Ensure stream is seeked back before exiting so load_func gets
@@ -1329,12 +1543,6 @@ def _security_scan_internal(
         stream.seek(original_stream_pos)
       except (OSError, AttributeError, io.UnsupportedOperation):
         logging.debug("Failed to restore stream pointer before exiting scan.")
-
-    if shm:
-      shm.close()
-      shm.unlink()
-    if pickle_file_path:
-      os.remove(pickle_file_path)
 
 
 _ORIG_METHODS_BEFORE_HOOKING = {}
