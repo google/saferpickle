@@ -192,6 +192,17 @@ PICKLEMAGIC_PATTERNS = [
     ),
 ]
 
+_WHITESPACE_NORMALIZE_RE = re.compile(r"[ \t]+")
+_BINARY_BYTES_HEX_RE = re.compile(
+    r"bytearray\(b(?:'[^']*\\x[^']*'|\"[^\"]*\\x[^\"]*\")\)"
+    r"|b(?:'[^']*\\x[^']*'|\"[^\"]*\\x[^\"]*\")"
+    r"|\\x[0-9a-fA-F]{2}"
+)
+_HEX_TOKEN_PREFIX_RE = re.compile(r"^x[0-9a-fA-F]{2}")
+_COMBINED_ARGS_TOKEN_RE = re.compile(
+    r"'([^']*)'|\"([^\"]*)\"|([a-zA-Z_][a-zA-Z0-9_.]*(?:\(.*?\))?)"
+)
+
 
 # Creates a copy of the module
 def copy_module(original_name: str, new_name: str) -> types.ModuleType | None:
@@ -512,6 +523,34 @@ def is_pickle_file(
 
       if opcode.arg is None:
         continue
+
+      if opcode.name in constants.PAYLOAD_PREFIX_SIZES and hasattr(
+          pickle_stream, "seek"
+      ):
+        prefix_size = constants.PAYLOAD_PREFIX_SIZES[opcode.name]
+        len_bytes = pickle_stream.read(prefix_size)
+        if len(len_bytes) != prefix_size:
+          is_suspected_pickle = valid_opcodes_count >= 3
+          return (
+              (is_suspected_pickle, valid_opcodes_count)
+              if return_num_bytes_read
+              else is_suspected_pickle
+          )
+
+        payload_len = int.from_bytes(len_bytes, "little")
+        cur_pos = pickle_stream.tell()
+        stream_end_pos = pickle_stream.seek(0, io.SEEK_END)
+        if cur_pos + payload_len > stream_end_pos:
+          is_suspected_pickle = valid_opcodes_count >= 3
+          return (
+              (is_suspected_pickle, valid_opcodes_count)
+              if return_num_bytes_read
+              else is_suspected_pickle
+          )
+
+        pickle_stream.seek(cur_pos + payload_len)
+        continue
+
       try:
         _ = opcode.arg.reader(pickle_stream)
       except ValueError:
@@ -602,7 +641,8 @@ def get_module_members(module_name: str) -> Set[str] | None:
       imported_module = importlib.import_module(module_name)
     except ImportError:
       return None
-    return {member for member, _ in inspect.getmembers(imported_module)}
+    members = {member for member, _ in inspect.getmembers(imported_module)}
+    return members
 
   if (spec := importlib.util.find_spec(module_name)) is None:
     return None
@@ -651,35 +691,84 @@ def get_optimal_workers(file_size: int) -> int:
   return min(constants.MAX_NUM_CHUNKS or 1, scaled_workers)
 
 
-@functools.lru_cache(maxsize=None)
-def classify_class_name(class_name: str) -> Classification | None:
-  """Classifies a class name based on the safe, unsafe, and suspicious patterns."""
-  if safe_pattern.search(class_name):
-    return Classification.SAFE
-  if (
-      "." in class_name
-      and class_name.split(".", 1)[0] in constants.UNSAFE_PREFIX_MODULES
-  ):
-    return Classification.UNSAFE
-  if unsafe_pattern.search(class_name):
-    return Classification.UNSAFE
-  if suspicious_pattern.search(class_name):
-    return Classification.SUSPICIOUS
-  if unknown_pattern.search(class_name):
-    return Classification.UNKNOWN
-  return None
+def matches_symbol_prefix_list(
+    symbol: str,
+    prefixes: Sequence[str] | Set[str] | FrozenSet[str],
+    *,
+    match_suffix: bool = False,
+) -> bool:
+  """Checks whether a dotted symbol matches or is a child of any prefix.
+
+  Evaluates whether `symbol` is an exact match for any entry in `prefixes` or
+  starts with `<entry>.` as a submodule/attribute path (and optionally whether
+  an entry ends with `.<symbol>` for uncombined opcode string operands).
+
+  Args:
+    symbol: The dotted module, class, or attribute name to check.
+    prefixes: A collection of exact symbol names or package prefixes.
+    match_suffix: Whether to also match when an entry in `prefixes` ends with
+      `.<symbol>`.
+
+  Returns:
+    True if `symbol` matches an entry in `prefixes`, or False otherwise.
+  """
+  if not symbol:
+    return False
+
+  for item in prefixes:
+    if symbol == item or symbol.startswith(f"{item}."):
+      return True
+    if match_suffix and item.endswith(f".{symbol}"):
+      return True
+
+  return False
 
 
-def is_unsafe_or_suspicious(class_name: str) -> bool:
-  allow_list = config.get_allow_list()
-  if any(
-      allowed_item.startswith(class_name)
-      or class_name.startswith(allowed_item)
-      or allowed_item.endswith(f".{class_name}")
-      for allowed_item in allow_list
+def is_self_protected_symbol(symbol: str) -> bool:
+  """Checks whether a symbol targets internal scanner or sandbox protections.
+
+  Prevents project-level allow-list entries from overriding self-protection
+  invariants on `saferpickle`, `corrupy`, `picklemagic`, or
+  `config.set_config_path`, while excluding synthetic sandbox marker symbols.
+
+  Args:
+    symbol: The dotted module, class, function, or opcode string operand to
+      check.
+
+  Returns:
+    True if `symbol` matches a non-overridable self-protection prefix, or False
+    otherwise.
+  """
+  if not symbol or symbol in constants.INTERNAL_SANDBOX_SAFE_SYMBOLS:
+    return False
+
+  return matches_symbol_prefix_list(
+      symbol, constants.SELF_PROTECTED_PREFIXES, match_suffix=True
+  )
+
+
+def is_unsafe_for_fail_fast(symbol: str) -> bool:
+  """Checks whether a symbol is classified as `UNSAFE` for `fail_fast` scanning.
+
+  Evaluates the given symbol against the configured allow-list first, and if
+  not allow-listed, classifies the symbol using `classify_symbol`. Returns
+  True only for `Classification.UNSAFE` so `Classification.SUSPICIOUS`
+  operands do not prematurely terminate `fail_fast` opcode scanning before
+  subsequent `UNSAFE` payloads are reached.
+
+  Args:
+    symbol: The module, class, function, or opcode string operand to evaluate.
+
+  Returns:
+    True if the symbol is not allow-listed and is classified as `UNSAFE`, or
+    False otherwise.
+  """
+  if not is_self_protected_symbol(symbol) and matches_symbol_prefix_list(
+      symbol, config.get_allow_list(), match_suffix=True
   ):
     return False
-  classification = classify_class_name(class_name)
+
+  classification = classify_symbol(symbol)
   return classification == Classification.UNSAFE
 
 
@@ -755,12 +844,12 @@ def resolve_library_modules_from_results(
     if "." not in result:
       continue
     base_library, base_module = result.split(".", 1)
-    result_classification = classify_class_name(result)
+    result_classification = classify_symbol(result)
     if (
         base_library in final_results
         and base_library != "builtins"
         and (
-            classify_class_name(base_library) == result_classification
+            classify_symbol(base_library) == result_classification
             or result_classification == Classification.UNSAFE
         )
     ):
@@ -771,7 +860,7 @@ def resolve_library_modules_from_results(
         and base_module not in constants.UNSAFE_STRINGS
         and base_module not in constants.SUSPICIOUS_STRINGS
         and (
-            classify_class_name(base_module) == result_classification
+            classify_symbol(base_module) == result_classification
             or result_classification == Classification.UNSAFE
         )
     ):
@@ -784,14 +873,14 @@ def resolve_library_modules_from_results(
   # Eg. Remove requests.api if requests.api.post is present.
   underspecific_qualified_modules_to_remove = set()
   for qualified_result in final_results:
-    result_classification = classify_class_name(qualified_result)
+    result_classification = classify_symbol(qualified_result)
     attribute_parts = qualified_result.split(".")
     # Check for less specific versions of the current item
     for prefix_length in range(1, len(attribute_parts)):
       parent_symbol = ".".join(attribute_parts[:prefix_length])
       if parent_symbol not in final_results:
         continue
-      parent_classification = classify_class_name(parent_symbol)
+      parent_classification = classify_symbol(parent_symbol)
       if (
           parent_classification == result_classification
           or result_classification == Classification.UNSAFE
@@ -900,17 +989,675 @@ def is_sys_executable_patched() -> bool:
   return False
 
 
-def _classify_item(item: str) -> Classification | None:
-  """Classifies a single item string into a Classification enum."""
-  if not item:
+@functools.lru_cache(maxsize=1)
+def get_all_active_approved_base_classes() -> tuple[type[Any], ...]:
+  """Resolves active approved base classes currently loaded in `sys.modules`.
+
+  Combines safe Python builtin primitive and container types with any class
+  specifications in `constants.ALL_BASE_CLASS_SPECS` that are currently
+  loaded in `sys.modules`, without importing new modules.
+
+  Returns:
+    A tuple of resolved `type` objects representing approved base classes.
+  """
+  bases = (dict, list, tuple, set, frozenset, int, float, str, bytes, bool)
+  resolved = tuple(
+      cls
+      for spec in constants.ALL_BASE_CLASS_SPECS
+      if isinstance(cls := _resolve_dotted_path_in_sys_modules(spec), type)
+  )
+  return bases + resolved
+
+
+def _find_module_source_file(mod_path: str) -> str | None:
+  """Locates a module's `.py` source file on disk without importing submodules.
+
+  Walks backward from the most specific module prefix in `sys.modules` and
+  resolves the remaining relative path segments against the loaded package's
+  `__path__` directories.
+
+  Args:
+    mod_path: Dotted module path (e.g., `'torch.nn.modules.linear'`).
+
+  Returns:
+    The filesystem path to the module's `.py` or `__init__.py` file if found
+    on disk, or None otherwise.
+  """
+  parts = mod_path.split(".")
+  for idx in range(len(parts), 0, -1):
+    loaded_mod = sys.modules.get(".".join(parts[:idx]))
+    if (
+        idx == len(parts)
+        and isinstance(mod_file := getattr(loaded_mod, "__file__", None), str)
+        and os.path.isfile(mod_file)
+    ):
+      return mod_file
+
+    if mod_paths := getattr(loaded_mod, "__path__", None):
+      for base_dir in mod_paths:
+        candidate = os.path.join(base_dir, *parts[idx:])
+        for path in (f"{candidate}.py", os.path.join(candidate, "__init__.py")):
+          if os.path.isfile(path):
+            return path
+      break
+
+  return None
+
+
+def _ast_expr_to_dotted_name(expr: ast.AST, import_map: dict[str, str]) -> str:
+  """Resolves an AST expression node into a fully qualified dotted string.
+
+  Reconstructs dotted names from `ast.Name`, `ast.Attribute`, `ast.Call`, and
+  `ast.Subscript` nodes and expands leading aliases using `import_map`.
+
+  Args:
+    expr: The AST expression node representing a base class or decorator.
+    import_map: Mapping from local alias names to imported dotted module paths.
+
+  Returns:
+    The resolved dotted name string, or an empty string if `expr` cannot be
+    represented as a dotted name.
+  """
+  if isinstance(expr, ast.Name):
+    return import_map.get(expr.id, expr.id)
+
+  if isinstance(expr, ast.Attribute):
+    parent = _ast_expr_to_dotted_name(expr.value, import_map)
+    return f"{parent}.{expr.attr}" if parent else expr.attr
+
+  if isinstance(expr, (ast.Call, ast.Subscript)):
+    target = expr.func if isinstance(expr, ast.Call) else expr.value
+    return _ast_expr_to_dotted_name(target, import_map)
+
+  return ""
+
+
+def _code_object_has_dangerous_names(
+    code_object: types.CodeType, visited_code_ids: set[int]
+) -> bool:
+  """Checks whether a bytecode object references any dangerous global names.
+
+  Inspects `code_object.co_names` and recursively traverses nested code
+  objects in `code_object.co_consts` to detect references to symbols in
+  `constants.DANGEROUS_CODE_NAMES`.
+
+  Args:
+    code_object: The Python `CodeType` object to inspect.
+    visited_code_ids: Set of already-visited `id(code_object)` values used to
+      prevent cycles.
+
+  Returns:
+    True if `code_object` or any nested code constant references a dangerous
+    name, or False otherwise.
+  """
+  if id(code_object) in visited_code_ids:
+    return False
+  visited_code_ids.add(id(code_object))
+
+  if any(
+      name in constants.DANGEROUS_CODE_NAMES for name in code_object.co_names
+  ):
+    return True
+
+  return any(
+      isinstance(const, types.CodeType)
+      and _code_object_has_dangerous_names(const, visited_code_ids)
+      for const in code_object.co_consts
+  )
+
+
+def _is_safe_approved_root_function(
+    target_callable: Any, symbol_name: str, module_path: str
+) -> bool:
+  """Verifies whether a callable in an approved root is a safe reconstructor.
+
+  Checks whether `symbol_name` matches known reconstructor names or markers
+  in an approved package root, unwraps decorators, and inspects the
+  underlying bytecode (`__code__`) to ensure no dangerous globals or builtins
+  are used.
+
+  Args:
+    target_callable: The live function or callable object from `sys.modules`.
+    symbol_name: The attribute name of the callable.
+    module_path: The dotted module path from which the callable was resolved.
+
+  Returns:
+    True if `target_callable` is a verified-safe reconstructor function, or
+    False otherwise.
+  """
+  symbol_lower = symbol_name.lower()
+  callable_module = getattr(target_callable, "__module__", "") or module_path
+  is_candidate_reconstructor = (
+      symbol_name in constants.APPROVED_RECONSTRUCTOR_FUNCTIONS
+      or any(
+          marker in symbol_lower
+          for marker in constants.RECONSTRUCTOR_NAME_MARKERS
+      )
+      or bool(
+          {module_path, callable_module}
+          & {"numpy._core.fromnumeric", "numpy.core.fromnumeric"}
+      )
+  )
+  if not is_candidate_reconstructor:
+    return False
+
+  unwrapped = inspect.unwrap(target_callable)
+  if isinstance(
+      code_object := getattr(unwrapped, "__code__", None), types.CodeType
+  ):
+    return not _code_object_has_dangerous_names(code_object, set())
+
+  return symbol_name in constants.APPROVED_RECONSTRUCTOR_FUNCTIONS
+
+
+def _is_unsafe_class_path(full_name: str) -> bool:
+  """Checks whether a class path belongs to an unsafe root or unsafe symbol.
+
+  Evaluates a qualified class or base-class name from MRO or AST inspection.
+  Excludes `builtins` and `__builtin__` from root-level blanket rejection so
+  benign builtin base classes (such as `builtins.dict` or
+  `builtins.Exception`) are only rejected when they match a specific entry in
+  `UNSAFE_STRINGS`.
+
+  Args:
+    full_name: Fully qualified class or base-class path to check.
+
+  Returns:
+    True if `full_name` is under an unsafe root package or matches an entry in
+    `UNSAFE_STRINGS`, or False otherwise.
+  """
+  if not full_name:
+    return False
+
+  root = full_name.split(".")[0]
+  # Exclude builtins from root-level rejection so benign MRO ancestors (e.g.
+  # builtins.dict) are evaluated per-symbol against UNSAFE_STRINGS below.
+  if root in constants.UNSAFE_ROOT_PACKAGES and root not in (
+      "builtins",
+      "__builtin__",
+  ):
+    return True
+  return any(
+      full_name == unsafe or full_name.startswith(f"{unsafe}.")
+      for unsafe in constants.UNSAFE_STRINGS
+  )
+
+
+@functools.lru_cache(maxsize=512)
+def _inspect_class_via_ast(
+    file_path: str, symbol_name: str, root_pkg: str
+) -> Classification | None:
+  """Classifies a class definition by statically parsing its `.py` source file.
+
+  Parses `file_path` with `ast.parse` without importing the module, resolves
+  top-level imports, and inspects the target `ast.ClassDef` node's base
+  classes, decorators, and lifecycle hook methods.
+
+  Args:
+    file_path: Filesystem path to the `.py` module source file.
+    symbol_name: Name of the class symbol to inspect within `file_path`.
+    root_pkg: Top-level root package name (e.g., `"torch"` or `"custom_pkg"`).
+
+  Returns:
+    A `Classification` (`SAFE`, `UNSAFE`, `SUSPICIOUS`, or `UNKNOWN`) if the
+    symbol is defined at top level in `file_path`, or None if the file cannot
+    be parsed or the symbol is not found.
+  """
+  try:
+    with open(
+        file_path, "r", encoding="utf-8", errors="ignore"
+    ) as source_file:
+      tree = ast.parse(source_file.read(), filename=file_path)
+  except (IOError, OSError, SyntaxError, ValueError, TypeError):
     return None
-  if item in constants.UNSAFE_STRINGS:
+
+  import_map: dict[str, str] = {}
+  for node in tree.body:
+    if isinstance(node, ast.Import):
+      for alias in node.names:
+        import_map[alias.asname or alias.name] = alias.name
+    elif isinstance(node, ast.ImportFrom) and node.module:
+      for alias in node.names:
+        import_map[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+
+  for node in tree.body:
+    if getattr(node, "name", None) != symbol_name:
+      continue
+    if not isinstance(node, ast.ClassDef) or symbol_name.startswith("_"):
+      return Classification.UNKNOWN
+
+    method_names = {
+        item.name
+        for item in node.body
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    resolved_bases = [
+        _ast_expr_to_dotted_name(base_expr, import_map)
+        for base_expr in node.bases
+    ]
+    if any(_is_unsafe_class_path(base_name) for base_name in resolved_bases):
+      return Classification.UNSAFE
+
+    if method_names & {"__reduce__", "__reduce_ex__"}:
+      return Classification.SUSPICIOUS
+
+    if any(
+        _ast_expr_to_dotted_name(dec, import_map).endswith("dataclass")
+        for dec in node.decorator_list
+    ):
+      return Classification.SAFE
+
+    if any(
+        base_name in constants.APPROVED_AST_BASE_NAMES
+        or (
+            isinstance(
+                live_base := _resolve_dotted_path_in_sys_modules(base_name),
+                type,
+            )
+            and issubclass(live_base, get_all_active_approved_base_classes())
+        )
+        for base_name in resolved_bases
+    ):
+      return Classification.SAFE
+
+    if (
+        root_pkg not in ("custom_pkg", "collections", "datetime", "enum")
+        and set(resolved_bases) <= {"object", "builtins.object"}
+        and not (method_names & constants.DANGEROUS_CLASS_LIFECYCLE_HOOKS)
+    ):
+      return Classification.SAFE
+
+    return Classification.UNKNOWN
+
+  return None
+
+
+def _resolve_dotted_path_in_sys_modules(dotted_path: str) -> Any | None:
+  """Resolves a dotted module or attribute path from `sys.modules`.
+
+  Looks up `dotted_path` directly in `sys.modules` first, and if not found,
+  walks the attribute chain from the root module in `sys.modules` using
+  `getattr` without importing any new modules.
+
+  Args:
+    dotted_path: Dotted module, class, or attribute path to resolve.
+
+  Returns:
+    The resolved module, class, or attribute object if present in
+    `sys.modules`, or None if any segment is not loaded.
+  """
+  if (loaded_module := sys.modules.get(dotted_path)) is not None:
+    return loaded_module
+
+  path_parts = dotted_path.split(".")
+  current_obj: Any = sys.modules.get(path_parts[0])
+  for attribute_name in path_parts[1:]:
+    if current_obj is None:
+      return None
+    current_obj = getattr(current_obj, attribute_name, None)
+
+  return current_obj
+
+
+def _is_installed_root_package(root_package: str) -> bool:
+  """Checks whether a root package is loaded in `sys.modules` or installed.
+
+  Verifies that `root_package` is a valid Python identifier and checks
+  whether it is already present in `sys.modules` or discoverable via
+  `importlib.util.find_spec`.
+
+  Args:
+    root_package: Top-level package name to check.
+
+  Returns:
+    True if `root_package` is loaded in `sys.modules` or has a valid module
+    spec on disk, or False otherwise.
+  """
+  if not root_package or not root_package.isidentifier():
+    return False
+
+  try:
+    return (
+        root_package in sys.modules
+        or importlib.util.find_spec(root_package) is not None
+    )
+  except (ImportError, AttributeError, ValueError):
+    return False
+
+
+def _classify_loaded_class_mro(
+    target_class: type[Any], symbol_name: str, root_package: str
+) -> Classification:
+  """Classifies a live class object by inspecting its module, MRO, and methods.
+
+  Walks `target_class.__mro__` to verify that no ancestor originates from an
+  unsafe package or defines dangerous pickle lifecycle hooks, and checks
+  whether `target_class` inherits from an approved base class or is a simple
+  data class with safe constructor bytecode.
+
+  Args:
+    target_class: The live `type` object resolved from `sys.modules`.
+    symbol_name: Name of the class symbol being classified.
+    root_package: Expected top-level root package name from the symbol path.
+
+  Returns:
+    The `Classification` (`SAFE`, `UNSAFE`, `SUSPICIOUS`, or `UNKNOWN`) for
+    `target_class`.
+  """
+  try:
+    class_module = getattr(target_class, "__module__", "") or ""
+    class_root = class_module.split(".")[0] if class_module else ""
+    if (
+        class_root != root_package
+        and class_root not in constants.APPROVED_ROOT_PACKAGES
+    ):
+      if class_root in constants.UNSAFE_ROOT_PACKAGES:
+        return Classification.UNSAFE
+      return Classification.SUSPICIOUS
+
+    approved_bases = get_all_active_approved_base_classes()
+    is_approved_subclass = issubclass(target_class, approved_bases)
+    has_suspicious_hook = False
+
+    for ancestor in target_class.__mro__:
+      if ancestor is object:
+        continue
+
+      ancestor_mod = getattr(ancestor, "__module__", "") or ""
+      ancestor_qual = getattr(
+          ancestor, "__qualname__", getattr(ancestor, "__name__", "")
+      )
+      if _is_unsafe_class_path(f"{ancestor_mod}.{ancestor_qual}"):
+        return Classification.UNSAFE
+
+      if ancestor in approved_bases:
+        continue
+
+      if not is_approved_subclass and any(
+          hook in ancestor.__dict__
+          for hook in constants.DANGEROUS_CLASS_LIFECYCLE_HOOKS
+      ):
+        has_suspicious_hook = True
+
+      if root_package == "custom_pkg" and (
+          "__reduce__" in ancestor.__dict__
+          or "__reduce_ex__" in ancestor.__dict__
+      ):
+        has_suspicious_hook = True
+
+    if target_class in approved_bases:
+      return Classification.SAFE
+
+    if has_suspicious_hook:
+      return Classification.SUSPICIOUS
+
+    if symbol_name.startswith("_"):
+      return Classification.UNKNOWN
+
+    if is_approved_subclass:
+      return Classification.SAFE
+
+    if (
+        root_package not in ("custom_pkg", "collections", "datetime", "enum")
+        and type(target_class) is type  # pylint: disable=unidiomatic-typecheck
+        and target_class.__bases__ == (object,)
+    ):
+      for ctor_name in ("__new__", "__init__"):
+        if ctor_name not in target_class.__dict__:
+          continue
+        ctor_code = getattr(target_class.__dict__[ctor_name], "__code__", None)
+        if not isinstance(ctor_code, types.CodeType) or (
+            _code_object_has_dangerous_names(ctor_code, set())
+        ):
+          return Classification.UNKNOWN
+      return Classification.SAFE
+  except (TypeError, AttributeError, ValueError, RuntimeError):
+    return Classification.UNKNOWN
+
+  return Classification.UNKNOWN
+
+
+def classify_approved_root_symbol(symbol: str) -> Classification | None:
+  """Classifies a dotted symbol under an approved root package.
+
+  Inspects a dotted symbol without executing arbitrary module imports by
+  checking (1) loaded modules and objects in `sys.modules` (verifying class
+  MROs or reconstructor bytecode), (2) static `.py` source files on disk via
+  `ast.parse`, and (3) structural naming rules for uninstalled approved
+  roots.
+
+  Args:
+    symbol: Fully qualified dotted symbol string (e.g., `'torch.nn.Linear'`).
+
+  Returns:
+    The `Classification` (`SAFE`, `UNSAFE`, `SUSPICIOUS`, or `UNKNOWN`) if
+    the symbol belongs to an unsafe or approved root package, or None if the
+    symbol is unqualified or belongs to an unlisted root package.
+  """
+  if not symbol or "." not in symbol:
+    return None
+
+  symbol_parts = symbol.split(".")
+  root_package = symbol_parts[0]
+  if root_package in constants.UNSAFE_ROOT_PACKAGES:
     return Classification.UNSAFE
-  if item in constants.SUSPICIOUS_STRINGS:
-    return Classification.SUSPICIOUS
-  if item in constants.SAFE_STRINGS:
+  if root_package not in constants.APPROVED_ROOT_PACKAGES:
+    return None
+
+  module_path = ".".join(symbol_parts[:-1])
+  symbol_name = symbol_parts[-1]
+
+  if symbol in constants.ALL_BASE_CLASS_SPECS:
     return Classification.SAFE
-  return classify_class_name(item)
+
+  target_module = _resolve_dotted_path_in_sys_modules(module_path)
+  if target_module is not None:
+    target_object = getattr(target_module, symbol_name, None)
+    if target_object is None:
+      return Classification.UNKNOWN
+
+    if isinstance(target_object, types.ModuleType):
+      module_root = (getattr(target_object, "__name__", "") or "").split(".")[0]
+      if module_root in constants.UNSAFE_ROOT_PACKAGES:
+        return Classification.UNSAFE
+      has_private_segment = any(
+          seg.startswith("_") and seg != "_core" for seg in symbol_parts[1:]
+      )
+      if module_root != root_package or has_private_segment:
+        return Classification.SUSPICIOUS
+      return Classification.SAFE
+
+    if not isinstance(target_object, type):
+      if _is_safe_approved_root_function(
+          target_object, symbol_name, module_path
+      ):
+        return Classification.SAFE
+      return Classification.UNKNOWN
+
+    return _classify_loaded_class_mro(target_object, symbol_name, root_package)
+
+  if (source_file := _find_module_source_file(module_path)) is not None:
+    return (
+        _inspect_class_via_ast(source_file, symbol_name, root_package)
+        or Classification.UNKNOWN
+    )
+
+  if _find_module_source_file(symbol) is not None:
+    return Classification.SAFE
+
+  is_public_pascal_case = symbol_name[
+      :1
+  ].isupper() and not symbol_name.startswith("_")
+  has_only_module_segments = all(
+      not part.startswith("_") and part.islower() for part in symbol_parts[1:-1]
+  )
+  if (
+      is_public_pascal_case
+      and has_only_module_segments
+      and (
+          not _is_installed_root_package(root_package)
+          or (root_package == "custom_pkg" and module_path not in sys.modules)
+      )
+  ):
+    return Classification.SAFE
+
+  return Classification.UNKNOWN
+
+
+is_safe_class_dynamic = classify_approved_root_symbol
+
+
+def is_dunder_or_introspection_attr(attribute_name: str) -> bool:
+  """Checks if `attribute_name` is a non-reconstructor dunder or frame attr.
+
+  Allows standard pickle reconstructor dunders in
+  `constants.SAFE_DUNDER_RECONSTRUCTORS` (`__newobj__`, `__newobj_ex__`),
+  while flagging all other `__*__` dunder names and frame/function/generator
+  introspection attributes (`func_*`, `f_*`, `gi_*`, `cr_*`, `ag_*`, `co_*`).
+
+  Args:
+    attribute_name: Single identifier segment or attribute name to check.
+
+  Returns:
+    True if `attribute_name` is a non-reconstructor dunder or introspection
+    attribute, or False otherwise.
+  """
+  if attribute_name in constants.SAFE_DUNDER_RECONSTRUCTORS:
+    return False
+
+  is_dunder = (
+      len(attribute_name) > 4
+      and attribute_name.startswith("__")
+      and attribute_name.endswith("__")
+  )
+  is_introspection = (
+      attribute_name.startswith(constants.INTROSPECTION_ATTRIBUTE_PREFIXES)
+      or attribute_name in constants.INTROSPECTION_ATTRIBUTES
+  )
+  return is_dunder or is_introspection
+
+
+@functools.lru_cache(maxsize=16384)
+def classify_symbol(symbol: str) -> Classification:
+  """Classifies a symbol's safety against configured static and dynamic rules.
+
+  Normalizes two-token global strings, checks builtin types, dangerous
+  package members, inline code patterns, unsafe/suspicious root packages and
+  prefixes, safe metadata attributes on verified-safe prefixes, and
+  dynamic/AST package hierarchy rules for approved root packages.
+
+  Args:
+    symbol: The symbol or operand string to classify.
+
+  Returns:
+    The `Classification` (`SAFE`, `UNSAFE`, `SUSPICIOUS`, or `UNKNOWN`) for
+    the given symbol.
+  """
+  if not symbol:
+    return Classification.UNKNOWN
+
+  symbol_clean = symbol.strip()
+  tokens = symbol_clean.split()
+  if len(tokens) == 2:
+    joined = f"{tokens[0]}.{tokens[1]}"
+    root_mod = tokens[0].split(".")[0]
+    if all(part.isidentifier() for part in joined.split(".")) and (
+        root_mod in ("__builtin__",)
+        or root_mod in constants.APPROVED_ROOT_PACKAGES
+        or root_mod in constants.UNSAFE_ROOT_PACKAGES
+        or root_mod in constants.ALL_STRINGS
+        or _is_installed_root_package(root_mod)
+    ):
+      symbol_clean = joined
+
+  parts = (
+      symbol_clean.split(".")
+      if ("." in symbol_clean and " " not in symbol_clean)
+      else []
+  )
+  if parts:
+    if (
+        parts[0] in ("builtins", "__builtin__")
+        and len(parts) == 2
+        and parts[1] in constants.SAFE_BUILTIN_TYPES
+    ):
+      return Classification.SAFE
+
+    if any(part in constants.DANGEROUS_PACKAGE_MEMBERS for part in parts[1:]):
+      return Classification.UNSAFE
+
+  if symbol_clean in constants.UNSAFE_STRINGS:
+    return Classification.UNSAFE
+
+  symbol_normalized = _WHITESPACE_NORMALIZE_RE.sub(" ", symbol_clean.lower())
+  if any(pat in symbol_normalized for pat in constants.UNSAFE_INLINE_PATTERNS):
+    return Classification.UNSAFE
+
+  if symbol_clean in constants.SUSPICIOUS_STRINGS:
+    return Classification.SUSPICIOUS
+
+  if (
+      symbol_clean in constants.SAFE_STRINGS
+      or symbol_clean in constants.INTERNAL_SANDBOX_SAFE_SYMBOLS
+  ):
+    return Classification.SAFE
+
+  if parts and (
+      parts[0] in constants.UNSAFE_ROOT_PACKAGES
+      or any(part in constants.DANGEROUS_EXEC_MODULES for part in parts[1:])
+  ):
+    return Classification.UNSAFE
+
+  if any(symbol_clean.startswith(f"{u}.") for u in constants.UNSAFE_STRINGS):
+    return Classification.UNSAFE
+
+  if any(
+      symbol_clean.startswith(f"{s}.") for s in constants.SUSPICIOUS_STRINGS
+  ) or (parts and parts[-1] in constants.SUSPICIOUS_STRINGS):
+    return Classification.SUSPICIOUS
+
+  if parts:
+    prefix_symbol = ".".join(parts[:-1])
+    has_intermediate_dunder = any(
+        is_dunder_or_introspection_attr(part) for part in parts[1:-1]
+    )
+    if (
+        not has_intermediate_dunder
+        and parts[-1] in constants.SAFE_METADATA_ATTRIBUTES
+        and (
+            prefix_symbol in constants.APPROVED_ROOT_PACKAGES
+            or classify_symbol(prefix_symbol) == Classification.SAFE
+        )
+    ):
+      return Classification.SAFE
+
+  if parts and parts[0] in constants.APPROVED_ROOT_PACKAGES:
+    if parts[-1] in constants.APPROVED_RECONSTRUCTOR_FUNCTIONS:
+      return Classification.SAFE
+
+    return classify_approved_root_symbol(symbol_clean) or Classification.UNKNOWN
+
+  if any(symbol_clean.startswith(f"{s}.") for s in constants.SAFE_STRINGS):
+    return Classification.SAFE
+
+  return Classification.UNKNOWN
+
+
+def _strip_binary_bytes_repr(text: str) -> str:
+  """Strips hex-escaped binary byte literals from a formatted log string.
+
+  Replaces `bytes(...)`, `bytearray(...)`, and hex escape sequences in
+  `picklemagic` warning log arguments with spaces so random binary tensor
+  weights are not tokenized as identifier names.
+
+  Args:
+    text: Raw argument or state string extracted from a `picklemagic` log line.
+
+  Returns:
+    The input string with hex-escaped byte representations replaced by
+    spaces.
+  """
+  return _BINARY_BYTES_HEX_RE.sub(" ", text) if "\\x" in text else text
 
 
 def _parse_and_process_pattern(
@@ -934,27 +1681,49 @@ def _parse_and_process_pattern(
   state = groups.get("state", "")
 
   if class_name:
+    is_internal = class_name in constants.INTERNAL_FAKE_WARNING_CLASSES
     register_item(
         class_name,
-        Classification.SUSPICIOUS if is_suspicious_override else None,
+        Classification.SUSPICIOUS
+        if (is_suspicious_override and not is_internal)
+        else None,
     )
     if method_name:
-      register_item(f"{class_name}.{method_name}")
+      register_item(
+          method_name if is_internal else f"{class_name}.{method_name}"
+      )
+
   if attr_name:
     register_item(attr_name)
+
   if module_name:
     register_item(module_name)
 
   combined_args = (args or state) + " " + kwargs
   if combined_args.strip():
-    for group in re.findall(
-        r"['\"](.*?)['\"]|([a-zA-Z_][a-zA-Z0-9_.]*(?:\(.*?\))?)", combined_args
-    ):
+    combined_args = _strip_binary_bytes_repr(combined_args)
+    for group in _COMBINED_ARGS_TOKEN_RE.findall(combined_args):
       for token in group:
-        if token:
+        token = token.strip(".")
+        if token and not _HEX_TOKEN_PREFIX_RE.match(token):
           register_item(token)
 
   return True
+
+
+def _is_valid_dotted_log_symbol(symbol: str) -> bool:
+  """Checks whether a symbol extracted from a log prefix is a valid dotted path.
+
+  Args:
+    symbol: Candidate module or class path string.
+
+  Returns:
+    True if `symbol` is a non-empty ASCII alphanumeric/underscore/dot token, or
+    False otherwise.
+  """
+  if not symbol or not symbol.isascii():
+    return False
+  return symbol.replace(".", "").replace("_", "").isalnum()
 
 
 def categorize_picklemagic(
@@ -969,7 +1738,12 @@ def categorize_picklemagic(
   }
 
   def register_item(item: str, override: Classification | None = None):
-    cls = override or _classify_item(item)
+    base_cls = classify_symbol(item) if item else None
+    cls = (
+        override
+        if (override is not None and base_cls == Classification.UNKNOWN)
+        else base_cls
+    )
     if cls is not None:
       results[cls].add(item)
 
@@ -978,24 +1752,28 @@ def categorize_picklemagic(
     if not line:
       continue
 
-    if "Unsafe module/class invoked:" in line:
-      match = re.search(
-          r"Unsafe module/class invoked:\s*([a-zA-Z0-9_.]+)", line
-      )
-      if match:
-        full_name = match.group(1)
-        results[Classification.UNSAFE].add(full_name)
-        if "." in full_name:
-          results[Classification.UNSAFE].add(full_name.split(".", 1)[0])
-      continue
+    clean_line = line.removeprefix("WARNING:picklemagic:")
+    if clean_line.startswith("Unsafe module/class invoked:"):
+      full_name = clean_line.removeprefix(
+          "Unsafe module/class invoked:"
+      ).strip()
+      if _is_valid_dotted_log_symbol(full_name):
+        cls = classify_symbol(full_name)
+        if cls in (Classification.SAFE, Classification.SUSPICIOUS):
+          results[cls].add(full_name)
+        else:
+          results[Classification.UNSAFE].add(full_name)
+          if "." in full_name:
+            results[Classification.UNSAFE].add(full_name.split(".", 1)[0])
+        continue
 
-    if "Unknown module/class imported:" in line:
-      match = re.search(
-          r"Unknown module/class imported:\s*([a-zA-Z0-9_.]+)", line
-      )
-      if match:
-        results[Classification.UNKNOWN].add(match.group(1))
-      continue
+    if clean_line.startswith("Unknown module/class imported:"):
+      full_name = clean_line.removeprefix(
+          "Unknown module/class imported:"
+      ).strip()
+      if _is_valid_dotted_log_symbol(full_name):
+        results[Classification.UNKNOWN].add(full_name)
+        continue
 
     matched = False
     for keyword, pattern, is_override in PICKLEMAGIC_PATTERNS:
@@ -1013,16 +1791,7 @@ def categorize_picklemagic(
       continue
 
     # Legacy fallback parsing
-    if line.lower().startswith("warning"):
-      match = re.search(
-          r"Unsafe module/class invoked:\s*([a-zA-Z0-9_.]+)", line
-      )
-      if match:
-        full_name = match.group(1)
-        results[Classification.UNSAFE].add(full_name)
-        if "." in full_name:
-          results[Classification.UNSAFE].add(full_name.split(".", 1)[0])
-    elif line.lower().startswith("<"):
+    if line.lower().startswith("<"):
       class_args_match = ARGS_REGEX.search(line.lower())
       if class_args_match:
         register_item(class_args_match.group(1))
@@ -1474,34 +2243,25 @@ def partition_pickle_chunks(
         ]
         seed_stacks.append(non_null_strings[-16:])
 
-  if include_memo:
-    chunk_partitions = [
-        (
-            chunk_starts[chunk_index],
-            (
-                chunk_starts[chunk_index + 1]
-                if chunk_index + 1 < len(chunk_starts)
-                else effective_length
-            ),
-            seed_stacks[chunk_index],
-            seed_memos[chunk_index],
-        )
-        for chunk_index in range(len(chunk_starts))
-    ]
-    return chunk_partitions
-
-  chunk_partitions = [
-      (
-          chunk_starts[chunk_index],
-          (
-              chunk_starts[chunk_index + 1]
-              if chunk_index + 1 < len(chunk_starts)
-              else effective_length
-          ),
+  chunk_partitions = []
+  for chunk_index, chunk_start in enumerate(chunk_starts):
+    chunk_end = (
+        chunk_starts[chunk_index + 1]
+        if chunk_index + 1 < len(chunk_starts)
+        else effective_length
+    )
+    if include_memo:
+      chunk_partitions.append((
+          chunk_start,
+          chunk_end,
           seed_stacks[chunk_index],
+          seed_memos[chunk_index],
+      ))
+    else:
+      chunk_partitions.append(
+          (chunk_start, chunk_end, seed_stacks[chunk_index])
       )
-      for chunk_index in range(len(chunk_starts))
-  ]
+
   return chunk_partitions
 
 
