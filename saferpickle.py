@@ -973,13 +973,13 @@ def security_scan(
   try:
     is_archive = False
     if not isinstance(pickle_bytes, bytes):
-      # Peek first 262 bytes to identify archive streams
+      # Peek first 512 bytes to identify archive streams
       current_pos = pickle_bytes.tell()
-      header = pickle_bytes.read(262)
+      header = pickle_bytes.read(512)
       pickle_bytes.seek(current_pos)
       if header.startswith(
           (b"PK\x03\x04", b"BZh", b"\xfd7zXZ\x00", b"\x1f\x8b")
-      ) or (len(header) >= 262 and header[257:262] == b"ustar"):
+      ) or utils.has_tar_header(header):
         is_archive = True
 
     if is_archive:
@@ -1042,7 +1042,7 @@ def security_scan(
             fail_fast=fail_fast,
             check_magic_bytes=check_magic_bytes,
         )
-      elif len(pickle_bytes) >= 262 and pickle_bytes[257:262] == b"ustar":
+      elif utils.has_tar_header(pickle_bytes):
         return _extract_and_scan_archive(
             pickle_bytes,
             "tar",
@@ -1251,7 +1251,7 @@ def _security_scan_internal(
     stream.seek(current_pos)
     is_archive = header_bytes.startswith(
         (b"PK\x03\x04", b"BZh", b"\xfd7zXZ\x00", b"\x1f\x8b")
-    ) or (len(header_bytes) >= 262 and header_bytes[257:262] == b"ustar")
+    ) or utils.has_tar_header(header_bytes)
     if not is_archive:
       start_offset = utils.find_pickle_start_offset(stream)
     else:
@@ -1415,7 +1415,7 @@ def _scan_and_load(
       header_bytes = pickle_file.read(1024)
       is_archive = header_bytes.startswith(
           (b"PK\x03\x04", b"BZh", b"\xfd7zXZ\x00", b"\x1f\x8b")
-      ) or (len(header_bytes) >= 262 and header_bytes[257:262] == b"ustar")
+      ) or utils.has_tar_header(header_bytes)
       if not is_archive:
         start_offset = utils.find_pickle_start_offset(header_bytes)
       else:
@@ -1435,7 +1435,7 @@ def _scan_and_load(
     data_bytes = pickle_file_or_bytes
     is_archive = data_bytes.startswith(
         (b"PK\x03\x04", b"BZh", b"\xfd7zXZ\x00", b"\x1f\x8b")
-    ) or (len(data_bytes) >= 262 and data_bytes[257:262] == b"ustar")
+    ) or utils.has_tar_header(data_bytes)
     if not is_archive:
       start_offset = utils.find_pickle_start_offset(data_bytes)
     else:

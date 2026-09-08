@@ -357,10 +357,47 @@ def extract_gzip_contents(file_bytes: bytes | IO[bytes]) -> IO[bytes]:
   return cast(IO[bytes], gzip.open(stream))
 
 
+def has_tar_header(header: bytes) -> bool:
+  """Checks if a leading byte prefix looks like a tar header block.
+
+  ustar, GNU and pax archives all carry the "ustar" magic at offset 257, but
+  old (v7) archives carry no magic at all. Those are still readable by
+  `tarfile.open(mode="r:*")`, so they are identified here by verifying the
+  header checksum stored at offset 148 instead.
+
+  Args:
+    header: The leading bytes of the file. At least 512 bytes are needed to
+      recognise a v7 header.
+
+  Returns:
+    True if the prefix looks like a tar header, False otherwise.
+  """
+  if len(header) >= 262 and header[257:262] == b"ustar":
+    return True
+  if len(header) < 512:
+    return False
+
+  stored = header[148:156].split(b"\0")[0].strip()
+  if not stored:
+    return False
+  try:
+    expected = int(stored, 8)
+  except ValueError:
+    return False
+
+  # The checksum is computed with the checksum field itself read as spaces.
+  unsigned = sum(header[:148]) + (ord(" ") * 8) + sum(header[156:512])
+  signed = (
+      sum(b - 256 if b > 127 else b for b in header[:148])
+      + (ord(" ") * 8)
+      + sum(b - 256 if b > 127 else b for b in header[156:512])
+  )
+  return expected in (unsigned, signed)
+
+
 def is_tar_bytes(file_bytes: bytes | BinaryIO) -> bool:
   """Checks if the provided bytes represent a tar file."""
-  peeked = _peek_bytes(file_bytes, 262)
-  return len(peeked) >= 262 and peeked[257:262] == b"ustar"
+  return has_tar_header(_peek_bytes(file_bytes, 512))
 
 
 def extract_tar_contents(
