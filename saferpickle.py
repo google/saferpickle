@@ -978,14 +978,14 @@ def security_scan(
       header = pickle_bytes.read(262)
       pickle_bytes.seek(current_pos)
       if header.startswith(
-          (b"PK\x03\x04", b"BZh", b"\xfd7zXZ\x00", b"\x1f\x8b")
+          constants.ZIP_MAGIC_BYTES + (b"BZh", b"\xfd7zXZ\x00", b"\x1f\x8b")
       ) or (len(header) >= 262 and header[257:262] == b"ustar"):
         is_archive = True
 
     if is_archive:
       # Temporarily archive streams fully to bytes
       archive_bytes = pickle_bytes.read()  # pyrefly: ignore[missing-attribute]
-      if archive_bytes.startswith(b"PK\x03\x04"):
+      if archive_bytes.startswith(constants.ZIP_MAGIC_BYTES):
         archive_type = "zip"
       elif archive_bytes.startswith(b"BZh"):
         archive_type = "bz2"
@@ -1006,7 +1006,7 @@ def security_scan(
 
     # Check for compression signatures if input was raw bytes
     if isinstance(pickle_bytes, bytes):
-      if pickle_bytes.startswith(b"PK\x03\x04"):
+      if pickle_bytes.startswith(constants.ZIP_MAGIC_BYTES):
         return _extract_and_scan_archive(
             pickle_bytes,
             "zip",
@@ -1250,7 +1250,7 @@ def _security_scan_internal(
     header_bytes = stream.read(1024)
     stream.seek(current_pos)
     is_archive = header_bytes.startswith(
-        (b"PK\x03\x04", b"BZh", b"\xfd7zXZ\x00", b"\x1f\x8b")
+        constants.ZIP_MAGIC_BYTES + (b"BZh", b"\xfd7zXZ\x00", b"\x1f\x8b")
     ) or (len(header_bytes) >= 262 and header_bytes[257:262] == b"ustar")
     if not is_archive:
       start_offset = utils.find_pickle_start_offset(stream)
@@ -1414,7 +1414,7 @@ def _scan_and_load(
       pickle_file.seek(0)
       header_bytes = pickle_file.read(1024)
       is_archive = header_bytes.startswith(
-          (b"PK\x03\x04", b"BZh", b"\xfd7zXZ\x00", b"\x1f\x8b")
+          constants.ZIP_MAGIC_BYTES + (b"BZh", b"\xfd7zXZ\x00", b"\x1f\x8b")
       ) or (len(header_bytes) >= 262 and header_bytes[257:262] == b"ustar")
       if not is_archive:
         start_offset = utils.find_pickle_start_offset(header_bytes)
@@ -1434,7 +1434,7 @@ def _scan_and_load(
       raise TypeError("pickle_file_or_bytes must be bytes when is_load=False")
     data_bytes = pickle_file_or_bytes
     is_archive = data_bytes.startswith(
-        (b"PK\x03\x04", b"BZh", b"\xfd7zXZ\x00", b"\x1f\x8b")
+        constants.ZIP_MAGIC_BYTES + (b"BZh", b"\xfd7zXZ\x00", b"\x1f\x8b")
     ) or (len(data_bytes) >= 262 and data_bytes[257:262] == b"ustar")
     if not is_archive:
       start_offset = utils.find_pickle_start_offset(data_bytes)
