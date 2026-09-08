@@ -313,9 +313,9 @@ def extract_zip_contents(
       io.BytesIO(file_bytes) if isinstance(file_bytes, bytes) else file_bytes
   )
   with zipfile.ZipFile(stream) as zf:
-    for name in zf.namelist():
-      with zf.open(name) as f:
-        yield name, f
+    for info in zf.infolist():
+      with zf.open(info) as f:
+        yield info.filename, f
 
 
 def is_bz2_bytes(file_bytes: bytes | BinaryIO) -> bool:
