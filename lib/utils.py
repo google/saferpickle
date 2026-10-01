@@ -25,19 +25,35 @@ import inspect
 import io
 import lzma
 import math
+import mmap
 import os
+import pickletools
 import re
 import subprocess
 import sys
 import tarfile
 import threading
 import types
-from typing import BinaryIO, Callable, Dict, FrozenSet, Generator, IO, Set, Tuple, cast
+from typing import (
+    Any,
+    BinaryIO,
+    Callable,
+    Dict,
+    FrozenSet,
+    Generator,
+    IO,
+    Iterator,
+    Optional,
+    Set,
+    Tuple,
+    cast,
+)
 import zipfile
 
 from absl import logging
 from lib import config
 from lib import constants
+from lib import exceptions
 
 
 @enum.unique
@@ -832,6 +848,9 @@ def is_sys_executable_patched() -> bool:
     True if `sys.executable` was successfully patched to a valid path, False
     otherwise.
   """
+  if sys.executable and os.path.exists(sys.executable):
+    return True
+
   py_interpreter_candidate = sys.argv[0]
 
   # If sys.executable is not set, we patch it with the interpreter path that
@@ -841,8 +860,8 @@ def is_sys_executable_patched() -> bool:
     valid_py_interpreter_path = get_interpreter_path_to_patch()
 
     for interpreter_path in [
-        py_interpreter_candidate,
         valid_py_interpreter_path,
+        py_interpreter_candidate,
     ]:
       if (
           interpreter_path and os.path.exists(interpreter_path)
@@ -990,3 +1009,360 @@ def categorize_picklemagic(
       results[Classification.SUSPICIOUS],
       results[Classification.UNKNOWN],
   )
+
+
+_OPCODES_STRIDE_1: frozenset[int] = frozenset({
+    0x28,
+    0x29,
+    0x2E,
+    0x30,
+    0x31,
+    0x32,
+    0x4E,
+    0x7D,
+    0x5D,
+    0x61,
+    0x65,
+    0x73,
+    0x75,
+    0x74,
+    0x6C,
+    0x64,
+    0x85,
+    0x86,
+    0x87,
+    0x88,
+    0x89,
+    0x8F,
+    0x90,
+    0x91,
+    0x94,
+    0x97,
+    0x98,
+})
+_OPCODES_STRIDE_2: frozenset[int] = frozenset({0x80, 0x4B, 0x68, 0x71})
+_OPCODES_STRIDE_3: frozenset[int] = frozenset({0x4D})
+_OPCODES_STRIDE_5: frozenset[int] = frozenset({0x4A, 0x6A, 0x72})
+_OPCODES_STRIDE_9: frozenset[int] = frozenset({0x47, 0x95})
+
+
+def _build_opcode_strides() -> list[int]:
+  """Constructs a 256-element byte stride lookup table for fixed-size opcodes.
+
+  Precomputes fixed byte offset advances for standard pickle opcodes so the
+  parser can skip non-string operands in O(1) time without unpacking arguments.
+
+  Returns:
+    A 256-element integer list where indices represent opcode bytes and values
+    represent the total stride in bytes, or -1 for variable-length opcodes.
+  """
+  strides = [-1] * 256
+  for opcode_byte in _OPCODES_STRIDE_1:
+    strides[opcode_byte] = 1
+  for opcode_byte in _OPCODES_STRIDE_2:
+    strides[opcode_byte] = 2
+  for opcode_byte in _OPCODES_STRIDE_3:
+    strides[opcode_byte] = 3
+  for opcode_byte in _OPCODES_STRIDE_5:
+    strides[opcode_byte] = 5
+  for opcode_byte in _OPCODES_STRIDE_9:
+    strides[opcode_byte] = 9
+  return strides
+
+
+OPCODE_STRIDES = _build_opcode_strides()
+
+
+def decode_string_operand(
+    data: bytes | mmap.mmap,
+    start: int,
+    length: int,
+    encoding: str = "utf-8",
+) -> str | None:
+  """Decodes a byte slice into a string operand safely.
+
+  Decodes string operands extracted from pickle byte streams while ignoring
+  decode errors and filtering out single-character strings.
+
+  Args:
+    data: The raw pickle byte buffer or memory-mapped file.
+    start: The starting byte offset of the string payload.
+    length: The byte length of the string payload.
+    encoding: The character encoding to apply (defaults to utf-8).
+
+  Returns:
+    The decoded string operand if length exceeds 1 character, otherwise None.
+  """
+  try:
+    decoded_string = data[start : start + length].decode(
+        encoding, errors="ignore"
+    )
+    return decoded_string if len(decoded_string) > 1 else None
+  except (UnicodeDecodeError, ValueError):
+    return None
+
+
+_decode_string_operand = decode_string_operand
+
+
+def _read_length_span(
+    data: bytes | mmap.mmap,
+    pos: int,
+    total_length: int,
+    header_size: int,
+) -> tuple[int, int]:
+  """Returns (length, next_pos) for a length-prefixed opcode or raises error.
+
+  Validates that operand lengths do not exceed the bounds of the enclosing
+  pickle stream buffer.
+
+  Args:
+    data: The raw pickle byte buffer or memory-mapped file.
+    pos: Current byte offset at the start of the opcode.
+    total_length: Total byte length of the pickle data buffer.
+    header_size: Number of header bytes (1 opcode byte + length prefix bytes).
+
+  Returns:
+    A tuple of (payload_length, next_opcode_offset).
+
+  Raises:
+    exceptions.UnsafePickleDetectedError: If payload bounds exceed the buffer.
+  """
+  payload_start = pos + header_size
+  if payload_start > total_length:
+    raise exceptions.UnsafePickleDetectedError(
+        f"Parser error during security scan: truncated argument at offset {pos}"
+    )
+  payload_length = (
+      data[pos + 1]
+      if header_size == 2
+      else int.from_bytes(data[pos + 1 : payload_start], "little")
+  )
+  next_offset = payload_start + payload_length
+  if next_offset > total_length:
+    raise exceptions.UnsafePickleDetectedError(
+        f"Parser error during security scan: truncated argument at offset {pos}"
+    )
+  return payload_length, next_offset
+
+
+def _read_newline(
+    data: bytes | mmap.mmap,
+    start: int,
+    error_offset: int,
+) -> int:
+  """Returns index of next newline at or after start offset, or raises error.
+
+  Locates the terminating newline delimiter for text-based pickle opcodes.
+
+  Args:
+    data: The raw pickle byte buffer or memory-mapped file.
+    start: Byte offset where searching for newline should begin.
+    error_offset: Byte offset reported if the stream is truncated before
+      newline.
+
+  Returns:
+    The integer index of the newline byte in data.
+
+  Raises:
+    exceptions.UnsafePickleDetectedError: If no newline is found before end of
+    data.
+  """
+  newline_offset = data.find(b"\n", start)
+  if newline_offset == -1:
+    raise exceptions.UnsafePickleDetectedError(
+        "Parser error during security scan: truncated newline at offset"
+        f" {error_offset}"
+    )
+  return newline_offset
+
+
+def partition_pickle_chunks(
+    data: bytes | mmap.mmap,
+    target_chunk_size: int,
+    end: int | None = None,
+) -> list[tuple[int, int]]:
+  """Partitions pickle bytes into opcode-aligned chunk slices.
+
+  Scans opcode boundaries so large pickle buffers can be partitioned across
+  multiple threads without splitting multi-byte opcodes or string arguments.
+
+  Args:
+    data: The raw pickle byte buffer or memory-mapped file.
+    target_chunk_size: Desired byte size for each worker partition chunk.
+    end: Optional upper byte bound limiting the scan range.
+
+  Returns:
+    A list of tuples (chunk_start, chunk_end) defining slice ranges.
+  """
+  effective_length = len(data) if end is None else min(end, len(data))
+  chunk_starts = [0]
+  current_offset = 0
+  strides = OPCODE_STRIDES
+
+  while current_offset < effective_length:
+    opcode_byte = data[current_offset]
+    stride = strides[opcode_byte]
+    if stride > 0:
+      if opcode_byte == 0x2E:
+        break
+      current_offset += stride
+    else:
+      match opcode_byte:
+        # 1-byte length prefix (SHORT_BINUNICODE, SHORT_BINBYTES, etc.)
+        case 0x8C | 0x43 | 0x8A:
+          current_offset += 2 + data[current_offset + 1]
+        # 4-byte length prefix (BINUNICODE, BINBYTES, BINBYTES8_SHORT)
+        case 0x58 | 0x42 | 0x8B:
+          current_offset += 5 + int.from_bytes(
+              data[current_offset + 1 : current_offset + 5], "little"
+          )
+        # 8-byte length prefix (BINUNICODE8, BINBYTES8, BYTEARRAY8)
+        case 0x8D | 0x8E | 0x96:
+          current_offset += 9 + int.from_bytes(
+              data[current_offset + 1 : current_offset + 9], "little"
+          )
+        # Newline-terminated opcodes (INT, FLOAT, LONG, STRING, etc.)
+        case 0x49 | 0x46 | 0x4C | 0x70 | 0x67 | 0x50 | 0x56 | 0x53:
+          if (newline_offset := data.find(b"\n", current_offset + 1)) == -1:
+            break
+          current_offset = newline_offset + 1
+        # Two newline-terminated strings for module and attribute (GLOBAL, INST)
+        case 0x63 | 0x69:
+          if (first_newline := data.find(b"\n", current_offset + 1)) == -1 or (
+              second_newline := data.find(b"\n", first_newline + 1)
+          ) == -1:
+            break
+          current_offset = second_newline + 1
+        # Unrecognized or single-byte variable opcode
+        case _:
+          current_offset += 1
+
+    if (
+        current_offset - chunk_starts[-1] >= target_chunk_size
+        and current_offset < effective_length
+    ):
+      chunk_starts.append(current_offset)
+
+  # Returns the chunks and indexes
+  return [
+      (
+          chunk_starts[chunk_index],
+          (
+              chunk_starts[chunk_index + 1]
+              if chunk_index + 1 < len(chunk_starts)
+              else effective_length
+          ),
+      )
+      for chunk_index in range(len(chunk_starts))
+  ]
+
+
+def custom_genops_from_bytes(
+    data: bytes | mmap.mmap,
+    start: int = 0,
+    end: int | None = None,
+) -> Iterator[tuple[Optional[pickletools.OpcodeInfo], Any | None]]:
+  """Generates string-declaring opcodes and arguments from raw pickle bytes.
+
+  Args:
+    data: The raw pickle byte buffer or memory-mapped file.
+    start: Byte offset to start parsing from.
+    end: Optional byte offset upper limit for parsing.
+
+  Yields:
+    A tuple of (opcode_info, operand_value) for each string-declaring opcode.
+
+  Raises:
+    exceptions.UnsafePickleDetectedError: If a length-prefixed opcode is
+    truncated.
+  """
+  total_length = len(data)
+  limit_offset = total_length if end is None else min(end, total_length)
+  current_offset = start
+  strides = OPCODE_STRIDES
+
+  while current_offset < limit_offset:
+    opcode_byte = data[current_offset]
+    stride = strides[opcode_byte]
+    if stride > 0:
+      if current_offset + stride > limit_offset:
+        raise exceptions.UnsafePickleDetectedError(
+            "Parser error during security scan: truncated argument at offset"
+            f" {current_offset}"
+        )
+      if opcode_byte == 0x2E:
+        break
+      current_offset += stride
+      continue
+
+    match opcode_byte:
+      # 1-byte, 4-byte, or 8-byte length-prefixed Unicode text strings
+      case 0x8C | 0x58 | 0x8D:
+        header_size = (
+            2 if opcode_byte == 0x8C else (5 if opcode_byte == 0x58 else 9)
+        )
+        payload_length, current_offset = _read_length_span(
+            data, current_offset, limit_offset, header_size
+        )
+        string_value = decode_string_operand(
+            data, current_offset - payload_length, payload_length, "utf-8"
+        )
+        if string_value is not None:
+          yield constants.OPCODES_INFO_INT.get(opcode_byte), string_value
+
+      # Non-string binary byte buffers and bytearrays to skip safely
+      case 0x43 | 0x8A | 0x42 | 0x8B | 0x8E | 0x96:
+        header_size = (
+            2
+            if opcode_byte in (0x43, 0x8A)
+            else (5 if opcode_byte in (0x42, 0x8B) else 9)
+        )
+        _, current_offset = _read_length_span(
+            data, current_offset, limit_offset, header_size
+        )
+
+      # Newline-terminated string literals (Protocol 0 UNICODE / STRING)
+      case 0x56 | 0x53:
+        newline_offset = _read_newline(data, current_offset + 1, current_offset)
+        encoding = "raw-unicode-escape" if opcode_byte == 0x56 else "latin1"
+        string_value = decode_string_operand(
+            data,
+            current_offset + 1,
+            newline_offset - current_offset - 1,
+            encoding,
+        )
+        if string_value is not None:
+          yield constants.OPCODES_INFO_INT.get(opcode_byte), string_value
+        current_offset = newline_offset + 1
+
+      # Two newline-terminated strings for module and attribute names
+      case 0x63 | 0x69:
+        module_newline = _read_newline(data, current_offset + 1, current_offset)
+        name_newline = _read_newline(data, module_newline + 1, current_offset)
+        module_name = data[current_offset + 1 : module_newline].decode(
+            "utf-8", errors="ignore"
+        )
+        attribute_name = data[module_newline + 1 : name_newline].decode(
+            "utf-8", errors="ignore"
+        )
+        opcode_info = constants.OPCODES_INFO_INT.get(opcode_byte)
+        yield opcode_info, module_name
+        yield opcode_info, attribute_name
+        yield opcode_info, f"{module_name}.{attribute_name}"
+        current_offset = name_newline + 1
+
+      # Stack global resolution opcode referencing stack operands
+      case 0x93:
+        yield constants.OPCODES_INFO_INT.get(opcode_byte), "STACK_GLOBAL"
+        current_offset += 1
+
+      # Newline-terminated non-string numeric and memo arguments to skip
+      case 0x49 | 0x46 | 0x4C | 0x70 | 0x67 | 0x50:
+        current_offset = (
+            _read_newline(data, current_offset + 1, current_offset) + 1
+        )
+
+      # Unrecognized single-byte opcode
+      case _:
+        current_offset += 1

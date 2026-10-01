@@ -23,6 +23,7 @@ import io
 import logging as std_logging
 import lzma
 import math
+import mmap
 from multiprocessing import shared_memory
 import os
 import pickle
@@ -33,7 +34,17 @@ import sys
 import tarfile
 import tempfile
 import threading
-from typing import Any, BinaryIO, Callable, Dict, IO, Iterator, Optional, Set, Tuple
+from typing import (
+    Any,
+    BinaryIO,
+    Callable,
+    Dict,
+    IO,
+    Iterator,
+    Optional,
+    Set,
+    Tuple,
+)
 import zipfile
 
 from absl import logging
@@ -42,8 +53,6 @@ from lib import config
 from lib import constants
 from lib import exceptions
 from lib import utils
-
-import multiprocessing
 
 IllegalArgumentCombinationError = exceptions.IllegalArgumentCombinationError
 StrictCheckError = exceptions.StrictCheckError
@@ -72,9 +81,12 @@ class ScanResults:
   is_denylisted: bool = False
 
 
+_decode_string_operand = utils.decode_string_operand
+
+
 def _custom_genops(
-    pickle_bytes: bytes,
-) -> Iterator[tuple[pickletools.OpcodeInfo, Any | None]]:
+    pickle_bytes: bytes | BinaryIO,
+) -> Iterator[tuple[Optional[pickletools.OpcodeInfo], Any | None]]:
   """Generates string-declaring opcodes and their arguments from pickle data.
 
   Args:
@@ -83,24 +95,22 @@ def _custom_genops(
   Yields:
     A tuple of (opcode, opcode_argument) for each string-declaring opcode.
   """
-
   if isinstance(pickle_bytes, bytes):
-    pickle_file = io.BytesIO(pickle_bytes)
-  else:
-    pickle_file = pickle_bytes
+    yield from utils.custom_genops_from_bytes(pickle_bytes)
+    return
 
+  pickle_file = pickle_bytes
   while True:
     charcode = pickle_file.read(1)
-    if not charcode:  # Indicates exhaustion of the data stream
+    if not charcode:
       break
 
     try:
       opcode = constants.OPCODES_INFO_INT.get(charcode[0])
     except IndexError:
-      continue  # Skip invalid opcode bytes
+      continue
 
     if opcode is None:
-      # We skip processing unknown opcodes
       continue
 
     opcode_argument = None
@@ -148,19 +158,13 @@ def _custom_genops(
         ):
           continue
 
-    # We only yield opcodes that declare strings and have arguments
     should_yield = False
     for relevant_opcode_substr in constants.OPCODE_SUBSTRS_THAT_DECLARE_STRINGS:
       if relevant_opcode_substr in opcode.name:
         should_yield = True
         break
 
-    if (
-        should_yield
-        and opcode_argument is not None  # Exclude opcodes without arguments
-    ):
-      # This is to be careful while processing opcode arguments. This was
-      # borrowed from what works in the chunked version.
+    if should_yield and opcode_argument is not None:
       if isinstance(opcode_argument, (str, bytes)) and len(opcode_argument) > 1:
         yield opcode, opcode_argument
       elif isinstance(opcode_argument, tuple):
@@ -170,255 +174,138 @@ def _custom_genops(
       break
 
 
-def _custom_chunked_genops(
-    pickle_file: IO[bytes],
-    chunk_range: Tuple[int, int],
-) -> Iterator[tuple[pickletools.OpcodeInfo, Any | None]]:
-  """Generates string-declaring opcodes and arguments from a chunk.
+def _scan_byte_slice(
+    data: bytes | mmap.mmap,
+    start: int,
+    end: int,
+    fail_fast: bool,
+    abort_event: Optional[threading.Event] = None,
+) -> Set[str]:
+  """Worker function to scan a byte slice of pickle bytecode.
 
-  This function reads a specific byte range (chunk) of the pickle bytecode
-  and yields opcodes that are known to declare strings, along with their
-  arguments. It's designed to be used in parallel for large pickle files.
+  Scans an opcode-aligned byte slice concurrently in a worker thread and
+  extracts all string-declaring operands
 
   Args:
-    pickle_file: The pickle data stream to generate opcodes from.
-    chunk_range: A tuple (start, end) defining the byte range to process.
+    data: The raw pickle byte buffer or mmapped file slice.
+    start: Byte offset where the chunk starts.
+    end: Byte offset where the chunk ends.
+    fail_fast: Whether to abort scanning immediately upon detecting an unsafe or
+      suspicious operand.
+    abort_event: Optional threading event used to signal other workers to stop.
 
-  Yields:
-    A tuple of (opcode, opcode_argument) for each string-declaring opcode.
+  Returns:
+    A set of string operands discovered within the byte slice.
   """
-  pickle_file.seek(chunk_range[0])
-
-  while True:
-    current_file_position = pickle_file.tell()
-    if not (chunk_range[0] <= current_file_position < chunk_range[1]):
+  discovered_operands = set()
+  for _, operand in utils.custom_genops_from_bytes(data, start=start, end=end):
+    if abort_event and abort_event.is_set():
       break
-
-    charcode = pickle_file.read(1)
-    if not charcode:  # Indicates exhaustion of the data stream
-      break
-
-    try:
-      opcode = constants.OPCODES_INFO_INT.get(charcode[0])
-    except IndexError:
-      continue  # Skip invalid opcode bytes
-
-    if opcode is None:
-      # We skip processing unknown opcodes
-      if not charcode:
+    if operand is not None:
+      operand_string = str(operand)
+      discovered_operands.add(operand_string)
+      if fail_fast and utils.is_unsafe_or_suspicious(operand_string):
+        if abort_event:
+          abort_event.set()
         break
-      continue
-
-    opcode_argument = None
-    if opcode.arg is not None:
-      pos_before_arg_read = pickle_file.tell()
-      try:
-        opcode_argument = opcode.arg.reader(pickle_file)
-        new_pos = pickle_file.tell()
-
-        # Ensure we don't read past the chunk boundary accidentally
-        if new_pos > chunk_range[1]:
-          pickle_file.seek(pos_before_arg_read)
-          continue
-
-      except (ValueError, pickle.UnpicklingError) as e:
-        raise UnsafePickleDetectedError(
-            f"Parser error during security scan: {e}"
-        ) from e
-      except (
-          IndexError,
-          AttributeError,
-          EOFError,
-          TypeError,
-          ImportError,
-      ):
-        # Continue if we can't read the argument within the chunk
-        pickle_file.seek(pos_before_arg_read)
-        continue
-
-    # We only yield opcodes that declare strings and have arguments
-    should_yield = False
-    for relevant_opcode_substr in constants.OPCODE_SUBSTRS_THAT_DECLARE_STRINGS:
-      if relevant_opcode_substr in opcode.name:
-        should_yield = True
-        break
-
-    if (
-        should_yield
-        and opcode_argument is not None  # Exclude opcodes without arguments
-    ):
-      # Filter to ensure the argument is string-like if needed
-      if isinstance(opcode_argument, (str, bytes)) and len(opcode_argument) > 1:
-        yield opcode, opcode_argument
-      elif isinstance(
-          opcode_argument, tuple
-      ):  # Sometimes these arguments are memoized tuples
-        yield opcode, opcode_argument
-
-    if charcode == b".":
-      break
-
-
-def _process_chunk_for_generate_ops(
-    pickle_data_source: str | bytes,
-    chunk_range: Tuple[int, int],
-    is_shared_memory: bool = False,
-    abort_event: Optional[Any] = None,
-) -> Set[str]:
-  """Helper function to process a chunk of pickle data."""
-  chunked_operands = set()
-  try:
-    if is_shared_memory:
-      shm = shared_memory.SharedMemory(name=pickle_data_source)  # pyrefly: ignore[bad-argument-type]
-      try:
-        # Use BytesIO on the memoryview for compatibility with
-        # _custom_chunked_genops
-        data_view = shm.buf
-        with io.BytesIO(data_view) as f:  # pyrefly: ignore[bad-argument-type]
-          for _, operand in _custom_chunked_genops(f, chunk_range):
-            if abort_event and abort_event.is_set():
-              break
-            if operand is None:
-              continue
-            operand_str = str(operand)
-            chunked_operands.add(operand_str)
-            if abort_event:
-              if utils.is_unsafe_or_suspicious(operand_str):
-                abort_event.set()
-                break
-      finally:
-        shm.close()
-    else:
-      with open(pickle_data_source, "rb") as f:
-        f.seek(chunk_range[0])
-        chunk_data = f.read(chunk_range[1] - chunk_range[0])
-        with io.BytesIO(chunk_data) as memory_f:
-          for _, operand in _custom_chunked_genops(
-              memory_f, (0, len(chunk_data))
-          ):
-            if abort_event and abort_event.is_set():
-              break
-            if operand is None:
-              continue
-            operand_str = str(operand)
-            chunked_operands.add(operand_str)
-            if abort_event:
-              if utils.is_unsafe_or_suspicious(operand_str):
-                abort_event.set()
-                break
-  except StopIteration:
-    pass
-  return chunked_operands
+  return discovered_operands
 
 
 def generate_ops_from_file(
     pickle_file_path: str,
-    shm_name: Optional[str] = None,
+    shared_memory_name: Optional[str] = None,
     pickle_length: Optional[int] = None,
     fail_fast: Optional[bool] = DEFAULT_FAIL_FAST,
+    shm_name: Optional[str] = None,
 ) -> Set[str]:
   """Returns opcodes that declare strings from a path or shared memory.
 
+  Reads pickle bytecode and partitions large payloads for parallel
+  scanning using threads.
+
   Args:
-    pickle_file_path: The path to the pickle file.
-    shm_name: Optional name of the shared memory block.
-    pickle_length: Optional length of the pickle data.
+    pickle_file_path: The filesystem path to the pickle file.
+    shared_memory_name: Optional name of the shared memory block.
+    pickle_length: Optional length of the pickle data in bytes.
     fail_fast: Whether to fail fast on first unsafe or suspicious match.
+    shm_name: Deprecated alias for shared_memory_name.
 
   Returns:
-    genops_output: The operands associated with the opcodes that declare
-    strings.
+    The operands associated with opcodes declaring strings.
   """
-  filtered_operands = set()
-  num_workers = utils.get_optimal_workers(pickle_length)  # pyrefly: ignore[bad-argument-type]
-
-  if (
-      pickle_length < constants.MIN_SIZE_FOR_CHUNKING  # pyrefly: ignore[unsupported-operation]
-      or not utils.is_sys_executable_patched()
-  ):
-    if shm_name:
-      shm = shared_memory.SharedMemory(name=shm_name)
-      pickle_bytes = bytes(shm.buf[:pickle_length])  # pyrefly: ignore[unsupported-operation]
-    else:
-      with open(pickle_file_path, "rb") as f:
-        pickle_bytes = f.read()
-    try:
-      for _, operand in _custom_genops(pickle_bytes):
-        if operand is None:
-          continue
-        operand_str = str(operand)
-        filtered_operands.add(operand_str)
-        if fail_fast:
-          if utils.is_unsafe_or_suspicious(operand_str):
-            break
-    except StopIteration:
-      pass
-    return filtered_operands
-  else:
-    # Divide into constants.MAX_NUM_CHUNKS for larger files
-    chunk_size = math.ceil(pickle_length / num_workers)  # pyrefly: ignore[unsupported-operation]
-    ranges = []
-    for chunk_index in range(num_workers):
-      chunk_start_size = chunk_index * chunk_size
-      # Extend the chunk end by CHUNK_OVERLAP, but don't exceed pickle_length
-      chunk_end = min(  # pyrefly: ignore[bad-specialization]
-          chunk_start_size + chunk_size + constants.CHUNK_OVERLAP, pickle_length
+  target_shared_memory_name = shared_memory_name or shm_name
+  shared_memory_block = None
+  try:
+    if target_shared_memory_name:
+      shared_memory_block = shared_memory.SharedMemory(
+          name=target_shared_memory_name
       )
-      if chunk_start_size < pickle_length:  # pyrefly: ignore[unsupported-operation]
-        ranges.append((chunk_start_size, chunk_end))
-      if chunk_end == pickle_length:
-        break  # Last chunk reaches the end
+      pickle_bytes = getattr(shared_memory_block, "_mmap")
+    else:
+      with open(pickle_file_path, "rb") as file_handle:
+        pickle_bytes = file_handle.read()
 
-    ctx = multiprocessing.get_context("spawn")
-    manager = ctx.Manager() if fail_fast else None
-    abort_event = manager.Event() if manager else None
+    effective_length = (
+        pickle_length if pickle_length is not None else len(pickle_bytes)
+    )
+    num_workers = utils.get_optimal_workers(effective_length)
 
-    try:
-      with concurrent.futures.ProcessPoolExecutor(
-          max_workers=num_workers, mp_context=ctx
-      ) as executor:
-        future_to_range_tuple = {
-            executor.submit(
-                _process_chunk_for_generate_ops,
-                shm_name if shm_name else pickle_file_path,
-                range_tuple,
-                is_shared_memory=bool(shm_name),
-                abort_event=abort_event,
-            ): range_tuple
-            for range_tuple in ranges
-        }
-        for future in concurrent.futures.as_completed(future_to_range_tuple):
-          try:
-            chunk_results = future.result()
-            filtered_operands.update(chunk_results)
-            if fail_fast:
-              has_blocked_operand = False
-              for op in chunk_results:
-                if utils.is_unsafe_or_suspicious(op):
-                  has_blocked_operand = True
-                  break
-              if has_blocked_operand:
-                if abort_event:
-                  abort_event.set()
-                for f in future_to_range_tuple:
-                  f.cancel()
-                break
-          except (
-              EOFError,
-              ValueError,
-              IndexError,
-              TypeError,
-          ) as exc:
-            logging.exception(
-                "Error processing chunk %s: %s",
-                future_to_range_tuple[future],
-                exc,
-            )
-    finally:
-      if manager:
-        manager.shutdown()
+    if (
+        effective_length < constants.MIN_SIZE_FOR_CHUNKING
+        or num_workers <= 1
+        or not utils.is_sys_executable_patched()
+    ):
+      all_operands = set()
+      for _, operand in utils.custom_genops_from_bytes(
+          pickle_bytes, end=effective_length
+      ):
+        if operand is not None:
+          operand_string = str(operand)
+          all_operands.add(operand_string)
+          if fail_fast and utils.is_unsafe_or_suspicious(operand_string):
+            break
+      return all_operands
 
-    return filtered_operands
+    target_chunk_size = max(
+        constants.MIN_SIZE_FOR_CHUNKING, effective_length // num_workers
+    )
+    chunk_ranges = utils.partition_pickle_chunks(
+        pickle_bytes, target_chunk_size, end=effective_length
+    )
+
+    all_operands = set()
+    abort_event = threading.Event() if fail_fast else None
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(chunk_ranges)
+    ) as executor:
+      futures = [
+          executor.submit(
+              _scan_byte_slice,
+              pickle_bytes,
+              start_offset,
+              end_offset,
+              bool(fail_fast),
+              abort_event,
+          )
+          for start_offset, end_offset in chunk_ranges
+      ]
+      for future in concurrent.futures.as_completed(futures):
+        chunk_results = future.result()
+        all_operands.update(chunk_results)
+        if fail_fast and any(
+            utils.is_unsafe_or_suspicious(item) for item in chunk_results
+        ):
+          if abort_event:
+            abort_event.set()
+          for running_future in futures:
+            running_future.cancel()
+          break
+
+    return all_operands
+  finally:
+    if shared_memory_block is not None:
+      shared_memory_block.close()
 
 
 def generate_ops(
@@ -435,7 +322,6 @@ def generate_ops(
     genops_output: The operands associated with the opcodes that declare
     strings.
   """
-
   filtered_operands = set()
   original_pos = None
   if not isinstance(pickle_bytes, bytes):
@@ -457,6 +343,120 @@ def generate_ops(
   finally:
     if original_pos is not None:
       pickle_bytes.seek(original_pos)  # pyrefly: ignore[missing-attribute]
+
+
+class SaferUnpickler(picklemagic.SafeUnpickler):
+  """Subclass of SafeUnpickler to optimize state checking during BUILD.
+
+  Overrides and refines object state verification to prevent bypasses from
+  injecting malicious state or invoking dangerous reduction callbacks on
+  untrusted classes.
+  """
+
+  def _state_contains_fake_class(
+      self,
+      object_to_inspect: Any,
+      visited_object_ids: Optional[Set[int]] = None,
+  ) -> bool:
+    """Recursively inspects an object to detect FakeClass instances or types.
+
+    Args:
+      object_to_inspect: The candidate object, container, or state dictionary.
+      visited_object_ids: Set of memory addresses visited to prevent infinite
+        cycles in self-referential structures.
+
+    Returns:
+      True if the object contains a FakeClass instance or type, False otherwise.
+    """
+    # Primitive immutable types cannot harbor custom objects so we quickly
+    # return
+    if isinstance(
+        object_to_inspect,
+        (
+            int,
+            float,
+            str,
+            bytes,
+            bool,
+            type(None),
+            complex,
+            memoryview,
+            bytearray,
+            range,
+        ),
+    ):
+      return False
+
+    # Skip heavy numerical array buffers from standard scientific libraries.
+    object_type = type(object_to_inspect)
+    if object_type.__module__ in (
+        "numpy",
+        "torch",
+    ) and object_type.__name__ in (
+        "ndarray",
+        "Tensor",
+    ):
+      return False
+
+    # Initialize cycle detection set on top-level call.
+    if visited_object_ids is None:
+      visited_object_ids = set()
+
+    current_object_id = id(object_to_inspect)
+    if current_object_id in visited_object_ids:
+      return False
+    visited_object_ids.add(current_object_id)
+
+    # Multiple checks below involve checking FakeClasses, dicts, sets,
+    # lists, __slots__ and tuples
+
+    # Check if target object is an unapproved sandbox FakeClass or
+    # FakeClassType.
+    if isinstance(
+        object_to_inspect, (picklemagic.FakeClass, picklemagic.FakeClassType)
+    ) or (
+        isinstance(object_to_inspect, type)
+        and issubclass(object_to_inspect, picklemagic.FakeClass)
+    ):
+      return True
+
+    if isinstance(object_to_inspect, (list, tuple, set, frozenset)):
+      return any(
+          self._state_contains_fake_class(element, visited_object_ids)
+          for element in object_to_inspect
+      )
+
+    if isinstance(object_to_inspect, dict):
+      return any(
+          self._state_contains_fake_class(dict_key, visited_object_ids)
+          or self._state_contains_fake_class(dict_value, visited_object_ids)
+          for dict_key, dict_value in object_to_inspect.items()
+      )
+
+    if hasattr(object_to_inspect, "__dict__") and isinstance(
+        getattr(object_to_inspect, "__dict__", None), dict
+    ):
+      instance_attributes = getattr(object_to_inspect, "__dict__")
+      if any(
+          self._state_contains_fake_class(attribute_name, visited_object_ids)
+          or self._state_contains_fake_class(
+              attribute_value, visited_object_ids
+          )
+          for attribute_name, attribute_value in instance_attributes.items()
+      ):
+        return True
+
+    if hasattr(object_to_inspect, "__slots__"):
+      slot_names = getattr(object_to_inspect, "__slots__")
+      if isinstance(slot_names, str):
+        slot_names = [slot_names]
+      for slot_name in slot_names:
+        if hasattr(object_to_inspect, slot_name):
+          slot_value = getattr(object_to_inspect, slot_name)
+          if self._state_contains_fake_class(slot_value, visited_object_ids):
+            return True
+
+    return False
 
 
 def get_class_instantiations(
@@ -503,7 +503,7 @@ def get_class_instantiations(
 
       # Instead of using safe_loads, we do this to get the
       # has_blocked_unsafe_build_instr boolean properly.
-      unpickler = picklemagic.SafeUnpickler(
+      unpickler = SaferUnpickler(
           pickle_stream,
           class_factory=factory,
           safe_modules=constants.SAFE_STRINGS,
@@ -793,18 +793,20 @@ def picklemagic_scan(
 def genops_scan(
     pickle_bytes: bytes | IO[bytes],
     pickle_file_path: Optional[str] = None,
-    shm_name: Optional[str] = None,
+    shared_memory_name: Optional[str] = None,
     fail_fast: Optional[bool] = DEFAULT_FAIL_FAST,
     pickle_length: Optional[int] = None,
+    shm_name: Optional[str] = None,
 ) -> ScanResults:
   """Genops scan for malicious content in pickle files.
 
   Args:
     pickle_bytes: Pickle bytecode to scan.
     pickle_file_path: Optional path to the pickle file for streaming scan.
-    shm_name: Optional name of the shared memory block.
+    shared_memory_name: Optional name of the shared memory block.
     fail_fast: Whether to fail fast on first unsafe or suspicious match.
-    pickle_length: Optional length of the pickle data.
+    pickle_length: Optional length of the pickle data in bytes.
+    shm_name: Deprecated alias for shared_memory_name.
 
   Returns:
     A ScanResults object.
@@ -812,10 +814,11 @@ def genops_scan(
   resolved_pickle_length = (
       pickle_length if pickle_length is not None else len(pickle_bytes)  # pyrefly: ignore[bad-argument-type]
   )
-  if shm_name:
+  target_shared_memory_name = shared_memory_name or shm_name
+  if target_shared_memory_name:
     genops_output = generate_ops_from_file(
         "",
-        shm_name=shm_name,
+        shared_memory_name=target_shared_memory_name,
         pickle_length=resolved_pickle_length,
         fail_fast=fail_fast,
     )
