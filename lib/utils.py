@@ -1209,11 +1209,12 @@ def partition_pickle_chunks(
       current_offset += stride
     else:
       match opcode_byte:
-        # 1-byte length prefix (SHORT_BINUNICODE, SHORT_BINBYTES, etc.)
-        case 0x8C | 0x43 | 0x8A:
+        # 1-byte length prefix (SHORT_BINUNICODE, SHORT_BINBYTES,
+        # SHORT_BINSTRING, etc.)
+        case 0x8C | 0x43 | 0x8A | 0x55:
           current_offset += 2 + data[current_offset + 1]
-        # 4-byte length prefix (BINUNICODE, BINBYTES, BINBYTES8_SHORT)
-        case 0x58 | 0x42 | 0x8B:
+        # 4-byte length prefix (BINUNICODE, BINBYTES, BINSTRING, etc.)
+        case 0x58 | 0x42 | 0x8B | 0x54:
           current_offset += 5 + int.from_bytes(
               data[current_offset + 1 : current_offset + 5], "little"
           )
@@ -1307,6 +1308,19 @@ def custom_genops_from_bytes(
         )
         string_value = decode_string_operand(
             data, current_offset - payload_length, payload_length, "utf-8"
+        )
+        if string_value is not None:
+          yield constants.OPCODES_INFO_INT.get(opcode_byte), string_value
+
+      # 1-byte or 4-byte length-prefixed latin-1 text strings
+      # (SHORT_BINSTRING, BINSTRING)
+      case 0x55 | 0x54:
+        header_size = 2 if opcode_byte == 0x55 else 5
+        payload_length, current_offset = _read_length_span(
+            data, current_offset, limit_offset, header_size
+        )
+        string_value = decode_string_operand(
+            data, current_offset - payload_length, payload_length, "latin-1"
         )
         if string_value is not None:
           yield constants.OPCODES_INFO_INT.get(opcode_byte), string_value
