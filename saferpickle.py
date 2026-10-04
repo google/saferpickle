@@ -1090,7 +1090,8 @@ def _extract_and_scan_archive(
     if archive_type == "zip":
       try:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
-          for name in zf.namelist():
+          for info in zf.infolist():
+            name = info.filename
             if ".." in name or name.startswith("/"):
               # Zip slip detection
               logging.warning("Zip slip detected: %s", name)
@@ -1100,7 +1101,7 @@ def _extract_and_scan_archive(
                   "unknown": 0,
               }  # Return early
 
-            with zf.open(name) as f:
+            with zf.open(info) as f:
               content = f.read()
               scores = security_scan(
                   content,
