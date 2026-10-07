@@ -116,17 +116,17 @@ def security_scan_with_justifications(
           "Found suspicious results:"
           f" {', '.join(map(str, final_suspicious_results))}"
       )
+  elif final_unknown_results:
+    classification = "unknown"
+    justification = (
+        f"Found unknown results: {', '.join(map(str, final_unknown_results))}"
+    )
   else:
-    justification_parts = []
-    if safe_results:
-      justification_parts.append(
-          f"Found safe results: {', '.join(map(str, final_safe_results))}"
-      )
-    if unknown_results:
-      justification_parts.append(
-          f"Found unknown results: {', '.join(map(str, final_unknown_results))}"
-      )
-    justification = " and ".join(justification_parts)
+    justification = (
+        f"Found safe results: {', '.join(map(str, final_safe_results))}"
+        if final_safe_results
+        else ""
+    )
     classification = "benign"
 
   return {"classification": classification, "justification": justification}

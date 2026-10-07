@@ -16,7 +16,9 @@
 
 import ast
 import bz2
+import codecs
 import collections
+import copyreg
 import dataclasses
 import enum
 import functools
@@ -141,6 +143,8 @@ _HEX_TOKEN_PREFIX_RE = re.compile(r"^x[0-9a-fA-F]{2}")
 _COMBINED_ARGS_TOKEN_RE = re.compile(
     r"'([^']*)'|\"([^\"]*)\"|([a-zA-Z_][a-zA-Z0-9_.]*(?:\(.*?\))?)"
 )
+_CLASS_REF_LOG_RE = re.compile(r"<class '([^']+)'>")
+_OBJECT_REF_LOG_RE = re.compile(r"<([a-zA-Z_][a-zA-Z0-9_.]*) object at 0x")
 
 
 # Creates a copy of the module
@@ -1352,15 +1356,25 @@ def get_module_members(module_name: str) -> Set[str] | None:
     members = {member for member, _ in inspect.getmembers(imported_module)}
     return members
 
-  if (spec := importlib.util.find_spec(module_name)) is None:
+  try:
+    spec = importlib.util.find_spec(module_name)
+  except (ImportError, AttributeError, ValueError):
     return None
-  if (origin := spec.origin) is None:
+  if spec is None:
+    return None
+  if (origin := spec.origin) is None or origin in ("built-in", "frozen"):
     return None
 
   try:
     with open(origin, "r") as f:
       tree = ast.parse(f.read(), filename=origin)
-  except (IOError, ValueError, SyntaxError, RecursionError):
+  except (
+      IOError,
+      OSError,
+      ValueError,
+      SyntaxError,
+      RecursionError,
+  ):
     return None
 
   members = {
@@ -1531,18 +1545,21 @@ def resolve_library_modules_from_results(
 
   # Identify which of the remaining candidates are actual importable modules.
   importable_modules = {}
-  for name in candidates:
-    module_name = name.split(".")[0]
-    if module_name == "__main__":
+  for candidate_name in candidates:
+    module_name = candidate_name.split(".")[0]
+    if module_name == "__main__" or is_self_protected_symbol(candidate_name):
       continue
 
     # Find spec to avoid importing risky modules from a loose python file
     # like import.py or similar.
-    module_spec = importlib.util.find_spec(name)
+    try:
+      module_spec = importlib.util.find_spec(candidate_name)
+    except (ImportError, AttributeError, ValueError):
+      module_spec = None
     if module_spec is not None:
-      module_members = get_module_members(name)
+      module_members = get_module_members(candidate_name)
       if module_members is not None:
-        importable_modules[name] = module_members
+        importable_modules[candidate_name] = module_members
 
   resolved_candidates = set()
   # Combine modules with any members found in the candidates list.
@@ -2030,6 +2047,16 @@ def _inspect_referenced_class(
   return False
 
 
+def _unwrap_callable(func: Any) -> Any:
+  """Unwraps `staticmethod`/`classmethod` descriptors and function wrappers."""
+  if isinstance(func, (staticmethod, classmethod)):
+    func = func.__func__
+  try:
+    return inspect.unwrap(func)
+  except (TypeError, ValueError):
+    return func
+
+
 def _callable_has_dangerous_bytecode(
     func: Any,
     *,
@@ -2040,12 +2067,7 @@ def _callable_has_dangerous_bytecode(
     visited_ids: set[Any] | None = None,
 ) -> bool:
   """Checks a Python function's bytecode, globals, closures, and helpers."""
-  if isinstance(func, (staticmethod, classmethod)):
-    func = func.__func__
-  try:
-    unwrapped = inspect.unwrap(func)
-  except (TypeError, ValueError):
-    unwrapped = func
+  unwrapped = _unwrap_callable(func)
 
   code_object = getattr(unwrapped, "__code__", None)
   if not isinstance(unwrapped, types.FunctionType) or not isinstance(
@@ -2067,12 +2089,7 @@ def _callable_has_dangerous_bytecode(
 
   while worklist:
     target, fallback_mod, target_ancs = worklist.popleft()
-    if isinstance(target, (staticmethod, classmethod)):
-      target = target.__func__
-    try:
-      target_unwrapped = inspect.unwrap(target)
-    except (TypeError, ValueError):
-      target_unwrapped = target
+    target_unwrapped = _unwrap_callable(target)
 
     if isinstance(target_unwrapped, types.ModuleType):
       if _is_dangerous_referenced_module(
@@ -2426,6 +2443,9 @@ def _ast_hook_status(
       and isinstance(node.value, ast.Name)
       and node.value.id == first_arg
   }
+  call_func_ids = {
+      id(node.func) for node in walk_nodes if isinstance(node, ast.Call)
+  }
   load_attrs = {
       node.attr
       for node in walk_nodes
@@ -2507,6 +2527,12 @@ def _ast_hook_status(
       ):
         helpers.append(("cls", child.attr))
       elif is_self and not isinstance(child.ctx, ast.Store):
+        if (
+            not is_restricted
+            and id(child) not in call_func_ids
+            and not is_dunder_or_introspection_attr(child.attr)
+        ):
+          continue
         allowed_self = (
             constants.UNPICKLE_LIFECYCLE_HOOKS
             | assigned_self_attrs
@@ -2748,9 +2774,10 @@ def _inspect_ast_class_node(
 
   hooks_to_check = constants.UNPICKLE_LIFECYCLE_HOOKS | extra_hooks
   unknown_only = (
-      {"__init__"} | (set() if is_restricted else {"__new__"})
+      {"__init__"}
+      | (set() if is_restricted else constants.NON_RESTRICTED_UNKNOWN_HOOKS)
   ) - extra_hooks
-  ordered_hooks = sorted(hooks_to_check, key=lambda h: h in unknown_only)
+  ordered_hooks = sorted(hooks_to_check, key=unknown_only.__contains__)
   for hook_name in ordered_hooks:
     fail_cls = (
         Classification.UNKNOWN
@@ -2857,7 +2884,7 @@ def _inspect_class_via_ast(
     is_restricted = root_pkg in constants.RESTRICTED_APPROVED_ROOTS
     if is_restricted or not _is_reconstructor_name(symbol_name):
       return Classification.UNKNOWN
-    return _ast_hook_status(
+    fn_verdict = _ast_hook_status(
         top_funcs[symbol_name],
         file_ctx,
         import_map,
@@ -2865,6 +2892,9 @@ def _inspect_class_via_ast(
         top_classes,
         depth=depth,
     )
+    if fn_verdict == Classification.SUSPICIOUS:
+      return Classification.UNKNOWN
+    return fn_verdict
 
   if symbol_name not in top_classes:
     if symbol_name not in import_map:
@@ -2913,10 +2943,6 @@ def _resolve_dotted_path_in_sys_modules(dotted_path: str) -> Any | None:
 def _is_installed_root_package(root_package: str) -> bool:
   """Checks whether a root package is loaded in `sys.modules` or installed.
 
-  Verifies that `root_package` is a valid Python identifier and checks
-  whether it is already present in `sys.modules` or discoverable via
-  `importlib.util.find_spec`.
-
   Args:
     root_package: Top-level package name to check.
 
@@ -2940,11 +2966,6 @@ def _classify_loaded_class_mro(
     extra_hooks: frozenset[str] = frozenset(),
 ) -> Classification:
   """Classifies a live class object by inspecting its module, MRO, and methods.
-
-  Walks `target_class.__mro__` to verify that no ancestor originates from an
-  unsafe package or defines dangerous pickle lifecycle hooks, and checks
-  whether `target_class` inherits from an approved base class or has safe
-  unpickling lifecycle hooks.
 
   Args:
     target_class: The live `type` object resolved from `sys.modules`.
@@ -3008,7 +3029,12 @@ def _classify_loaded_class_mro(
 
     anc_hooks = constants.UNPICKLE_LIFECYCLE_HOOKS | extra_hooks
     unknown_only = (
-        {"__init__"} | (set() if is_restricted_root else {"__new__"})
+        {"__init__"}
+        | (
+            set()
+            if is_restricted_root
+            else constants.NON_RESTRICTED_UNKNOWN_HOOKS
+        )
     ) - extra_hooks
     for ancestor in non_approved_ancestors:
       if disallowed_hooks.intersection(ancestor.__dict__):
@@ -3027,12 +3053,7 @@ def _classify_loaded_class_mro(
             if hook_name in unknown_only
             else Classification.SUSPICIOUS
         )
-        raw_hook = ancestor.__dict__[hook_name]
-        unwrapped_hook = inspect.unwrap(
-            raw_hook.__func__
-            if isinstance(raw_hook, (staticmethod, classmethod))
-            else raw_hook
-        )
+        unwrapped_hook = _unwrap_callable(ancestor.__dict__[hook_name])
         if (
             is_restricted_root
             and hook_name == "__setstate__"
@@ -3256,9 +3277,14 @@ def classify_symbol(symbol: str) -> Classification:
     ):
       symbol_clean = joined
 
-  parts = (
+  raw_parts = (
       symbol_clean.split(".")
       if ("." in symbol_clean and " " not in symbol_clean)
+      else []
+  )
+  parts = (
+      raw_parts
+      if all(identifier_part.isidentifier() for identifier_part in raw_parts)
       else []
   )
   if parts:
@@ -3294,14 +3320,21 @@ def classify_symbol(symbol: str) -> Classification:
   ):
     return Classification.UNSAFE
 
-  if any(symbol_clean.startswith(f"{u}.") for u in constants.UNSAFE_STRINGS):
+  if parts and any(
+      symbol_clean.startswith(f"{u}.") for u in constants.UNSAFE_STRINGS
+  ):
     return Classification.UNSAFE
 
-  if any(
-      symbol_clean.startswith(f"{s}.") for s in constants.SUSPICIOUS_STRINGS
-  ) or (parts and parts[-1] in constants.SUSPICIOUS_STRINGS):
+  if parts and (
+      any(
+          symbol_clean.startswith(f"{suspicious_symbol}.")
+          for suspicious_symbol in constants.SUSPICIOUS_STRINGS
+      )
+      or any(part in constants.SUSPICIOUS_STRINGS for part in parts)
+  ):
     return Classification.SUSPICIOUS
 
+  has_intermediate_dunder = False
   if parts:
     prefix_symbol = ".".join(parts[:-1])
     has_intermediate_dunder = any(
@@ -3318,16 +3351,102 @@ def classify_symbol(symbol: str) -> Classification:
       return Classification.SAFE
 
   if parts and parts[0] in constants.APPROVED_ROOT_PACKAGES:
-    if parts[-1] in constants.SAFE_DUNDER_RECONSTRUCTORS or (
-        parts[0] == "dataclasses" and parts[-1] == "dataclass"
-    ):
+    if has_intermediate_dunder:
+      return Classification.SUSPICIOUS
+
+    is_safe_dunder_reconstructor = (
+        parts[-1] in constants.SAFE_DUNDER_RECONSTRUCTORS
+    )
+    is_dataclasses_decorator = (
+        len(parts) == 2
+        and parts[0] == "dataclasses"
+        and parts[1] == "dataclass"
+    )
+    if is_safe_dunder_reconstructor or is_dataclasses_decorator:
       return Classification.SAFE
+
     return classify_approved_root_symbol(symbol_clean) or Classification.UNKNOWN
 
-  if any(symbol_clean.startswith(f"{s}.") for s in constants.SAFE_STRINGS):
+  if parts and any(
+      symbol_clean.startswith(f"{s}.") for s in constants.SAFE_STRINGS
+  ):
     return Classification.SAFE
 
   return Classification.UNKNOWN
+
+
+def resolve_extension_code(code: int) -> str:
+  """Resolves a `copyreg` extension code to its registered `'module.name'`."""
+  inverted_registry = getattr(copyreg, "_inverted_registry", {})
+  key = inverted_registry.get(code)
+  if isinstance(key, tuple) and len(key) == 2:
+    return f"{key[0]}.{key[1]}"
+  return f"unregistered_extension.code_{code}"
+
+
+def is_potentially_dangerous_literal(operand: str) -> bool:
+  """Checks whether a string operand matches dangerous literal or dunder rules.
+
+  Args:
+    operand: Decoded string literal from a pickle string or persistent ID
+      opcode.
+
+  Returns:
+    True if `operand` matches a deny-listed or dangerous literal pattern, or
+    False otherwise.
+  """
+  if not operand:
+    return False
+  deny_list = config.get_deny_list()
+  if deny_list and matches_symbol_prefix_list(operand, deny_list):
+    return True
+  operand_lower = operand.lower()
+  operand_normalized = _WHITESPACE_NORMALIZE_RE.sub(" ", operand_lower)
+  if any(
+      inline_pattern in operand_normalized
+      for inline_pattern in constants.UNSAFE_INLINE_PATTERNS
+  ):
+    return True
+  if operand in (
+      "CodeType",
+      "_builtin_type",
+      "_make_function",
+      "__builtin__.",
+  ) or (
+      operand.startswith("__")
+      and operand.endswith("__")
+      and operand in constants.SUSPICIOUS_STRINGS
+  ):
+    return True
+  if (
+      "." in operand
+      and " " not in operand
+      and all(
+          identifier_part.isidentifier()
+          for identifier_part in operand.split(".")
+      )
+  ):
+    operand_parts = operand.split(".")
+    if any(
+        identifier_part.startswith("__")
+        and identifier_part.endswith("__")
+        and (
+            identifier_part in constants.SUSPICIOUS_STRINGS
+            or identifier_part in constants.UNSAFE_STRINGS
+        )
+        for identifier_part in operand_parts
+    ):
+      return True
+    if (
+        len(operand_parts) >= 2
+        and any(
+            identifier_part in constants.DANGEROUS_EXEC_MODULES
+            for identifier_part in operand_parts[:-1]
+        )
+        and operand_parts[-1] in constants.DANGEROUS_CODE_NAMES
+    ):
+      return True
+  return False
 
 
 def _strip_binary_bytes_repr(text: str) -> str:
@@ -3401,11 +3520,22 @@ def _parse_and_process_pattern(
   combined_args = (args or state) + " " + kwargs
   if combined_args.strip():
     combined_args = _strip_binary_bytes_repr(combined_args)
+    if "<" in combined_args:
+      for class_reference in _CLASS_REF_LOG_RE.findall(combined_args):
+        register_item(class_reference, allow_unknown=False)
+      for object_reference in _OBJECT_REF_LOG_RE.findall(combined_args):
+        register_item(object_reference, allow_unknown=False)
+
+    is_risky_target = bool(class_name) and classify_symbol(class_name) in (
+        Classification.UNSAFE,
+        Classification.SUSPICIOUS,
+    )
     for group in _COMBINED_ARGS_TOKEN_RE.findall(combined_args):
       for token in group:
         token = token.strip(".")
         if token and not _HEX_TOKEN_PREFIX_RE.match(token):
-          register_item(token)
+          if is_risky_target or is_potentially_dangerous_literal(token):
+            register_item(token, allow_unknown=False)
 
   return True
 
@@ -3445,14 +3575,18 @@ def categorize_picklemagic(
       Classification.UNKNOWN: set(),
   }
 
-  def register_item(item: str, override: Classification | None = None):
+  def register_item(
+      item: str,
+      override: Classification | None = None,
+      allow_unknown: bool = True,
+  ):
     base_cls = classify_symbol(item) if item else None
     cls = (
         override
         if (override is not None and base_cls == Classification.UNKNOWN)
         else base_cls
     )
-    if cls is not None:
+    if cls is not None and (allow_unknown or cls != Classification.UNKNOWN):
       results[cls].add(item)
 
   lines = filtered_output.getvalue().split("\n")
@@ -3480,7 +3614,7 @@ def categorize_picklemagic(
           "Unknown module/class imported:"
       ).strip()
       if _is_valid_dotted_log_symbol(full_name):
-        results[Classification.UNKNOWN].add(full_name)
+        register_item(full_name)
         continue
 
     matched = False
@@ -3535,9 +3669,9 @@ _OPCODES_STRIDE_1: frozenset[int] = frozenset({
     0x97,
     0x98,
 })
-_OPCODES_STRIDE_2: frozenset[int] = frozenset({0x80, 0x4B, 0x68, 0x71})
-_OPCODES_STRIDE_3: frozenset[int] = frozenset({0x4D})
-_OPCODES_STRIDE_5: frozenset[int] = frozenset({0x4A, 0x6A, 0x72})
+_OPCODES_STRIDE_2: frozenset[int] = frozenset({0x80, 0x4B, 0x68, 0x71, 0x82})
+_OPCODES_STRIDE_3: frozenset[int] = frozenset({0x4D, 0x83})
+_OPCODES_STRIDE_5: frozenset[int] = frozenset({0x4A, 0x6A, 0x72, 0x84})
 _OPCODES_STRIDE_9: frozenset[int] = frozenset({0x47, 0x95})
 
 
@@ -3573,28 +3707,60 @@ def decode_string_operand(
     start: int,
     length: int,
     encoding: str = "utf-8",
+    *,
+    min_length: int = 2,
 ) -> str | None:
   """Decodes a byte slice into a string operand safely.
 
   Decodes string operands extracted from pickle byte streams while ignoring
-  decode errors and filtering out single-character strings.
+  decode errors and filtering out short strings.
 
   Args:
     data: The raw pickle byte buffer or memory-mapped file.
     start: The starting byte offset of the string payload.
     length: The byte length of the string payload.
     encoding: The character encoding to apply (defaults to utf-8).
+    min_length: Minimum decoded character length to retain (defaults to 2).
 
   Returns:
-    The decoded string operand if length exceeds 1 character, otherwise None.
+    The decoded string operand if length >= min_length, otherwise None.
   """
   try:
     decoded_string = data[start : start + length].decode(
         encoding, errors="ignore"
     )
-    return decoded_string if len(decoded_string) > 1 else None
+    return decoded_string if len(decoded_string) >= min_length else None
   except (UnicodeDecodeError, ValueError):
     return None
+
+
+def _decode_protocol0_string(raw_bytes: bytes) -> str | None:
+  """Decodes a Protocol 0 `STRING` (`0x53`) operand with escape sequences.
+
+  Args:
+    raw_bytes: Raw newline-stripped operand bytes following a `STRING` opcode.
+
+  Returns:
+    The decoded string if non-empty, or None otherwise.
+  """
+  if raw_bytes.endswith(b"\r"):
+    raw_bytes = raw_bytes[:-1]
+  if (
+      len(raw_bytes) >= 2
+      and raw_bytes[0] == raw_bytes[-1]
+      and raw_bytes[0] in (0x27, 0x22)
+  ):
+    raw_bytes = raw_bytes[1:-1]
+  if b"\\" in raw_bytes:
+    try:
+      raw_bytes = codecs.escape_decode(raw_bytes)[0]  # pyrefly: ignore[bad-assignment]
+    except (ValueError, UnicodeDecodeError):
+      pass
+  try:
+    decoded_string = raw_bytes.decode("utf-8")
+  except UnicodeDecodeError:
+    decoded_string = raw_bytes.decode("latin1", errors="ignore")
+  return decoded_string or None
 
 
 def _read_length_span(
@@ -3672,6 +3838,191 @@ def _read_newline(
 MAX_ABSTRACT_STACK_SIZE = 65536
 
 
+def is_benign_storage_arg(argument_value: str) -> bool:
+  """Checks whether a string token in a PyTorch `storage` tuple is benign.
+
+  Args:
+    argument_value: String element from a PyTorch `('storage', ...)` persistent
+      ID tuple.
+
+  Returns:
+    True if `argument_value` is a safe PyTorch storage parameter, or False
+    otherwise.
+  """
+  if is_potentially_dangerous_literal(argument_value):
+    return False
+  if (
+      argument_value.isdigit()
+      or argument_value in (
+          "cpu",
+          "cuda",
+          "mps",
+          "meta",
+          "xpu",
+          "hpu",
+          "xla",
+          "disk",
+      )
+      or argument_value.startswith(("cuda:", "xpu:", "hpu:", "mps:", "xla:"))
+  ):
+    return True
+  return classify_symbol(argument_value) == Classification.SAFE
+
+
+def _collapse_tuple_items(
+    tuple_items: Sequence[Optional[str]],
+) -> Optional[str]:
+  """Collapses popped tuple elements into a summary token for `BINPERSID`.
+
+  Inspects tuples beginning with `'storage'` (PyTorch persistent storage IDs)
+  and returns the first non-benign element if one exists, or
+  `'__pytorch_storage__'` if all elements are benign.
+
+  Args:
+    tuple_items: Sequence of abstract stack tokens popped for a tuple opcode.
+
+  Returns:
+    The first suspicious/unsafe element string from a `'storage'` tuple,
+    `'__pytorch_storage__'` if all elements are benign, or None for
+    non-storage tuples.
+  """
+  if not tuple_items or tuple_items[0] != "storage":
+    return None
+  for tuple_element in tuple_items[1:]:
+    if tuple_element is not None and not is_benign_storage_arg(tuple_element):
+      return tuple_element
+  return "__pytorch_storage__"
+
+
+def _advance_past_stop_opcode(
+    data: bytes | mmap.mmap,
+    pos: int,
+    end: int,
+) -> Optional[int]:
+  """Advances past a STOP opcode and checks for a concatenated pickle stream.
+
+  Skips NUL bytes and ASCII whitespace following a `STOP` (`0x2E`) opcode and
+  verifies whether the remaining bytes begin another valid pickle stream.
+
+  Args:
+    data: The full pickle buffer or memory-mapped file.
+    pos: Current byte offset immediately following the `0x2E` byte.
+    end: Exclusive end byte offset of the slice being scanned.
+
+  Returns:
+    The next byte offset to resume scanning if a valid concatenated pickle
+    stream follows, or None if scanning should stop.
+  """
+  while pos < end and data[pos] in (0x00, 0x0A, 0x0D, 0x20):
+    pos += 1
+  if pos < end and is_pickle_file(bytes(data[pos : min(end, pos + 1024)])):
+    return pos
+  return None
+
+
+def _resolve_ext_opcode(
+    data: bytes | mmap.mmap,
+    current_offset: int,
+    opcode_byte: int,
+) -> str:
+  """Resolves the registered symbol for an EXT1, EXT2, or EXT4 opcode.
+
+  Reads the 1-, 2-, or 4-byte extension code operand following `opcode_byte`
+  at `current_offset` and resolves its registered `'module.name'` via
+  `resolve_extension_code`.
+
+  Args:
+    data: The pickle byte buffer or memory-mapped file.
+    current_offset: Byte offset of the `0x82`, `0x83`, or `0x84` opcode byte.
+    opcode_byte: The opcode byte (`0x82`, `0x83`, or `0x84`).
+
+  Returns:
+    The resolved `'module.name'` string, or
+    `'unregistered_extension.code_<code>'` if unregistered.
+  """
+  stride = OPCODE_STRIDES[opcode_byte]
+  ext_code = int.from_bytes(
+      data[current_offset + 1 : current_offset + stride],
+      "little",
+      signed=(opcode_byte == 0x84),
+  )
+  return resolve_extension_code(ext_code)
+
+
+def _decode_protocol0_text_opcode(
+    data: bytes | mmap.mmap,
+    current_offset: int,
+    newline_offset: int,
+    opcode_byte: int,
+) -> Optional[str]:
+  r"""Decodes a Protocol 0 STRING (`0x53`) or UNICODE (`0x56`) opcode operand.
+
+  Skips binary Protocol 0 byte strings containing escaped NUL bytes and
+  decodes up to 4096 bytes of the newline-delimited operand.
+
+  Args:
+    data: The pickle byte buffer or memory-mapped file.
+    current_offset: Byte offset of the `0x53` or `0x56` opcode byte.
+    newline_offset: Byte offset of the terminating newline (`\n`).
+    opcode_byte: Either `0x53` (`STRING`) or `0x56` (`UNICODE`).
+
+  Returns:
+    The decoded string operand if non-empty and non-binary, or None otherwise.
+  """
+  span_length = newline_offset - current_offset - 1
+  is_binary_protocol0_string = (
+      opcode_byte == 0x53
+      and span_length > 256
+      and b"\\x00" in data[
+          current_offset + 1 : min(newline_offset, current_offset + 65)
+      ]
+  )
+  if is_binary_protocol0_string:
+    return None
+
+  decode_length = min(span_length, 4096)
+  raw_slice = bytes(
+      data[current_offset + 1 : current_offset + 1 + decode_length]
+  )
+  if opcode_byte == 0x56:
+    cleaned_slice = raw_slice.rstrip(b"\r")
+    return decode_string_operand(
+        cleaned_slice,
+        0,
+        len(cleaned_slice),
+        "raw-unicode-escape",
+        min_length=1,
+    )
+  return _decode_protocol0_string(raw_slice)
+
+
+def _parse_protocol0_memo_index(
+    data: bytes | mmap.mmap,
+    current_offset: int,
+    newline_offset: int,
+) -> Optional[int]:
+  r"""Parses a newline-terminated integer memo key for PUT or GET opcodes.
+
+  Extracts the line between `current_offset + 1` and `newline_offset`, strips
+  embedded NUL bytes and trailing carriage returns, and parses the integer
+  memo index using base-0 integer literal rules.
+
+  Args:
+    data: The pickle byte buffer or memory-mapped file.
+    current_offset: Byte offset of the `0x70` or `0x67` opcode byte.
+    newline_offset: Byte offset of the terminating newline (`\n`).
+
+  Returns:
+    The parsed integer memo key, or None if the line is not a valid integer.
+  """
+  try:
+    return int(
+        _clean_protocol0_line(data[current_offset + 1 : newline_offset]), 0
+    )
+  except ValueError:
+    return None
+
+
 def _apply_fixed_opcode_stack_effect(
     opcode_byte: int,
     data: bytes | mmap.mmap,
@@ -3697,7 +4048,13 @@ def _apply_fixed_opcode_stack_effect(
     case 0x28:  # MARK
       mark_stack.append(len(value_stack))
 
-    case 0x30 | 0x61 | 0x62:  # POP, APPEND, BUILD
+    case 0x30:  # POP
+      if mark_stack and len(value_stack) <= mark_stack[-1]:
+        mark_stack.pop()
+      elif value_stack:
+        value_stack.pop()
+
+    case 0x61 | 0x62:  # APPEND, BUILD
       if value_stack:
         value_stack.pop()
 
@@ -3713,8 +4070,19 @@ def _apply_fixed_opcode_stack_effect(
       else:
         value_stack.clear()
 
-    case 0x64 | 0x69 | 0x6C | 0x6F | 0x74 | 0x91:
-      # DICT, INST, LIST, OBJ, TUPLE, FROZENSET
+    case 0x74:  # TUPLE
+      if mark_stack:
+        mark_position = mark_stack.pop()
+        popped_items = value_stack[mark_position:]
+        del value_stack[mark_position:]
+      else:
+        popped_items = list(value_stack)
+        value_stack.clear()
+      if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+        value_stack.append(_collapse_tuple_items(popped_items))
+
+    case 0x64 | 0x69 | 0x6C | 0x6F | 0x91:
+      # DICT, INST, LIST, OBJ, FROZENSET
       if mark_stack:
         mark_position = mark_stack.pop()
         del value_stack[mark_position:]
@@ -3724,7 +4092,11 @@ def _apply_fixed_opcode_stack_effect(
         value_stack.append(None)
 
     case 0x32:  # DUP
-      if value_stack and len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+      frame_floor = mark_stack[-1] if mark_stack else 0
+      if (
+          len(value_stack) > frame_floor
+          and len(value_stack) < MAX_ABSTRACT_STACK_SIZE
+      ):
         value_stack.append(value_stack[-1])
 
     case 0x94:  # MEMOIZE
@@ -3752,20 +4124,36 @@ def _apply_fixed_opcode_stack_effect(
       if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
         value_stack.append(memo_table.get(memo_key))
 
-    case 0x85 | 0x98:  # TUPLE1, READONLY_BUFFER
+    case 0x82 | 0x83 | 0x84:  # EXT1, EXT2, EXT4
+      if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+        value_stack.append(
+            _resolve_ext_opcode(data, current_offset, opcode_byte)
+        )
+
+    case 0x85 | 0x86 | 0x87:  # TUPLE1, TUPLE2, TUPLE3
+      tuple_arity = opcode_byte - 0x84
+      popped_items: list[Optional[str]] = []
+      for _ in range(tuple_arity):
+        if value_stack:
+          popped_items.append(value_stack.pop())
+      popped_items.reverse()
+      if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+        value_stack.append(_collapse_tuple_items(popped_items))
+
+    case 0x51 | 0x98:  # BINPERSID, READONLY_BUFFER
       if value_stack:
         value_stack.pop()
       if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
         value_stack.append(None)
 
-    case 0x52 | 0x81 | 0x86:  # REDUCE, NEWOBJ, TUPLE2
+    case 0x52 | 0x81:  # REDUCE, NEWOBJ
       for _ in range(2):
         if value_stack:
           value_stack.pop()
       if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
         value_stack.append(None)
 
-    case 0x87 | 0x92:  # TUPLE3, NEWOBJ_EX
+    case 0x92:  # NEWOBJ_EX
       for _ in range(3):
         if value_stack:
           value_stack.pop()
@@ -3784,9 +4172,6 @@ def _apply_fixed_opcode_stack_effect(
         | 0x4D  # BININT2
         | 0x4A  # BININT
         | 0x47  # BINFLOAT
-        | 0x82  # EXT1
-        | 0x83  # EXT2
-        | 0x84  # EXT4
         | 0x8A  # LONG1
         | 0x8B  # LONG4
         | 0x43  # SHORT_BINBYTES
@@ -3809,11 +4194,7 @@ def partition_pickle_chunks(
     *,
     include_memo: bool = False,
 ) -> list[Any]:
-  """Partitions pickle bytes into opcode-aligned chunk slices with seed stacks.
-
-  Scans opcode boundaries so large pickle buffers can be partitioned across
-  multiple threads without splitting multi-byte opcodes or losing string operand
-  context between boundaries.
+  """Partitions pickle bytes into opcode-aligned chunk slices with seed state.
 
   Args:
     data: The raw pickle byte buffer or memory-mapped file.
@@ -3842,7 +4223,16 @@ def partition_pickle_chunks(
       if current_offset + stride > effective_length:
         break
       if opcode_byte == 0x2E:
-        break
+        value_stack.clear()
+        mark_stack.clear()
+        memo_table.clear()
+        next_pos = _advance_past_stop_opcode(
+            data, current_offset + 1, effective_length
+        )
+        if next_pos is None:
+          break
+        current_offset = next_pos
+        continue
       _apply_fixed_opcode_stack_effect(
           opcode_byte,
           data,
@@ -3854,24 +4244,34 @@ def partition_pickle_chunks(
       current_offset += stride
     else:
       match opcode_byte:
-        # 1-byte prefix (SHORT_BINUNICODE) or 4-byte prefix (BINUNICODE)
-        case 0x8C | 0x58:
-          header_size = 2 if opcode_byte == 0x8C else 5
+        # 1-byte, 4-byte, or 8-byte length-prefixed string opcodes
+        case 0x8C | 0x55 | 0x58 | 0x54 | 0x8D:
+          header_size = (
+              2
+              if opcode_byte in (0x8C, 0x55)
+              else (5 if opcode_byte in (0x58, 0x54) else 9)
+          )
           try:
             operand_length, next_offset = _read_length_span(
                 data, current_offset, effective_length, header_size
             )
           except exceptions.UnsafePickleDetectedError:
             break
+          encoding = "latin1" if opcode_byte in (0x55, 0x54) else "utf-8"
+          decode_length = min(operand_length, 4096)
           decoded_value = decode_string_operand(
-              data, current_offset + header_size, operand_length, "utf-8"
+              data,
+              current_offset + header_size,
+              decode_length,
+              encoding,
+              min_length=1,
           )
           if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
             value_stack.append(decoded_value)
           current_offset = next_offset
 
-        # 1-, 4-, or 8-byte length prefix binary/large payloads to skip safely
-        case 0x43 | 0x8A | 0x42 | 0x8B | 0x8D | 0x8E | 0x96:
+        # 1-, 4-, or 8-byte length prefix non-string bytes to skip safely
+        case 0x43 | 0x8A | 0x42 | 0x8B | 0x8E | 0x96:
           header_size = (
               2
               if opcode_byte in (0x43, 0x8A)
@@ -3886,8 +4286,43 @@ def partition_pickle_chunks(
           if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
             value_stack.append(None)
 
-        # Newline-terminated opcodes (INT, FLOAT, LONG, STRING, etc.)
-        case 0x49 | 0x46 | 0x4C | 0x70 | 0x67 | 0x50 | 0x56 | 0x53:
+        # Newline-terminated string opcodes (UNICODE, STRING)
+        case 0x56 | 0x53:
+          if (newline_offset := data.find(b"\n", current_offset + 1)) == -1:
+            break
+          decoded_value = _decode_protocol0_text_opcode(
+              data, current_offset, newline_offset, opcode_byte
+          )
+          if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+            value_stack.append(decoded_value)
+          current_offset = newline_offset + 1
+
+        # Protocol 0 PUT
+        case 0x70:
+          if (newline_offset := data.find(b"\n", current_offset + 1)) == -1:
+            break
+          memo_key = _parse_protocol0_memo_index(
+              data, current_offset, newline_offset
+          )
+          if memo_key is not None:
+            memo_table[memo_key] = value_stack[-1] if value_stack else None
+          current_offset = newline_offset + 1
+
+        # Protocol 0 GET
+        case 0x67:
+          if (newline_offset := data.find(b"\n", current_offset + 1)) == -1:
+            break
+          memo_key = _parse_protocol0_memo_index(
+              data, current_offset, newline_offset
+          )
+          if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+            value_stack.append(
+                memo_table.get(memo_key) if memo_key is not None else None
+            )
+          current_offset = newline_offset + 1
+
+        # Other newline-terminated opcodes (INT, FLOAT, LONG, PERSID)
+        case 0x49 | 0x46 | 0x4C | 0x50:
           if (newline_offset := data.find(b"\n", current_offset + 1)) == -1:
             break
           if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
@@ -3909,6 +4344,15 @@ def partition_pickle_chunks(
           if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
             value_stack.append(None)
           current_offset = second_newline + 1
+
+        # STACK_GLOBAL
+        case 0x93:
+          for _ in range(2):
+            if value_stack:
+              value_stack.pop()
+          if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+            value_stack.append(None)
+          current_offset += 1
 
         # Unrecognized or single-byte variable opcode fallback
         case _:
@@ -3960,10 +4404,6 @@ def custom_genops_from_bytes(
 ) -> Iterator[tuple[Optional[pickletools.OpcodeInfo], Any | None]]:
   """Generates string-declaring opcodes and arguments from raw pickle bytes.
 
-  Traverses pickle opcodes starting from byte offset `start` up to `end`,
-  yielding discovered string operands and module references while tracking stack
-  state and skipping binary payloads in constant time.
-
   Args:
     data: The raw pickle byte buffer or memory-mapped file.
     start: Byte offset to start parsing from.
@@ -3996,7 +4436,24 @@ def custom_genops_from_bytes(
             f" {current_offset}"
         )
       if opcode_byte == 0x2E:
-        break
+        value_stack.clear()
+        mark_stack.clear()
+        memo_table.clear()
+        next_pos = _advance_past_stop_opcode(
+            data, current_offset + 1, limit_offset
+        )
+        if next_pos is None:
+          break
+        current_offset = next_pos
+        continue
+      # EXT1, EXT2, EXT4 have fixed strides (2, 3, 5) in OPCODE_STRIDES
+      if opcode_byte in (0x82, 0x83, 0x84):
+        resolved_ext = _resolve_ext_opcode(data, current_offset, opcode_byte)
+        if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+          value_stack.append(resolved_ext)
+        yield constants.OPCODES_INFO_INT.get(opcode_byte), resolved_ext
+        current_offset += stride
+        continue
       _apply_fixed_opcode_stack_effect(
           opcode_byte,
           data,
@@ -4009,29 +4466,48 @@ def custom_genops_from_bytes(
       continue
 
     match opcode_byte:
-      # 1-byte, 4-byte, or 8-byte length-prefixed Unicode text strings
-      case 0x8C | 0x58 | 0x8D:
+      # 1-byte, 4-byte, or 8-byte length-prefixed Unicode/ASCII text strings
+      case 0x8C | 0x55 | 0x58 | 0x54 | 0x8D:
         header_size = (
-            2 if opcode_byte == 0x8C else (5 if opcode_byte == 0x58 else 9)
+            2
+            if opcode_byte in (0x8C, 0x55)
+            else (5 if opcode_byte in (0x58, 0x54) else 9)
         )
         payload_length, current_offset = _read_length_span(
             data, current_offset, limit_offset, header_size
         )
+        encoding = "latin1" if opcode_byte in (0x55, 0x54) else "utf-8"
+        decode_length = min(payload_length, 4096)
         string_value = decode_string_operand(
-            data, current_offset - payload_length, payload_length, "utf-8"
+            data,
+            current_offset - payload_length,
+            decode_length,
+            encoding,
+            min_length=1,
         )
         if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
           value_stack.append(string_value)
-        if string_value is not None:
+        if string_value is not None and len(string_value) >= 2:
           yield constants.OPCODES_INFO_INT.get(opcode_byte), string_value
 
-      # Non-string binary byte buffers and bytearrays to skip safely
-      case 0x43 | 0x8A | 0x42 | 0x8B | 0x8E | 0x96:
-        header_size = (
-            2
-            if opcode_byte in (0x43, 0x8A)
-            else (5 if opcode_byte in (0x42, 0x8B) else 9)
-        )
+      # Fast inline skip for 1-byte binary payloads (SHORT_BINBYTES, LONG1)
+      case 0x43 | 0x8A:
+        payload_start = current_offset + 2
+        if (
+            payload_start > limit_offset
+            or payload_start + data[current_offset + 1] > limit_offset
+        ):
+          raise exceptions.UnsafePickleDetectedError(
+              "Parser error during security scan: truncated argument at offset"
+              f" {current_offset}"
+          )
+        current_offset = payload_start + data[current_offset + 1]
+        if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+          value_stack.append(None)
+
+      # Non-string 4-byte/8-byte binary byte buffers and bytearrays to skip
+      case 0x42 | 0x8B | 0x8E | 0x96:
+        header_size = 5 if opcode_byte in (0x42, 0x8B) else 9
         _, current_offset = _read_length_span(
             data, current_offset, limit_offset, header_size
         )
@@ -4041,29 +4517,25 @@ def custom_genops_from_bytes(
       # Newline-terminated string literals (Protocol 0 UNICODE / STRING)
       case 0x56 | 0x53:
         newline_offset = _read_newline(data, current_offset + 1, current_offset)
-        encoding = "raw-unicode-escape" if opcode_byte == 0x56 else "latin1"
-        string_value = decode_string_operand(
-            data,
-            current_offset + 1,
-            newline_offset - current_offset - 1,
-            encoding,
+        string_value = _decode_protocol0_text_opcode(
+            data, current_offset, newline_offset, opcode_byte
         )
         if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
           value_stack.append(string_value)
-        if string_value is not None:
+        if string_value is not None and len(string_value) >= 2:
           yield constants.OPCODES_INFO_INT.get(opcode_byte), string_value
         current_offset = newline_offset + 1
 
-      # Two newline-terminated strings for module and attribute names
+      # Two newline-terminated strings for module and attribute (GLOBAL, INST)
       case 0x63 | 0x69:
         module_newline = _read_newline(data, current_offset + 1, current_offset)
         name_newline = _read_newline(data, module_newline + 1, current_offset)
-        module_name = data[current_offset + 1 : module_newline].decode(
-            "utf-8", errors="ignore"
-        )
-        attribute_name = data[module_newline + 1 : name_newline].decode(
-            "utf-8", errors="ignore"
-        )
+        module_name = _clean_protocol0_line(
+            data[current_offset + 1 : module_newline]
+        ).decode("utf-8", errors="ignore")
+        attribute_name = _clean_protocol0_line(
+            data[module_newline + 1 : name_newline]
+        ).decode("utf-8", errors="ignore")
         if opcode_byte == 0x69:
           if mark_stack:
             mark_position = mark_stack.pop()
@@ -4071,8 +4543,6 @@ def custom_genops_from_bytes(
           else:
             value_stack.clear()
         opcode_info = constants.OPCODES_INFO_INT.get(opcode_byte)
-        yield opcode_info, module_name
-        yield opcode_info, attribute_name
         qualified_name = f"{module_name}.{attribute_name}"
         if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
           value_stack.append(qualified_name if opcode_byte == 0x63 else None)
@@ -4098,31 +4568,62 @@ def custom_genops_from_bytes(
       # Protocol 0 PUT (newline-terminated decimal memo index)
       case 0x70:
         newline_offset = _read_newline(data, current_offset + 1, current_offset)
-        try:
-          memo_key = int(
-              bytes(data[current_offset + 1 : newline_offset]).rstrip(b"\r"), 0
-          )
+        memo_key = _parse_protocol0_memo_index(
+            data, current_offset, newline_offset
+        )
+        if memo_key is not None:
           memo_table[memo_key] = value_stack[-1] if value_stack else None
-        except ValueError:
-          pass
         current_offset = newline_offset + 1
 
       # Protocol 0 GET (newline-terminated decimal memo index)
       case 0x67:
         newline_offset = _read_newline(data, current_offset + 1, current_offset)
-        try:
-          memo_key = int(
-              bytes(data[current_offset + 1 : newline_offset]).rstrip(b"\r"), 0
+        memo_key = _parse_protocol0_memo_index(
+            data, current_offset, newline_offset
+        )
+        if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+          value_stack.append(
+              memo_table.get(memo_key) if memo_key is not None else None
           )
-          if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
-            value_stack.append(memo_table.get(memo_key))
-        except ValueError:
-          if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
-            value_stack.append(None)
         current_offset = newline_offset + 1
 
-      # Newline-terminated non-string numeric and persistent ID arguments
-      case 0x49 | 0x46 | 0x4C | 0x50:
+      # Protocol 0 PERSID (newline-terminated persistent ID string)
+      case 0x50:
+        newline_offset = _read_newline(data, current_offset + 1, current_offset)
+        pid_string = _clean_protocol0_line(
+            data[current_offset + 1 : newline_offset]
+        ).decode("utf-8", errors="ignore")
+        opcode_info = constants.OPCODES_INFO_INT.get(opcode_byte)
+        if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+          value_stack.append(None)
+        if pid_string:
+          if is_potentially_dangerous_literal(pid_string):
+            yield opcode_info, pid_string
+          else:
+            yield opcode_info, f"persistent_id.{pid_string}"
+        else:
+          yield opcode_info, "persistent_id.PERSID"
+        current_offset = newline_offset + 1
+
+      # BINPERSID (persistent ID popped from stack)
+      case 0x51:
+        opcode_info = constants.OPCODES_INFO_INT.get(opcode_byte)
+        pid_string = value_stack.pop() if value_stack else None
+        if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+          value_stack.append(None)
+        if pid_string == "__pytorch_storage__":
+          pass
+        elif pid_string:
+          if is_potentially_dangerous_literal(pid_string):
+            yield opcode_info, pid_string
+          else:
+            yield opcode_info, f"persistent_id.{pid_string}"
+        else:
+          yield opcode_info, "persistent_id.BINPERSID"
+        current_offset += 1
+
+      # Newline-terminated numeric arguments to skip (INT, FLOAT, LONG)
+      case 0x49 | 0x46 | 0x4C:
         current_offset = (
             _read_newline(data, current_offset + 1, current_offset) + 1
         )
