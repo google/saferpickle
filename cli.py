@@ -19,7 +19,7 @@ import os
 from typing import Any, Dict, List, Sequence
 from absl import app
 from absl import flags
-import saferpickle
+import saferpickle as safer_pickle
 from lib import utils
 
 
@@ -48,24 +48,14 @@ def security_scan_with_justifications(
       set(),
   )
 
-  if utils.is_zip_bytes(pickle_bytes):
-    unzipped_files = utils.extract_zip_contents(pickle_bytes)
-    for unzipped_file in unzipped_files:
-      _, file_stream = unzipped_file
-      file_bytes = file_stream.read()
-
-      if not utils.is_pickle_file(file_bytes) or not file_bytes:
-        continue
-
-      pickle_bytes = file_bytes
-      break
-
-  if not utils.is_pickle_file(pickle_bytes):
+  if not safer_pickle._is_archive(pickle_bytes) and not utils.is_pickle_file(  # pylint: disable=protected-access
+      pickle_bytes
+  ):
     return {"classification": classification, "justification": justification}
 
   # Call the individual scan functions from SaferPickle to sets of results.
   # Picklemagic Scan
-  picklemagic_results = saferpickle.picklemagic_scan(pickle_bytes)
+  picklemagic_results = safer_pickle.picklemagic_scan(pickle_bytes)
 
   safe_results.update(picklemagic_results.safe_results)
   unsafe_results.update(picklemagic_results.unsafe_results)
@@ -73,7 +63,7 @@ def security_scan_with_justifications(
   unknown_results.update(picklemagic_results.unknown_results)
 
   # Genops Scan
-  genops_results = saferpickle.genops_scan(
+  genops_results = safer_pickle.genops_scan(
       pickle_bytes, pickle_file_path=file_path, fail_fast=False
   )
   safe_results.update(genops_results.safe_results)
@@ -98,7 +88,7 @@ def security_scan_with_justifications(
       num_unsafe,
       num_suspicious,
       _,  # The unknown_score is not used for classification, only reporting
-  ) = saferpickle.score_results(
+  ) = safer_pickle.score_results(
       final_safe_results,
       final_unsafe_results,
       final_suspicious_results,
@@ -106,7 +96,7 @@ def security_scan_with_justifications(
   )
 
   # Check for safety and return the results with justifications.
-  if saferpickle.is_unsafe(num_safe, num_unsafe, num_suspicious):
+  if safer_pickle.is_unsafe(num_safe, num_unsafe, num_suspicious):
     if num_unsafe > 0:
       classification = "unsafe"
       all_results = []
@@ -126,17 +116,17 @@ def security_scan_with_justifications(
           "Found suspicious results:"
           f" {', '.join(map(str, final_suspicious_results))}"
       )
+  elif final_unknown_results:
+    classification = "unknown"
+    justification = (
+        f"Found unknown results: {', '.join(map(str, final_unknown_results))}"
+    )
   else:
-    justification_parts = []
-    if safe_results:
-      justification_parts.append(
-          f"Found safe results: {', '.join(map(str, final_safe_results))}"
-      )
-    if unknown_results:
-      justification_parts.append(
-          f"Found unknown results: {', '.join(map(str, final_unknown_results))}"
-      )
-    justification = " and ".join(justification_parts)
+    justification = (
+        f"Found safe results: {', '.join(map(str, final_safe_results))}"
+        if final_safe_results
+        else ""
+    )
     classification = "benign"
 
   return {"classification": classification, "justification": justification}
