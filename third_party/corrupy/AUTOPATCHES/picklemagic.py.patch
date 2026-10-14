@@ -1089,15 +1089,10 @@
 +      self.dispatch[pickle.STACK_GLOBAL[0]] = self.load_stack_global
 +
 +  def find_class(self, module, name):
-+    if isinstance(module, bytes):
-+      module = module.decode("utf-8", errors="replace")
-+    elif not isinstance(module, str):
-+      module = str(module)
-+
-+    if isinstance(name, bytes):
-+      name = name.decode("utf-8", errors="replace")
-+    elif not isinstance(name, str):
-+      name = str(name)
++    module, name = (
++        x.decode("utf-8", "replace") if isinstance(x, bytes) else str(x)
++        for x in (module, name)
++    )
 +
 +    # __main__ can be manipulated so it's
 +    # never safe to load real classes from it.
@@ -1281,16 +1276,18 @@
 +      slots_state = None
 +      if isinstance(state, tuple) and len(state) == 2:
 +        dict_state, slots_state = state
-+
 +      if isinstance(dict_state, dict):
 +        inst_dict = getattr(inst, "__dict__", None)
 +        if isinstance(inst_dict, dict):
 +          logger.info("Updating __dict__ of %s with state", type(inst))
 +          inst_dict.update(dict_state)
++        elif isinstance(inst, dict):
++          logger.info("Updating dict state of %s with state", type(inst))
++          inst.update(dict_state)
 +        elif inst_dict is not None:
-+          for k, v in dict_state.items():
++          for slot_key, slot_val in dict_state.items():
 +            try:
-+              setattr(inst, k, v)
++              setattr(inst, slot_key, slot_val)
 +            except Exception:
 +              pass
 +      elif dict_state is not None:
