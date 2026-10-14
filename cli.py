@@ -48,19 +48,9 @@ def security_scan_with_justifications(
       set(),
   )
 
-  if utils.is_zip_bytes(pickle_bytes):
-    unzipped_files = utils.extract_zip_contents(pickle_bytes)
-    for unzipped_file in unzipped_files:
-      _, file_stream = unzipped_file
-      file_bytes = file_stream.read()
-
-      if not utils.is_pickle_file(file_bytes) or not file_bytes:
-        continue
-
-      pickle_bytes = file_bytes
-      break
-
-  if not utils.is_pickle_file(pickle_bytes):
+  if not saferpickle._is_archive(pickle_bytes) and not utils.is_pickle_file(  # pylint: disable=protected-access
+      pickle_bytes
+  ):
     return {"classification": classification, "justification": justification}
 
   # Call the individual scan functions from SaferPickle to sets of results.
@@ -107,7 +97,7 @@ def security_scan_with_justifications(
 
   # Check for safety and return the results with justifications.
   if saferpickle.is_unsafe(num_safe, num_unsafe, num_suspicious):
-    if num_unsafe > num_suspicious:
+    if num_unsafe > 0:
       classification = "unsafe"
       all_results = []
       if unsafe_results:
