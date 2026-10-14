@@ -980,9 +980,13 @@ def security_scan(
       current_pos = pickle_bytes.tell()
       header = pickle_bytes.read(262)
       pickle_bytes.seek(current_pos)
-      if header.startswith(
-          (b"PK\x03\x04", b"BZh", b"\xfd7zXZ\x00", b"\x1f\x8b")
-      ) or (len(header) >= 262 and header[257:262] == b"ustar"):
+      if (
+          header.startswith(
+              (b"PK\x03\x04", b"BZh", b"\xfd7zXZ\x00", b"\x1f\x8b")
+          )
+          or (len(header) >= 262 and header[257:262] == b"ustar")
+          or utils.is_lzma_alone_bytes(header)
+      ):
         is_archive = True
 
     if is_archive:
@@ -996,6 +1000,8 @@ def security_scan(
         archive_type = "lzma"
       elif archive_bytes.startswith(b"\x1f\x8b"):
         archive_type = "gzip"
+      elif utils.is_lzma_alone_bytes(archive_bytes):
+        archive_type = "lzma"
       else:
         archive_type = "tar"
       return _extract_and_scan_archive(
@@ -1027,7 +1033,9 @@ def security_scan(
             fail_fast=fail_fast,
             check_magic_bytes=check_magic_bytes,
         )
-      elif pickle_bytes.startswith(b"\xfd7zXZ\x00"):
+      elif pickle_bytes.startswith(b"\xfd7zXZ\x00") or utils.is_lzma_alone_bytes(
+          pickle_bytes
+      ):
         return _extract_and_scan_archive(
             pickle_bytes,
             "lzma",
@@ -1252,9 +1260,13 @@ def _security_scan_internal(
     stream.seek(0)
     header_bytes = stream.read(1024)
     stream.seek(current_pos)
-    is_archive = header_bytes.startswith(
-        (b"PK\x03\x04", b"BZh", b"\xfd7zXZ\x00", b"\x1f\x8b")
-    ) or (len(header_bytes) >= 262 and header_bytes[257:262] == b"ustar")
+    is_archive = (
+        header_bytes.startswith(
+            (b"PK\x03\x04", b"BZh", b"\xfd7zXZ\x00", b"\x1f\x8b")
+        )
+        or (len(header_bytes) >= 262 and header_bytes[257:262] == b"ustar")
+        or utils.is_lzma_alone_bytes(header_bytes)
+    )
     if not is_archive:
       start_offset = utils.find_pickle_start_offset(stream)
     else:
@@ -1416,9 +1428,13 @@ def _scan_and_load(
       current_pos = pickle_file.tell()
       pickle_file.seek(0)
       header_bytes = pickle_file.read(1024)
-      is_archive = header_bytes.startswith(
-          (b"PK\x03\x04", b"BZh", b"\xfd7zXZ\x00", b"\x1f\x8b")
-      ) or (len(header_bytes) >= 262 and header_bytes[257:262] == b"ustar")
+      is_archive = (
+          header_bytes.startswith(
+              (b"PK\x03\x04", b"BZh", b"\xfd7zXZ\x00", b"\x1f\x8b")
+          )
+          or (len(header_bytes) >= 262 and header_bytes[257:262] == b"ustar")
+          or utils.is_lzma_alone_bytes(header_bytes)
+      )
       if not is_archive:
         start_offset = utils.find_pickle_start_offset(header_bytes)
       else:
@@ -1436,9 +1452,13 @@ def _scan_and_load(
     if not isinstance(pickle_file_or_bytes, bytes):
       raise TypeError("pickle_file_or_bytes must be bytes when is_load=False")
     data_bytes = pickle_file_or_bytes
-    is_archive = data_bytes.startswith(
-        (b"PK\x03\x04", b"BZh", b"\xfd7zXZ\x00", b"\x1f\x8b")
-    ) or (len(data_bytes) >= 262 and data_bytes[257:262] == b"ustar")
+    is_archive = (
+        data_bytes.startswith(
+            (b"PK\x03\x04", b"BZh", b"\xfd7zXZ\x00", b"\x1f\x8b")
+        )
+        or (len(data_bytes) >= 262 and data_bytes[257:262] == b"ustar")
+        or utils.is_lzma_alone_bytes(data_bytes)
+    )
     if not is_archive:
       start_offset = utils.find_pickle_start_offset(data_bytes)
     else:
