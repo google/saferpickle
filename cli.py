@@ -19,18 +19,16 @@ import os
 from typing import Any, Dict, List, Sequence
 from absl import app
 from absl import flags
-import saferpickle
-from lib import utils
+import saferpickle as safer_pickle
 
 
 def security_scan_with_justifications(
-    pickle_bytes: bytes, file_path: str | None = None
+    pickle_bytes: bytes,
 ) -> Dict[str, Any]:
   """Analyzes pickle byte content and returns a detailed analysis result.
 
   Args:
     pickle_bytes: The bytes of the pickle file to analyze.
-    file_path: The path to the pickle file, for streaming scan.
 
   Returns:
     A dictionary containing the analysis result. It includes:
@@ -39,107 +37,45 @@ def security_scan_with_justifications(
       - "justification": (Optional) A string providing a list of appropriate
       keywords for the classification.
   """
-  classification = "Not supported"
-  justification = "Not a pickle file"
-  safe_results, unsafe_results, suspicious_results, unknown_results = (
-      set(),
-      set(),
-      set(),
-      set(),
-  )
+  results = safer_pickle.security_scan_results(pickle_bytes)
+  if results is None:
+    return {
+        "classification": "Not supported",
+        "justification": "Not a pickle file",
+    }
 
-  if utils.is_zip_bytes(pickle_bytes):
-    unzipped_files = utils.extract_zip_contents(pickle_bytes)
-    for unzipped_file in unzipped_files:
-      _, file_stream = unzipped_file
-      file_bytes = file_stream.read()
-
-      if not utils.is_pickle_file(file_bytes) or not file_bytes:
-        continue
-
-      pickle_bytes = file_bytes
-      break
-
-  if not utils.is_pickle_file(pickle_bytes):
-    return {"classification": classification, "justification": justification}
-
-  # Call the individual scan functions from SaferPickle to sets of results.
-  # Picklemagic Scan
-  picklemagic_results = saferpickle.picklemagic_scan(pickle_bytes)
-
-  safe_results.update(picklemagic_results.safe_results)
-  unsafe_results.update(picklemagic_results.unsafe_results)
-  suspicious_results.update(picklemagic_results.suspicious_results)
-  unknown_results.update(picklemagic_results.unknown_results)
-
-  # Genops Scan
-  genops_results = saferpickle.genops_scan(
-      pickle_bytes, pickle_file_path=file_path, fail_fast=False
-  )
-  safe_results.update(genops_results.safe_results)
-  unsafe_results.update(genops_results.unsafe_results)
-  suspicious_results.update(genops_results.suspicious_results)
-  unknown_results.update(genops_results.unknown_results)
-
-  final_safe_results = utils.resolve_library_modules_from_results(safe_results)
-  final_unsafe_results = utils.resolve_library_modules_from_results(
-      unsafe_results
-  )
-  final_suspicious_results = utils.resolve_library_modules_from_results(
-      suspicious_results
-  )
-  final_unknown_results = utils.resolve_library_modules_from_results(
-      unknown_results
-  )
-
-  # Score the results
-  (
-      num_safe,
-      num_unsafe,
-      num_suspicious,
-      _,  # The unknown_score is not used for classification, only reporting
-  ) = saferpickle.score_results(
-      final_safe_results,
-      final_unsafe_results,
-      final_suspicious_results,
-      final_unknown_results,
-  )
-
-  # Check for safety and return the results with justifications.
-  if saferpickle.is_unsafe(num_safe, num_unsafe, num_suspicious):
-    if num_unsafe > 0:
-      classification = "unsafe"
-      all_results = []
-      if unsafe_results:
-        all_results.append(
-            f"malicious results: {', '.join(map(str, final_unsafe_results))}"
-        )
-      if suspicious_results:
-        all_results.append(
-            "suspicious results:"
-            f" {', '.join(map(str, final_suspicious_results))}"
-        )
-      justification = f"Found {' and '.join(all_results)}"
-    else:
-      classification = "suspicious"
-      justification = (
-          "Found suspicious results:"
-          f" {', '.join(map(str, final_suspicious_results))}"
+  if results.unsafe_results:
+    all_results = [f"malicious results: {', '.join(results.unsafe_results)}"]
+    if results.suspicious_results:
+      all_results.append(
+          f"suspicious results: {', '.join(results.suspicious_results)}"
       )
-  else:
-    justification_parts = []
-    if safe_results:
-      justification_parts.append(
-          f"Found safe results: {', '.join(map(str, final_safe_results))}"
-      )
-    if unknown_results:
-      justification_parts.append(
-          f"Found unknown results: {', '.join(map(str, final_unknown_results))}"
-      )
-    justification = " and ".join(justification_parts)
-    classification = "benign"
+    return {
+        "classification": "unsafe",
+        "justification": f"Found {' and '.join(all_results)}",
+    }
+  if results.suspicious_results:
+    return {
+        "classification": "suspicious",
+        "justification": (
+            f"Found suspicious results: {', '.join(results.suspicious_results)}"
+        ),
+    }
+  if results.unknown_results:
+    return {
+        "classification": "unknown",
+        "justification": (
+            f"Found unknown results: {', '.join(results.unknown_results)}"
+        ),
+    }
 
-  return {"classification": classification, "justification": justification}
+  justification = ""
+  if results.safe_results:
+    justification = f"Found safe results: {', '.join(results.safe_results)}"
+  return {
+      "classification": "benign",
+      "justification": justification,
+  }
 
 
 def scan_directory(directory_path: str) -> List[Dict[str, Any]]:
@@ -162,7 +98,12 @@ def scan_directory(directory_path: str) -> List[Dict[str, Any]]:
         "error".
   """
   results = []
-  if not os.path.isdir(directory_path):
+  try:
+    is_valid_dir = os.path.isdir(directory_path)
+  except (IOError, OSError):
+    is_valid_dir = False
+
+  if not is_valid_dir:
     results.append({
         "status": "error",
         "filename": directory_path,
@@ -180,9 +121,7 @@ def scan_directory(directory_path: str) -> List[Dict[str, Any]]:
         if not content:
           analysis_result = {"classification": "Not supported"}
         else:
-          analysis_result = security_scan_with_justifications(
-              content, file_path=file_path
-          )
+          analysis_result = security_scan_with_justifications(content)
 
         file_result = {
             "status": "success",
@@ -190,12 +129,36 @@ def scan_directory(directory_path: str) -> List[Dict[str, Any]]:
             **analysis_result,
         }
 
-      except (IOError, ValueError) as e:
-        file_result = {
-            "status": "error",
-            "filename": file_path,
-            "error_msg": f"Exception during parsing: {type(e).__name__} - {e}",
-        }
+      except (
+          IOError,
+          OSError,
+          ValueError,
+          EOFError,
+          safer_pickle.UnsafePickleDetectedError,
+          safer_pickle.MaxRecursionDepthExceededError,
+          safer_pickle.StrictCheckError,
+      ) as error:
+        if isinstance(
+            error,
+            (
+                safer_pickle.UnsafePickleDetectedError,
+                safer_pickle.MaxRecursionDepthExceededError,
+            ),
+        ):
+          file_result = {
+              "status": "success",
+              "filename": file_path,
+              "classification": "unsafe",
+              "justification": f"Found malicious results: {error}",
+          }
+        else:
+          file_result = {
+              "status": "error",
+              "filename": file_path,
+              "error_msg": (
+                  f"Exception during parsing: {type(error).__name__} - {error}"
+              ),
+          }
       results.append(file_result)
   return results
 
