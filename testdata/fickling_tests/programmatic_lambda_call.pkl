@@ -1,0 +1,4 @@
+c__builtins__
+eval
+(V(lambda:1234)()
+tR.
