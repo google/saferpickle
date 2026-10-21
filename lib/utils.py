@@ -43,7 +43,9 @@ from typing import (
     Generator,
     IO,
     Iterator,
+    Mapping,
     Optional,
+    Sequence,
     Set,
     Tuple,
     cast,
@@ -613,14 +615,11 @@ def get_module_members(module_name: str) -> Set[str] | None:
   except (IOError, ValueError, SyntaxError, RecursionError):
     return None
 
-  members = set()
-  # This generates the list of methods and classes in the module from
-  # the AST tree of the module source file.
-  for node in ast.walk(tree):
-    if isinstance(node, ast.FunctionDef):
-      members.add(node.name)
-    elif isinstance(node, ast.ClassDef):
-      members.add(node.name)
+  members = {
+      node.name
+      for node in ast.walk(tree)
+      if isinstance(node, (ast.FunctionDef, ast.ClassDef))
+  }
   return members
 
 
@@ -655,13 +654,18 @@ def get_optimal_workers(file_size: int) -> int:
 @functools.lru_cache(maxsize=None)
 def classify_class_name(class_name: str) -> Classification | None:
   """Classifies a class name based on the safe, unsafe, and suspicious patterns."""
-  if re.search(safe_pattern, class_name):
+  if safe_pattern.search(class_name):
     return Classification.SAFE
-  if re.search(unsafe_pattern, class_name):
+  if (
+      "." in class_name
+      and class_name.split(".", 1)[0] in constants.UNSAFE_PREFIX_MODULES
+  ):
     return Classification.UNSAFE
-  if re.search(suspicious_pattern, class_name):
+  if unsafe_pattern.search(class_name):
+    return Classification.UNSAFE
+  if suspicious_pattern.search(class_name):
     return Classification.SUSPICIOUS
-  if re.search(unknown_pattern, class_name):
+  if unknown_pattern.search(class_name):
     return Classification.UNKNOWN
   return None
 
@@ -748,13 +752,30 @@ def resolve_library_modules_from_results(
   libraries_to_remove = set()
   modules_to_remove = set()
   for result in final_results:
-    if "." in result:
-      base_library = result.split(".", 1)[0]
-      base_module = result.split(".", 1)[1]
-      if base_library in final_results:
-        libraries_to_remove.add(base_library)
-      if base_module in final_results:
-        modules_to_remove.add(base_module)
+    if "." not in result:
+      continue
+    base_library, base_module = result.split(".", 1)
+    result_classification = classify_class_name(result)
+    if (
+        base_library in final_results
+        and base_library != "builtins"
+        and (
+            classify_class_name(base_library) == result_classification
+            or result_classification == Classification.UNSAFE
+        )
+    ):
+      libraries_to_remove.add(base_library)
+    if (
+        "." not in base_module
+        and base_module in final_results
+        and base_module not in constants.UNSAFE_STRINGS
+        and base_module not in constants.SUSPICIOUS_STRINGS
+        and (
+            classify_class_name(base_module) == result_classification
+            or result_classification == Classification.UNSAFE
+        )
+    ):
+      modules_to_remove.add(base_module)
 
   final_results.difference_update(libraries_to_remove)
   final_results.difference_update(modules_to_remove)
@@ -762,13 +783,20 @@ def resolve_library_modules_from_results(
   # Remove less specific versions of qualified modules.
   # Eg. Remove requests.api if requests.api.post is present.
   underspecific_qualified_modules_to_remove = set()
-  for res in final_results:
-    attribute_parts = res.split(".")
+  for qualified_result in final_results:
+    result_classification = classify_class_name(qualified_result)
+    attribute_parts = qualified_result.split(".")
     # Check for less specific versions of the current item
-    for i in range(1, len(attribute_parts)):
-      parent = ".".join(attribute_parts[:i])
-      if parent in final_results:
-        underspecific_qualified_modules_to_remove.add(parent)
+    for prefix_length in range(1, len(attribute_parts)):
+      parent_symbol = ".".join(attribute_parts[:prefix_length])
+      if parent_symbol not in final_results:
+        continue
+      parent_classification = classify_class_name(parent_symbol)
+      if (
+          parent_classification == result_classification
+          or result_classification == Classification.UNSAFE
+      ):
+        underspecific_qualified_modules_to_remove.add(parent_symbol)
 
   final_results.difference_update(underspecific_qualified_modules_to_remove)
 
@@ -1102,9 +1130,6 @@ def decode_string_operand(
     return None
 
 
-_decode_string_operand = decode_string_operand
-
-
 def _read_length_span(
     data: bytes | mmap.mmap,
     pos: int,
@@ -1177,26 +1202,157 @@ def _read_newline(
   return newline_offset
 
 
+MAX_ABSTRACT_STACK_SIZE = 65536
+
+
+def _apply_fixed_opcode_stack_effect(
+    opcode_byte: int,
+    data: bytes | mmap.mmap,
+    current_offset: int,
+    value_stack: list[Optional[str]],
+    mark_stack: list[int],
+    memo_table: dict[int, Optional[str]],
+) -> None:
+  """Updates value_stack, mark_stack, and memo_table for fixed-stride opcodes."""
+  match opcode_byte:
+    case 0x28:  # MARK
+      mark_stack.append(len(value_stack))
+
+    case 0x30 | 0x61 | 0x62:  # POP, APPEND, BUILD
+      if value_stack:
+        value_stack.pop()
+
+    case 0x73:  # SETITEM
+      for _ in range(2):
+        if value_stack:
+          value_stack.pop()
+
+    case 0x31 | 0x65 | 0x75 | 0x90:  # POP_MARK, APPENDS, SETITEMS, ADDITEMS
+      if mark_stack:
+        mark_position = mark_stack.pop()
+        del value_stack[mark_position:]
+      else:
+        value_stack.clear()
+
+    case 0x64 | 0x69 | 0x6C | 0x6F | 0x74 | 0x91:
+      # DICT, INST, LIST, OBJ, TUPLE, FROZENSET
+      if mark_stack:
+        mark_position = mark_stack.pop()
+        del value_stack[mark_position:]
+      else:
+        value_stack.clear()
+      if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+        value_stack.append(None)
+
+    case 0x32:  # DUP
+      if value_stack and len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+        value_stack.append(value_stack[-1])
+
+    case 0x94:  # MEMOIZE
+      memo_table[len(memo_table)] = value_stack[-1] if value_stack else None
+
+    case 0x71:  # BINPUT
+      memo_key = data[current_offset + 1]
+      memo_table[memo_key] = value_stack[-1] if value_stack else None
+
+    case 0x72:  # LONG_BINPUT
+      memo_key = int.from_bytes(
+          data[current_offset + 1 : current_offset + 5], "little"
+      )
+      memo_table[memo_key] = value_stack[-1] if value_stack else None
+
+    case 0x68:  # BINGET
+      memo_key = data[current_offset + 1]
+      if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+        value_stack.append(memo_table.get(memo_key))
+
+    case 0x6A:  # LONG_BINGET
+      memo_key = int.from_bytes(
+          data[current_offset + 1 : current_offset + 5], "little"
+      )
+      if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+        value_stack.append(memo_table.get(memo_key))
+
+    case 0x85 | 0x98:  # TUPLE1, READONLY_BUFFER
+      if value_stack:
+        value_stack.pop()
+      if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+        value_stack.append(None)
+
+    case 0x52 | 0x81 | 0x86:  # REDUCE, NEWOBJ, TUPLE2
+      for _ in range(2):
+        if value_stack:
+          value_stack.pop()
+      if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+        value_stack.append(None)
+
+    case 0x87 | 0x92:  # TUPLE3, NEWOBJ_EX
+      for _ in range(3):
+        if value_stack:
+          value_stack.pop()
+      if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+        value_stack.append(None)
+
+    case (
+        0x29  # EMPTY_TUPLE
+        | 0x4E  # NONE
+        | 0x5D  # EMPTY_LIST
+        | 0x7D  # EMPTY_DICT
+        | 0x88  # NEWTRUE
+        | 0x89  # NEWFALSE
+        | 0x8F  # EMPTY_SET
+        | 0x4B  # BININT1
+        | 0x4D  # BININT2
+        | 0x4A  # BININT
+        | 0x47  # BINFLOAT
+        | 0x82  # EXT1
+        | 0x83  # EXT2
+        | 0x84  # EXT4
+        | 0x8A  # LONG1
+        | 0x8B  # LONG4
+        | 0x43  # SHORT_BINBYTES
+        | 0x42  # BINBYTES
+        | 0x8E  # BINBYTES8
+        | 0x96  # BYTEARRAY8
+        | 0x97  # NEXT_BUFFER
+        | 0x49  # INT
+        | 0x4C  # LONG
+        | 0x46  # FLOAT
+    ):
+      if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+        value_stack.append(None)
+
+
 def partition_pickle_chunks(
     data: bytes | mmap.mmap,
     target_chunk_size: int,
     end: int | None = None,
-) -> list[tuple[int, int]]:
-  """Partitions pickle bytes into opcode-aligned chunk slices.
+    *,
+    include_memo: bool = False,
+) -> list[Any]:
+  """Partitions pickle bytes into opcode-aligned chunk slices with seed stacks.
 
   Scans opcode boundaries so large pickle buffers can be partitioned across
-  multiple threads without splitting multi-byte opcodes or string arguments.
+  multiple threads without splitting multi-byte opcodes or losing string operand
+  context between boundaries.
 
   Args:
     data: The raw pickle byte buffer or memory-mapped file.
     target_chunk_size: Desired byte size for each worker partition chunk.
     end: Optional upper byte bound limiting the scan range.
+    include_memo: Whether to include a memo_table snapshot in each chunk tuple.
 
   Returns:
-    A list of tuples (chunk_start, chunk_end) defining slice ranges.
+    A list of 3-tuples (chunk_start, chunk_end, seed_stack) or 4-tuples
+    (chunk_start, chunk_end, seed_stack, seed_memo) when include_memo is True.
   """
   effective_length = len(data) if end is None else min(end, len(data))
   chunk_starts = [0]
+  seed_stacks: list[list[Optional[str]]] = [[]]
+  seed_memos: list[dict[int, Optional[str]]] = [{}]
+  value_stack: list[Optional[str]] = []
+  mark_stack: list[int] = []
+  memo_table: dict[int, Optional[str]] = {}
   current_offset = 0
   strides = OPCODE_STRIDES
 
@@ -1204,38 +1360,104 @@ def partition_pickle_chunks(
     opcode_byte = data[current_offset]
     stride = strides[opcode_byte]
     if stride > 0:
+      if current_offset + stride > effective_length:
+        break
       if opcode_byte == 0x2E:
         break
+      _apply_fixed_opcode_stack_effect(
+          opcode_byte,
+          data,
+          current_offset,
+          value_stack,
+          mark_stack,
+          memo_table,
+      )
       current_offset += stride
     else:
       match opcode_byte:
-        # 1-byte length prefix (SHORT_BINUNICODE, SHORT_BINBYTES, etc.)
-        case 0x8C | 0x43 | 0x8A:
+        # 1-byte prefix (SHORT_BINUNICODE) or 4-byte prefix (BINUNICODE)
+        case 0x8C | 0x58:
+          header_size = 2 if opcode_byte == 0x8C else 5
+          if current_offset + header_size > effective_length:
+            break
+          if header_size == 2:
+            operand_length = data[current_offset + 1]
+          else:
+            operand_length = int.from_bytes(
+                data[current_offset + 1 : current_offset + 5], "little"
+            )
+          next_offset = current_offset + header_size + operand_length
+          if next_offset > effective_length:
+            break
+          decoded_value = decode_string_operand(
+              data, current_offset + header_size, operand_length, "utf-8"
+          )
+          if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+            value_stack.append(decoded_value)
+          current_offset = next_offset
+
+        # 1-byte length prefix non-string bytes to skip (SHORT_BINBYTES, etc.)
+        case 0x43 | 0x8A:
+          if current_offset + 2 > effective_length:
+            break
           current_offset += 2 + data[current_offset + 1]
-        # 4-byte length prefix (BINUNICODE, BINBYTES, BINBYTES8_SHORT)
-        case 0x58 | 0x42 | 0x8B:
+          if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+            value_stack.append(None)
+
+        # 4-byte length prefix non-string bytes to skip safely (BINBYTES, etc.)
+        case 0x42 | 0x8B:
+          if current_offset + 5 > effective_length:
+            break
           current_offset += 5 + int.from_bytes(
               data[current_offset + 1 : current_offset + 5], "little"
           )
+          if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+            value_stack.append(None)
+
         # 8-byte length prefix (BINUNICODE8, BINBYTES8, BYTEARRAY8)
         case 0x8D | 0x8E | 0x96:
+          if current_offset + 9 > effective_length:
+            break
           current_offset += 9 + int.from_bytes(
               data[current_offset + 1 : current_offset + 9], "little"
           )
+          if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+            value_stack.append(None)
+
         # Newline-terminated opcodes (INT, FLOAT, LONG, STRING, etc.)
         case 0x49 | 0x46 | 0x4C | 0x70 | 0x67 | 0x50 | 0x56 | 0x53:
           if (newline_offset := data.find(b"\n", current_offset + 1)) == -1:
             break
+          if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+            value_stack.append(None)
           current_offset = newline_offset + 1
+
         # Two newline-terminated strings for module and attribute (GLOBAL, INST)
         case 0x63 | 0x69:
           if (first_newline := data.find(b"\n", current_offset + 1)) == -1 or (
               second_newline := data.find(b"\n", first_newline + 1)
           ) == -1:
             break
+          if opcode_byte == 0x69:
+            if mark_stack:
+              mark_position = mark_stack.pop()
+              del value_stack[mark_position:]
+            else:
+              value_stack.clear()
+          if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+            value_stack.append(None)
           current_offset = second_newline + 1
-        # Unrecognized or single-byte variable opcode
+
+        # Unrecognized or single-byte variable opcode fallback
         case _:
+          _apply_fixed_opcode_stack_effect(
+              opcode_byte,
+              data,
+              current_offset,
+              value_stack,
+              mark_stack,
+              memo_table,
+          )
           current_offset += 1
 
     if (
@@ -1243,9 +1465,32 @@ def partition_pickle_chunks(
         and current_offset < effective_length
     ):
       chunk_starts.append(current_offset)
+      if include_memo:
+        seed_stacks.append(list(value_stack[-64:]))
+        seed_memos.append(dict(memo_table))
+      else:
+        non_null_strings: list[Optional[str]] = [
+            stack_item for stack_item in value_stack if stack_item is not None
+        ]
+        seed_stacks.append(non_null_strings[-16:])
 
-  # Returns the chunks and indexes
-  return [
+  if include_memo:
+    chunk_partitions = [
+        (
+            chunk_starts[chunk_index],
+            (
+                chunk_starts[chunk_index + 1]
+                if chunk_index + 1 < len(chunk_starts)
+                else effective_length
+            ),
+            seed_stacks[chunk_index],
+            seed_memos[chunk_index],
+        )
+        for chunk_index in range(len(chunk_starts))
+    ]
+    return chunk_partitions
+
+  chunk_partitions = [
       (
           chunk_starts[chunk_index],
           (
@@ -1253,34 +1498,47 @@ def partition_pickle_chunks(
               if chunk_index + 1 < len(chunk_starts)
               else effective_length
           ),
+          seed_stacks[chunk_index],
       )
       for chunk_index in range(len(chunk_starts))
   ]
+  return chunk_partitions
 
 
 def custom_genops_from_bytes(
     data: bytes | mmap.mmap,
     start: int = 0,
     end: int | None = None,
+    seed_stack: Sequence[Optional[str]] = (),
+    seed_memo: Optional[Mapping[int, Optional[str]]] = None,
 ) -> Iterator[tuple[Optional[pickletools.OpcodeInfo], Any | None]]:
   """Generates string-declaring opcodes and arguments from raw pickle bytes.
+
+  Traverses pickle opcodes starting from byte offset `start` up to `end`,
+  yielding discovered string operands and module references while tracking stack
+  state and skipping binary payloads in constant time.
 
   Args:
     data: The raw pickle byte buffer or memory-mapped file.
     start: Byte offset to start parsing from.
     end: Optional byte offset upper limit for parsing.
+    seed_stack: Initial string operands to populate the stack context.
+    seed_memo: Initial memo table mapping memo keys to string operands.
 
   Yields:
     A tuple of (opcode_info, operand_value) for each string-declaring opcode.
 
   Raises:
     exceptions.UnsafePickleDetectedError: If a length-prefixed opcode is
-    truncated.
+      truncated.
   """
   total_length = len(data)
   limit_offset = total_length if end is None else min(end, total_length)
   current_offset = start
   strides = OPCODE_STRIDES
+  memo_table: dict[int, Optional[str]] = dict(seed_memo) if seed_memo else {}
+  value_stack: list[Optional[str]] = list(seed_stack) if seed_stack else []
+  mark_stack: list[int] = []
 
   while current_offset < limit_offset:
     opcode_byte = data[current_offset]
@@ -1293,6 +1551,14 @@ def custom_genops_from_bytes(
         )
       if opcode_byte == 0x2E:
         break
+      _apply_fixed_opcode_stack_effect(
+          opcode_byte,
+          data,
+          current_offset,
+          value_stack,
+          mark_stack,
+          memo_table,
+      )
       current_offset += stride
       continue
 
@@ -1308,6 +1574,8 @@ def custom_genops_from_bytes(
         string_value = decode_string_operand(
             data, current_offset - payload_length, payload_length, "utf-8"
         )
+        if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+          value_stack.append(string_value)
         if string_value is not None:
           yield constants.OPCODES_INFO_INT.get(opcode_byte), string_value
 
@@ -1321,6 +1589,8 @@ def custom_genops_from_bytes(
         _, current_offset = _read_length_span(
             data, current_offset, limit_offset, header_size
         )
+        if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+          value_stack.append(None)
 
       # Newline-terminated string literals (Protocol 0 UNICODE / STRING)
       case 0x56 | 0x53:
@@ -1332,6 +1602,8 @@ def custom_genops_from_bytes(
             newline_offset - current_offset - 1,
             encoding,
         )
+        if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+          value_stack.append(string_value)
         if string_value is not None:
           yield constants.OPCODES_INFO_INT.get(opcode_byte), string_value
         current_offset = newline_offset + 1
@@ -1346,23 +1618,79 @@ def custom_genops_from_bytes(
         attribute_name = data[module_newline + 1 : name_newline].decode(
             "utf-8", errors="ignore"
         )
+        if opcode_byte == 0x69:
+          if mark_stack:
+            mark_position = mark_stack.pop()
+            del value_stack[mark_position:]
+          else:
+            value_stack.clear()
         opcode_info = constants.OPCODES_INFO_INT.get(opcode_byte)
         yield opcode_info, module_name
         yield opcode_info, attribute_name
-        yield opcode_info, f"{module_name}.{attribute_name}"
+        qualified_name = f"{module_name}.{attribute_name}"
+        if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+          value_stack.append(qualified_name if opcode_byte == 0x63 else None)
+        yield opcode_info, qualified_name
         current_offset = name_newline + 1
 
       # Stack global resolution opcode referencing stack operands
       case 0x93:
-        yield constants.OPCODES_INFO_INT.get(opcode_byte), "STACK_GLOBAL"
+        opcode_info = constants.OPCODES_INFO_INT.get(opcode_byte)
+        attribute_member = value_stack.pop() if value_stack else None
+        module_member = value_stack.pop() if value_stack else None
+        if isinstance(module_member, str) and isinstance(attribute_member, str):
+          qualified_name = f"{module_member}.{attribute_member}"
+          if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+            value_stack.append(qualified_name)
+          yield opcode_info, qualified_name
+        else:
+          if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+            value_stack.append(None)
+          yield opcode_info, "STACK_GLOBAL"
         current_offset += 1
 
-      # Newline-terminated non-string numeric and memo arguments to skip
-      case 0x49 | 0x46 | 0x4C | 0x70 | 0x67 | 0x50:
+      # Protocol 0 PUT (newline-terminated decimal memo index)
+      case 0x70:
+        newline_offset = _read_newline(data, current_offset + 1, current_offset)
+        try:
+          memo_key = int(
+              bytes(data[current_offset + 1 : newline_offset]).rstrip(b"\r"), 0
+          )
+          memo_table[memo_key] = value_stack[-1] if value_stack else None
+        except ValueError:
+          pass
+        current_offset = newline_offset + 1
+
+      # Protocol 0 GET (newline-terminated decimal memo index)
+      case 0x67:
+        newline_offset = _read_newline(data, current_offset + 1, current_offset)
+        try:
+          memo_key = int(
+              bytes(data[current_offset + 1 : newline_offset]).rstrip(b"\r"), 0
+          )
+          if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+            value_stack.append(memo_table.get(memo_key))
+        except ValueError:
+          if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+            value_stack.append(None)
+        current_offset = newline_offset + 1
+
+      # Newline-terminated non-string numeric and persistent ID arguments
+      case 0x49 | 0x46 | 0x4C | 0x50:
         current_offset = (
             _read_newline(data, current_offset + 1, current_offset) + 1
         )
+        if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+          value_stack.append(None)
 
-      # Unrecognized single-byte opcode
+      # Unrecognized or variable-stride single-byte opcode (REDUCE, BUILD, etc.)
       case _:
+        _apply_fixed_opcode_stack_effect(
+            opcode_byte,
+            data,
+            current_offset,
+            value_stack,
+            mark_stack,
+            memo_table,
+        )
         current_offset += 1

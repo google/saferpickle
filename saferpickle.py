@@ -41,7 +41,9 @@ from typing import (
     Dict,
     IO,
     Iterator,
+    Mapping,
     Optional,
+    Sequence,
     Set,
     Tuple,
 )
@@ -81,9 +83,6 @@ class ScanResults:
   is_denylisted: bool = False
 
 
-_decode_string_operand = utils.decode_string_operand
-
-
 def _custom_genops(
     pickle_bytes: bytes | BinaryIO,
 ) -> Iterator[tuple[Optional[pickletools.OpcodeInfo], Any | None]]:
@@ -95,91 +94,45 @@ def _custom_genops(
   Yields:
     A tuple of (opcode, opcode_argument) for each string-declaring opcode.
   """
-  if isinstance(pickle_bytes, bytes):
-    yield from utils.custom_genops_from_bytes(pickle_bytes)
-    return
+  match pickle_bytes:
+    case bytes() | mmap.mmap():
+      yield from utils.custom_genops_from_bytes(pickle_bytes)
+      return
 
-  pickle_file = pickle_bytes
-  while True:
-    charcode = pickle_file.read(1)
-    if not charcode:
-      break
+    case bytearray() | memoryview():
+      yield from utils.custom_genops_from_bytes(bytes(pickle_bytes))
+      return
 
-    try:
-      opcode = constants.OPCODES_INFO_INT.get(charcode[0])
-    except IndexError:
-      continue
+    case io.BytesIO():
+      yield from utils.custom_genops_from_bytes(
+          pickle_bytes.getvalue(), start=pickle_bytes.tell()
+      )
+      return
 
-    if opcode is None:
-      continue
-
-    opcode_argument = None
-    if opcode.arg is not None:
-      if charcode in constants.LENGTH_PREFIXED_OPCODES:
-        try:
-          match charcode:
-            case c if c in constants.OPCODES_4BYTE_LEN:
-              length = int.from_bytes(pickle_file.read(4), byteorder="little")
-            case c if c in constants.OPCODES_8BYTE_LEN:
-              length = int.from_bytes(pickle_file.read(8), byteorder="little")
-            case c if c in constants.OPCODES_1BYTE_LEN:
-              length = int.from_bytes(pickle_file.read(1), byteorder="little")
-            case _:
-              length = 0
-          pickle_file.seek(length, os.SEEK_CUR)
-        except (AttributeError, io.UnsupportedOperation, OSError):
-          try:
-            opcode_argument = opcode.arg.reader(pickle_file)
-          except (ValueError, pickle.UnpicklingError) as e:
-            raise UnsafePickleDetectedError(
-                f"Parser error during security scan: {e}"
-            ) from e
-          except (
-              IndexError,
-              AttributeError,
-              EOFError,
-              TypeError,
-              ImportError,
-          ):
-            continue
-      else:
-        try:
-          opcode_argument = opcode.arg.reader(pickle_file)
-        except (ValueError, pickle.UnpicklingError) as e:
-          raise UnsafePickleDetectedError(
-              f"Parser error during security scan: {e}"
-          ) from e
-        except (
-            IndexError,
-            AttributeError,
-            EOFError,
-            TypeError,
-            ImportError,
-        ):
-          continue
-
-    should_yield = False
-    for relevant_opcode_substr in constants.OPCODE_SUBSTRS_THAT_DECLARE_STRINGS:
-      if relevant_opcode_substr in opcode.name:
-        should_yield = True
-        break
-
-    if should_yield and opcode_argument is not None:
-      if isinstance(opcode_argument, (str, bytes)) and len(opcode_argument) > 1:
-        yield opcode, opcode_argument
-      elif isinstance(opcode_argument, tuple):
-        yield opcode, opcode_argument
-
-    if charcode == b".":
-      break
+  start_position = None
+  try:
+    start_position = pickle_bytes.tell()
+  except (OSError, AttributeError, io.UnsupportedOperation):
+    pass
+  try:
+    data_bytes = pickle_bytes.read(-1)
+  finally:
+    if start_position is not None:
+      try:
+        pickle_bytes.seek(start_position)
+      except (OSError, AttributeError, io.UnsupportedOperation):
+        pass
+  yield from utils.custom_genops_from_bytes(data_bytes)
 
 
 def _scan_byte_slice(
     data: bytes | mmap.mmap,
     start: int,
     end: int,
-    fail_fast: bool,
+    seed_stack: Sequence[Optional[str]] = (),
+    fail_fast: bool = False,
     abort_event: Optional[threading.Event] = None,
+    seed_memo: Optional[Mapping[int, Optional[str]]] = None,
 ) -> Set[str]:
   """Worker function to scan a byte slice of pickle bytecode.
 
@@ -190,22 +143,36 @@ def _scan_byte_slice(
     data: The raw pickle byte buffer or mmapped file slice.
     start: Byte offset where the chunk starts.
     end: Byte offset where the chunk ends.
+    seed_stack: Initial string operands to populate the stack context.
     fail_fast: Whether to abort scanning immediately upon detecting an unsafe or
       suspicious operand.
     abort_event: Optional threading event used to signal other workers to stop.
+    seed_memo: Initial memo table mapping memo keys to string operands.
 
   Returns:
     A set of string operands discovered within the byte slice.
   """
   discovered_operands = set()
-  for _, operand in utils.custom_genops_from_bytes(data, start=start, end=end):
-    if abort_event and abort_event.is_set():
+  for chunk_index, (_, operand) in enumerate(
+      utils.custom_genops_from_bytes(
+          data,
+          start=start,
+          end=end,
+          seed_stack=seed_stack,
+          seed_memo=seed_memo,
+      )
+  ):
+    if (
+        abort_event is not None
+        and (chunk_index & 0xFF == 0)
+        and abort_event.is_set()
+    ):
       break
     if operand is not None:
       operand_string = str(operand)
       discovered_operands.add(operand_string)
       if fail_fast and utils.is_unsafe_or_suspicious(operand_string):
-        if abort_event:
+        if abort_event is not None:
           abort_event.set()
         break
   return discovered_operands
@@ -270,7 +237,10 @@ def generate_ops_from_file(
         constants.MIN_SIZE_FOR_CHUNKING, effective_length // num_workers
     )
     chunk_ranges = utils.partition_pickle_chunks(
-        pickle_bytes, target_chunk_size, end=effective_length
+        pickle_bytes,
+        target_chunk_size,
+        end=effective_length,
+        include_memo=True,
     )
 
     all_operands = set()
@@ -285,10 +255,12 @@ def generate_ops_from_file(
               pickle_bytes,
               start_offset,
               end_offset,
+              seed_stack,
               bool(fail_fast),
               abort_event,
+              seed_memo,
           )
-          for start_offset, end_offset in chunk_ranges
+          for start_offset, end_offset, seed_stack, seed_memo in chunk_ranges
       ]
       for future in concurrent.futures.as_completed(futures):
         chunk_results = future.result()
@@ -608,11 +580,17 @@ def _reclassify_with_resolution(
   allow_list = config.get_allow_list()
   deny_list = config.get_deny_list()
 
-  # Combine results for `resolve_library_modules_from_results` call.
-  all_results = safe_results.union(
-      unsafe_results, suspicious_results, unknown_results
-  )
-  resolved_results = utils.resolve_library_modules_from_results(all_results)
+  # Only resolve qualified symbols (e.g. 'pkg.mod') to avoid plain words.
+  candidate_results = safe_results.union(unsafe_results, suspicious_results)
+  dotted_unknowns = {
+      unknown_symbol
+      for unknown_symbol in unknown_results
+      if "." in unknown_symbol
+  }
+  all_candidates = candidate_results.union(dotted_unknowns)
+
+  resolved_results = utils.resolve_library_modules_from_results(all_candidates)
+  resolved_results.update(unknown_results - dotted_unknowns)
 
   # Re-categorize the resolved results
   new_safe_results = set()
