@@ -653,6 +653,7 @@ def get_optimal_workers(file_size: int) -> int:
 
 @functools.lru_cache(maxsize=None)
 def classify_class_name(class_name: str) -> Classification | None:
+  # Evaluates safe pattern first to prevent false positives
   """Classifies a class name based on the safe, unsafe, and suspicious patterns."""
   if safe_pattern.search(class_name):
     return Classification.SAFE
