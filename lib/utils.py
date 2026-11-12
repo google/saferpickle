@@ -651,9 +651,51 @@ def get_optimal_workers(file_size: int) -> int:
   return min(constants.MAX_NUM_CHUNKS or 1, scaled_workers)
 
 
+def _get_matching_length(
+    class_name: str,
+    strings: FrozenSet[str],
+    prefix_only: bool = False,
+) -> int:
+  """Finds the longest matching string entry in strings for class_name.
+
+  Args:
+    class_name: The class name or symbol to check.
+    strings: The set of pattern strings to match against.
+    prefix_only: If True, only match as exact string or module/attribute prefix.
+
+  Returns:
+    The length of the longest matching entry, or 0 if no match.
+  """
+  best_len = 0
+  for entry in strings:
+    if not entry:
+      continue
+    entry_len = len(entry)
+    if entry_len <= best_len:
+      continue
+    if class_name == entry:
+      best_len = entry_len
+    elif class_name.startswith(entry + ".") or (
+        entry.endswith(".") and class_name.startswith(entry)
+    ):
+      best_len = entry_len
+    elif not prefix_only:
+      if class_name.endswith("." + entry) or f".{entry}." in class_name:
+        best_len = entry_len
+      elif entry in class_name:
+        pattern = rf"(?<![a-zA-Z0-9_]){re.escape(entry)}(?![a-zA-Z0-9_])"
+        if re.search(pattern, class_name):
+          best_len = entry_len
+  return best_len
+
+
 @functools.lru_cache(maxsize=None)
 def classify_class_name(class_name: str) -> Classification | None:
   """Classifies a class name based on the safe, unsafe, and suspicious patterns."""
+  if unsafe_pattern.search(class_name):
+    return Classification.UNSAFE
+  if suspicious_pattern.search(class_name):
+    return Classification.SUSPICIOUS
   if safe_pattern.search(class_name):
     return Classification.SAFE
   if (
@@ -661,10 +703,6 @@ def classify_class_name(class_name: str) -> Classification | None:
       and class_name.split(".", 1)[0] in constants.UNSAFE_PREFIX_MODULES
   ):
     return Classification.UNSAFE
-  if unsafe_pattern.search(class_name):
-    return Classification.UNSAFE
-  if suspicious_pattern.search(class_name):
-    return Classification.SUSPICIOUS
   if unknown_pattern.search(class_name):
     return Classification.UNKNOWN
   return None
@@ -901,7 +939,14 @@ def is_sys_executable_patched() -> bool:
 
 
 def _classify_item(item: str) -> Classification | None:
-  """Classifies a single item string into a Classification enum."""
+  """Classifies a single item string into a Classification enum.
+
+  Args:
+    item: The string to classify.
+
+  Returns:
+    The Classification enum or None.
+  """
   if not item:
     return None
   if item in constants.UNSAFE_STRINGS:

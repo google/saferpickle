@@ -225,18 +225,40 @@ class FakeStrict(FakeClass, object):
 class FakeWarning(FakeClass, object):
 
   def __new__(cls, *args, **kwargs):
+    """Creates a new instance and unconditionally logs the instantiation.
+
+    Args:
+      *args: Positional arguments passed to the constructor.
+      **kwargs: Keyword arguments passed to the constructor.
+
+    Returns:
+      The newly created FakeWarning instance.
+    """
     self = FakeClass.__new__(cls)
-    if args or kwargs:
-      logger.warning(
-          "FakeWarning.__new__ called on %s with args=%s, kwargs=%s",
-          cls,
-          args,
-          kwargs,
-      )
+    logger.warning(
+        "FakeWarning.__new__ called on %s with args=%s, kwargs=%s",
+        cls,
+        args,
+        kwargs,
+    )
+    if args:
       self._new_args = args
+    if kwargs:
+      self._new_kwargs = kwargs
     return self
 
   def __setstate__(self, state):
+    """Restores instance state and unconditionally logs state updates.
+
+    Args:
+      state: The state object, dictionary, or tuple of states to set.
+    """
+    logger.warning(
+        "FakeWarning.__setstate__ called on %s with unexpected state=%s",
+        self.__class__,
+        state,
+    )
+    self._setstate_args = state
     slotstate = None
 
     if (
@@ -249,14 +271,7 @@ class FakeWarning(FakeClass, object):
 
     if state:
       # Don't have to check for slotstate here since it's either None or a dict
-      if not isinstance(state, dict):
-        logger.warning(
-            "FakeWarning.__setstate__ called on %s with unexpected state=%s",
-            self.__class__,
-            state,
-        )
-        self._setstate_args = state
-      else:
+      if isinstance(state, dict):
         self.__dict__.update(state)
 
     if slotstate:
@@ -600,7 +615,7 @@ class FakeUnpickler(pickle.Unpickler if PY2 else pickle._Unpickler):
   if PY2:
 
     def __init__(
-        self, file, class_factory=None, encoding="bytes", errors="strict"
+        self, file, class_factory=None, encoding="ASCII", errors="strict"
     ):
       pickle.Unpickler.__init__(
           self,
@@ -611,7 +626,7 @@ class FakeUnpickler(pickle.Unpickler if PY2 else pickle._Unpickler):
   else:
 
     def __init__(
-        self, file, class_factory=None, encoding="bytes", errors="strict"
+        self, file, class_factory=None, encoding="ASCII", errors="strict"
     ):
       super().__init__(
           file, fix_imports=False, encoding=encoding, errors=errors
@@ -690,7 +705,7 @@ class SafeUnpickler(FakeUnpickler):
       safe_modules=(),
       unsafe_modules=(),
       use_copyreg=False,
-      encoding="bytes",
+      encoding="ASCII",
       errors="strict",
   ):
     FakeUnpickler.__init__(
@@ -823,9 +838,13 @@ class SafeUnpickler(FakeUnpickler):
     return False
 
   def load_build(self, *unused_args):
-    """Custom handler for the BUILD opcode to prevent setting state of
+    """Custom handler for the BUILD opcode.
 
-    a real object with a fake object (potentially dangerous).
+    Prevents setting state of a real object with a fake object and flags
+    blocked unsafe build instructions.
+
+    Args:
+      *unused_args: Optional arguments passed by opcode dispatch.
     """
     state = self.stack.pop()
     if state is None:
@@ -835,10 +854,11 @@ class SafeUnpickler(FakeUnpickler):
     contains_fake = self._state_contains_fake_class(state)
 
     # Prevent a real object from being configured with a fake one.
-    if not isinstance(inst, FakeClass) and contains_fake:
+    if contains_fake:
       self.has_blocked_unsafe_build_instr = True
-      # Return to prevent inst.__setstate__(state) from being called.
-      return
+      if not isinstance(inst, FakeClass):
+        # Return to prevent inst.__setstate__(state) from being called.
+        return
 
     try:
       setstate = getattr(inst, "__setstate__", None)
@@ -998,7 +1018,7 @@ class SafePickler(pickle.Pickler if PY2 else pickle._Pickler):
 # the main API
 
 
-def load(file, class_factory=None, encoding="bytes", errors="errors"):
+def load(file, class_factory=None, encoding="ASCII", errors="strict"):
   """Read a pickled object representation from the open binary :term:`file object` *file*
 
   and return the reconstitutded object hierarchy specified therein, generating
@@ -1026,7 +1046,7 @@ def load(file, class_factory=None, encoding="bytes", errors="errors"):
   ).load()
 
 
-def loads(string, class_factory=None, encoding="bytes", errors="errors"):
+def loads(string, class_factory=None, encoding="ASCII", errors="strict"):
   """Simjilar to :func:`load`, but takes an 8-bit string (bytes in Python 3, str in Python 2)
 
   as its first argument instead of a binary :term:`file object`.
@@ -1041,8 +1061,8 @@ def safe_load(
     class_factory=None,
     safe_modules=(),
     use_copyreg=False,
-    encoding="bytes",
-    errors="errors",
+    encoding="ASCII",
+    errors="strict",
 ):
   """Read a pickled object representation from the open binary :term:`file object` *file*
 
@@ -1085,7 +1105,7 @@ def safe_load(
       file,
       class_factory,
       safe_modules,
-      use_copyreg,
+      use_copyreg=use_copyreg,
       encoding=encoding,
       errors=errors,
   ).load()
@@ -1097,8 +1117,8 @@ def safe_loads(
     safe_modules=(),
     unsafe_modules=(),
     use_copyreg=False,
-    encoding="bytes",
-    errors="errors",
+    encoding="ASCII",
+    errors="strict",
 ):
   """Similar to :func:`safe_load`, but takes an 8-bit string (bytes in Python 3, str in Python 2)
 
@@ -1109,7 +1129,7 @@ def safe_loads(
       class_factory,
       safe_modules,
       unsafe_modules,
-      use_copyreg,
+      use_copyreg=use_copyreg,
       encoding=encoding,
       errors=errors,
   ).load()
