@@ -530,7 +530,14 @@ def categorize_strings(
 def _categorize_genops(
     filtered_output: Set[str],
 ) -> Tuple[Set[str], Set[str], Set[str], Set[str]]:
-  """Helper to categorize genops output."""
+  """Helper to categorize genops output.
+
+  Args:
+    filtered_output: Set of string operands from genops.
+
+  Returns:
+    A tuple of safe, unsafe, suspicious, and unknown results sets.
+  """
   safe_results: Set[str] = set()
   unsafe_results: Set[str] = set()
   suspicious_results: Set[str] = set()
@@ -542,24 +549,24 @@ def _categorize_genops(
         unsafe_string in line_in_lowercase
         for unsafe_string in constants.UNSAFE_STRINGS
     ) and re.findall(utils.unsafe_pattern, line_in_lowercase)
-    safe_match = any(
-        safe_string in line_in_lowercase
-        for safe_string in constants.SAFE_STRINGS
-    ) and re.findall(utils.safe_pattern, line_in_lowercase)
     suspicious_match = any(
         suspicious_string in line_in_lowercase
         for suspicious_string in constants.SUSPICIOUS_STRINGS
     ) and re.findall(utils.suspicious_pattern, line_in_lowercase)
+    safe_match = any(
+        safe_string in line_in_lowercase
+        for safe_string in constants.SAFE_STRINGS
+    ) and re.findall(utils.safe_pattern, line_in_lowercase)
 
     if unsafe_match:
       for match in unsafe_match:
         unsafe_results.add(match)
-    elif safe_match:
-      for match in safe_match:
-        safe_results.add(match)
     elif suspicious_match:
       for match in suspicious_match:
         suspicious_results.add(match)
+    elif safe_match:
+      for match in safe_match:
+        safe_results.add(match)
     else:
       # Only check for unknown if no other categories matched
       unknown_match = re.findall(utils.unknown_pattern, line_in_lowercase)
@@ -576,7 +583,17 @@ def _reclassify_with_resolution(
     suspicious_results: Set[str],
     unknown_results: Set[str],
 ) -> ScanResults:
-  """Helper to resolve modules and re-classify results."""
+  """Helper to resolve modules and re-classify results.
+
+  Args:
+    safe_results: Set of safe string results.
+    unsafe_results: Set of unsafe string results.
+    suspicious_results: Set of suspicious string results.
+    unknown_results: Set of unknown string results.
+
+  Returns:
+    A ScanResults instance with resolved and categorized results.
+  """
   allow_list = config.get_allow_list()
   deny_list = config.get_deny_list()
 
@@ -616,12 +633,12 @@ def _reclassify_with_resolution(
     # Classify the resolved result
     classification = utils.classify_class_name(result)
 
-    if classification == utils.Classification.SAFE:
-      new_safe_results.add(result)
-    elif classification == utils.Classification.UNSAFE:
+    if classification == utils.Classification.UNSAFE:
       new_unsafe_results.add(result)
     elif classification == utils.Classification.SUSPICIOUS:
       new_suspicious_results.add(result)
+    elif classification == utils.Classification.SAFE:
+      new_safe_results.add(result)
     elif classification == utils.Classification.UNKNOWN:
       # Fallback: Check against original categories if
       # classify_class_name returns UNKNOWN.
