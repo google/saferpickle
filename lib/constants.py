@@ -205,6 +205,9 @@ UNSAFE_STRINGS: FrozenSet[str] = frozenset([
     "winapi",
     "winreg",
     "zlib",
+    "pydoc",
+    "pipe_pager",
+    "tempfile_pager",
 ])
 
 # Dangerous root modules whose qualified member accesses (e.g.
