@@ -654,6 +654,10 @@ def get_optimal_workers(file_size: int) -> int:
 @functools.lru_cache(maxsize=None)
 def classify_class_name(class_name: str) -> Classification | None:
   """Classifies a class name based on the safe, unsafe, and suspicious patterns."""
+  if unsafe_pattern.search(class_name):
+    return Classification.UNSAFE
+  if suspicious_pattern.search(class_name):
+    return Classification.SUSPICIOUS
   if safe_pattern.search(class_name):
     return Classification.SAFE
   if (
@@ -661,10 +665,6 @@ def classify_class_name(class_name: str) -> Classification | None:
       and class_name.split(".", 1)[0] in constants.UNSAFE_PREFIX_MODULES
   ):
     return Classification.UNSAFE
-  if unsafe_pattern.search(class_name):
-    return Classification.UNSAFE
-  if suspicious_pattern.search(class_name):
-    return Classification.SUSPICIOUS
   if unknown_pattern.search(class_name):
     return Classification.UNKNOWN
   return None
