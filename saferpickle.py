@@ -24,15 +24,12 @@ import logging as std_logging
 import lzma
 import math
 import mmap
-from multiprocessing import shared_memory
-import os
 import pickle
 import pickletools
 import re
 import struct
 import sys
 import tarfile
-import tempfile
 import threading
 from typing import (
     Any,
@@ -99,6 +96,57 @@ def _get_stream_pos(stream: Any) -> Optional[int]:
     return stream.tell()
   except (OSError, AttributeError, io.UnsupportedOperation):
     return None
+
+
+def _resolve_pickle_length(
+    pickle_bytes: Any,
+    pickle_length: Optional[int],
+) -> int:
+  """Resolves the remaining byte length of a pickle buffer or stream.
+
+  Computes the exact remaining byte count for in-memory buffers (`bytes`,
+  `bytearray`, `memoryview`, `mmap.mmap`, `io.BytesIO`) and seekable streams
+  while preserving stream position, returning `0` for non-seekable streams.
+
+  Args:
+    pickle_bytes: In-memory byte buffer or binary stream to inspect.
+    pickle_length: Explicit byte length override, if already known.
+
+  Returns:
+    The non-negative byte length, or `0` if `pickle_bytes` is non-seekable.
+  """
+  if pickle_length is not None:
+    return pickle_length
+
+  if isinstance(pickle_bytes, (bytes, bytearray, memoryview, mmap.mmap)):
+    return len(pickle_bytes)
+
+  if isinstance(pickle_bytes, io.BytesIO):
+    return max(0, len(pickle_bytes.getbuffer()) - pickle_bytes.tell())
+
+  seekable_fn = getattr(pickle_bytes, "seekable", None)
+  if callable(seekable_fn):
+    try:
+      if not seekable_fn():
+        return 0
+    except (OSError, AttributeError, io.UnsupportedOperation):
+      return 0
+
+  cur_pos = _get_stream_pos(pickle_bytes)
+  if cur_pos is None:
+    return 0
+
+  try:
+    end_pos = pickle_bytes.seek(0, io.SEEK_END)
+    pickle_bytes.seek(cur_pos)
+  except (OSError, AttributeError, io.UnsupportedOperation):
+    try:
+      pickle_bytes.seek(cur_pos)
+    except (OSError, AttributeError, io.UnsupportedOperation):
+      pass
+    return 0
+
+  return max(0, end_pos - cur_pos)
 
 
 def _custom_genops(
@@ -194,104 +242,99 @@ def _scan_byte_slice(
 
 def generate_ops_from_file(
     pickle_file_path: str,
-    shared_memory_name: Optional[str] = None,
     pickle_length: Optional[int] = None,
     fail_fast: Optional[bool] = DEFAULT_FAIL_FAST,
-    shm_name: Optional[str] = None,
+    data_buffer: Optional[bytes | mmap.mmap] = None,
 ) -> Set[str]:
-  """Returns opcodes that declare strings from a path or shared memory.
+  """Returns opcodes that declare strings from a path or in-memory buffer.
 
   Reads pickle bytecode and partitions large payloads for parallel
   scanning using threads.
 
   Args:
     pickle_file_path: The filesystem path to the pickle file.
-    shared_memory_name: Optional name of the shared memory block.
     pickle_length: Optional length of the pickle data in bytes.
     fail_fast: Whether to fail fast on first unsafe or suspicious match.
-    shm_name: Deprecated alias for shared_memory_name.
+    data_buffer: Optional in-memory bytes or mmap buffer for zero-copy scanning.
 
   Returns:
     The operands associated with opcodes declaring strings.
   """
-  target_shared_memory_name = shared_memory_name or shm_name
-  shared_memory_block = None
-  try:
-    if target_shared_memory_name:
-      shared_memory_block = shared_memory.SharedMemory(
-          name=target_shared_memory_name
+  if data_buffer is not None:
+    pickle_bytes = data_buffer
+  else:
+    with open(pickle_file_path, "rb") as file_handle:
+      pickle_bytes = (
+          file_handle.read(pickle_length)
+          if pickle_length is not None
+          else file_handle.read()
       )
-      pickle_bytes = getattr(shared_memory_block, "_mmap")
-    else:
-      with open(pickle_file_path, "rb") as file_handle:
-        pickle_bytes = file_handle.read()
 
-    effective_length = (
-        pickle_length if pickle_length is not None else len(pickle_bytes)
-    )
-    num_workers = utils.get_optimal_workers(effective_length)
+  effective_length = (
+      min(pickle_length, len(pickle_bytes))
+      if pickle_length is not None
+      else len(pickle_bytes)
+  )
+  num_workers = utils.get_optimal_workers(effective_length)
 
-    if (
-        effective_length < constants.MIN_SIZE_FOR_CHUNKING
-        or num_workers <= 1
-        or not utils.is_sys_executable_patched()
-    ):
-      all_operands = set()
-      for _, operand in utils.custom_genops_from_bytes(
-          pickle_bytes, end=effective_length
-      ):
-        if operand is not None:
-          operand_string = str(operand)
-          all_operands.add(operand_string)
-          if fail_fast and utils.is_unsafe_for_fail_fast(operand_string):
-            break
-      return all_operands
-
-    target_chunk_size = max(
-        constants.MIN_SIZE_FOR_CHUNKING, effective_length // num_workers
-    )
-    chunk_ranges = utils.partition_pickle_chunks(
-        pickle_bytes,
-        target_chunk_size,
-        end=effective_length,
-        include_memo=True,
-    )
-
+  if (
+      effective_length < constants.MIN_SIZE_FOR_CHUNKING
+      or num_workers <= 1
+      or not utils.is_sys_executable_patched()
+  ):
     all_operands = set()
-    abort_event = threading.Event() if fail_fast else None
-
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=len(chunk_ranges)
-    ) as executor:
-      futures = [
-          executor.submit(
-              _scan_byte_slice,
-              pickle_bytes,
-              start_offset,
-              end_offset,
-              seed_stack,
-              bool(fail_fast),
-              abort_event,
-              seed_memo,
-          )
-          for start_offset, end_offset, seed_stack, seed_memo in chunk_ranges
-      ]
-      for future in concurrent.futures.as_completed(futures):
-        chunk_results = future.result()
-        all_operands.update(chunk_results)
-        if fail_fast and any(
-            utils.is_unsafe_for_fail_fast(item) for item in chunk_results
-        ):
-          if abort_event:
-            abort_event.set()
-          for running_future in futures:
-            running_future.cancel()
+    for _, operand in utils.custom_genops_from_bytes(
+        pickle_bytes, end=effective_length
+    ):
+      if operand is not None:
+        operand_string = str(operand)
+        all_operands.add(operand_string)
+        if fail_fast and utils.is_unsafe_for_fail_fast(operand_string):
           break
-
     return all_operands
-  finally:
-    if shared_memory_block is not None:
-      shared_memory_block.close()
+
+  target_chunk_size = max(
+      constants.MIN_SIZE_FOR_CHUNKING, effective_length // num_workers
+  )
+  chunk_ranges = utils.partition_pickle_chunks(
+      pickle_bytes,
+      target_chunk_size,
+      end=effective_length,
+      include_memo=True,
+  )
+
+  all_operands = set()
+  abort_event = threading.Event() if fail_fast else None
+
+  with concurrent.futures.ThreadPoolExecutor(
+      max_workers=len(chunk_ranges)
+  ) as executor:
+    futures = [
+        executor.submit(
+            _scan_byte_slice,
+            pickle_bytes,
+            start_offset,
+            end_offset,
+            seed_stack,
+            bool(fail_fast),
+            abort_event,
+            seed_memo,
+        )
+        for start_offset, end_offset, seed_stack, seed_memo in chunk_ranges
+    ]
+    for future in concurrent.futures.as_completed(futures):
+      chunk_results = future.result()
+      all_operands.update(chunk_results)
+      if fail_fast and any(
+          utils.is_unsafe_for_fail_fast(item) for item in chunk_results
+      ):
+        if abort_event:
+          abort_event.set()
+        for running_future in futures:
+          running_future.cancel()
+        break
+
+  return all_operands
 
 
 def generate_ops(
@@ -309,9 +352,11 @@ def generate_ops(
     strings.
   """
   filtered_operands = set()
-  original_pos = None
-  if not isinstance(pickle_bytes, bytes):
-    original_pos = pickle_bytes.tell()
+  original_pos = (
+      None
+      if isinstance(pickle_bytes, (bytes, bytearray, memoryview, mmap.mmap))
+      else _get_stream_pos(pickle_bytes)
+  )
 
   try:
     try:
@@ -320,15 +365,17 @@ def generate_ops(
           continue
         operand_str = str(operand)
         filtered_operands.add(operand_str)
-        if fail_fast:
-          if utils.is_unsafe_for_fail_fast(operand_str):
-            break
+        if fail_fast and utils.is_unsafe_for_fail_fast(operand_str):
+          break
     except StopIteration:
       pass
     return filtered_operands
   finally:
     if original_pos is not None:
-      pickle_bytes.seek(original_pos)  # pyrefly: ignore[missing-attribute]
+      try:
+        pickle_bytes.seek(original_pos)  # pyrefly: ignore[missing-attribute]
+      except (OSError, AttributeError, io.UnsupportedOperation):
+        pass
 
 
 class SaferUnpickler(picklemagic.SafeUnpickler):
@@ -620,27 +667,34 @@ class SaferUnpickler(picklemagic.SafeUnpickler):
         isinstance(object_to_inspect, type)
         and issubclass(object_to_inspect, picklemagic.FakeClass)
     ):
-      target_type = (
-          object_to_inspect
-          if isinstance(object_to_inspect, type)
-          else type(object_to_inspect)
+      if isinstance(object_to_inspect, picklemagic.FakeClass):
+        module_name = object_to_inspect.__class__.__module__
+        attribute_name = object_to_inspect.__class__.__name__
+      else:
+        module_name = getattr(object_to_inspect, "__module__", "")
+        attribute_name = getattr(object_to_inspect, "__name__", "")
+
+      full_symbol_name = (
+          f"{module_name}.{attribute_name}"
+          if module_name and attribute_name
+          else (module_name or attribute_name)
       )
-      mod = getattr(target_type, "__module__", "")
-      sym = f"{mod}.{getattr(target_type, '__name__', '')}".strip(".")
       if (
-          not sym
-          or mod == "picklemagic"
-          or utils.matches_symbol_prefix_list(sym, config.get_deny_list())
+          not full_symbol_name
+          or module_name == "picklemagic"
+          or utils.matches_symbol_prefix_list(
+              full_symbol_name, config.get_deny_list()
+          )
       ):
         return True
 
-      if is_self_protected := utils.is_self_protected_symbol(sym):
+      if is_self_protected := utils.is_self_protected_symbol(full_symbol_name):
         return True
 
       if not is_self_protected and not utils.matches_symbol_prefix_list(
-          sym, config.get_allow_list()
+          full_symbol_name, config.get_allow_list()
       ):
-        cls_verdict = utils.classify_symbol(sym)
+        cls_verdict = utils.classify_symbol(full_symbol_name)
         if only_suspicious:
           if cls_verdict in (
               utils.Classification.UNSAFE,
@@ -1027,43 +1081,58 @@ def picklemagic_scan(
 def genops_scan(
     pickle_bytes: bytes | IO[bytes],
     pickle_file_path: Optional[str] = None,
-    shared_memory_name: Optional[str] = None,
     fail_fast: Optional[bool] = DEFAULT_FAIL_FAST,
     pickle_length: Optional[int] = None,
-    shm_name: Optional[str] = None,
 ) -> ScanResults:
   """Genops scan for malicious content in pickle files.
 
   Args:
     pickle_bytes: Pickle bytecode to scan.
     pickle_file_path: Optional path to the pickle file for streaming scan.
-    shared_memory_name: Optional name of the shared memory block.
     fail_fast: Whether to fail fast on first unsafe or suspicious match.
     pickle_length: Optional length of the pickle data in bytes.
-    shm_name: Deprecated alias for shared_memory_name.
 
   Returns:
     A ScanResults object.
   """
-  resolved_pickle_length = (
-      pickle_length if pickle_length is not None else len(pickle_bytes)  # pyrefly: ignore[bad-argument-type]
-  )
-  target_shared_memory_name = shared_memory_name or shm_name
-  if target_shared_memory_name:
-    genops_output = generate_ops_from_file(
-        "",
-        shared_memory_name=target_shared_memory_name,
-        pickle_length=resolved_pickle_length,
-        fail_fast=fail_fast,
-    )
-  elif pickle_file_path:
+  if pickle_file_path:
     genops_output = generate_ops_from_file(
         pickle_file_path,
+        pickle_length=pickle_length,
+        fail_fast=fail_fast,
+    )
+    return categorize_strings(genops_output)
+
+  resolved_pickle_length = _resolve_pickle_length(pickle_bytes, pickle_length)
+  if resolved_pickle_length >= constants.MIN_SIZE_FOR_CHUNKING:
+    if isinstance(pickle_bytes, (bytes, mmap.mmap)):
+      data_buffer = pickle_bytes
+    elif isinstance(pickle_bytes, (bytearray, memoryview)):
+      data_buffer = bytes(pickle_bytes)
+    elif isinstance(pickle_bytes, io.BytesIO):
+      cur_pos = pickle_bytes.tell()
+      full_bytes = pickle_bytes.getvalue()
+      data_buffer = full_bytes if cur_pos == 0 else full_bytes[cur_pos:]
+    else:
+      cur_pos = _get_stream_pos(pickle_bytes)
+      try:
+        data_buffer = pickle_bytes.read()
+      finally:
+        if cur_pos is not None:
+          try:
+            pickle_bytes.seek(cur_pos)
+          except (OSError, AttributeError, io.UnsupportedOperation):
+            pass
+
+    genops_output = generate_ops_from_file(
+        "",
         pickle_length=resolved_pickle_length,
         fail_fast=fail_fast,
+        data_buffer=data_buffer,
     )
   else:
     genops_output = generate_ops(pickle_bytes, fail_fast=fail_fast)
+
   results = categorize_strings(genops_output)
   return results
 
@@ -1108,7 +1177,6 @@ def apply_approach(
     scan_approach: Callable[..., ScanResults],
     pickle_bytes: bytes | IO[bytes],
     pickle_file_path: Optional[str] = None,
-    shm_name: Optional[str] = None,
     fail_fast: Optional[bool] = DEFAULT_FAIL_FAST,
     pickle_length: Optional[int] = None,
 ) -> Dict[str, int]:
@@ -1118,7 +1186,6 @@ def apply_approach(
     scan_approach: The scan approach to apply to the data.
     pickle_bytes: The data to scan.
     pickle_file_path: Optional path to the pickle file for streaming scan.
-    shm_name: Optional name of the shared memory block.
     fail_fast: Whether to fail fast on first unsafe or suspicious match.
     pickle_length: Optional length of the pickle data.
 
@@ -1129,7 +1196,6 @@ def apply_approach(
     results = scan_approach(
         pickle_bytes,
         pickle_file_path=pickle_file_path,
-        shm_name=shm_name,
         fail_fast=fail_fast,
         pickle_length=pickle_length,
     )
@@ -1481,79 +1547,26 @@ def _security_scan_internal(
 
   # Find actual start of valid pickle payload if it has leading garbage
   start_offset = 0
-  try:
-    current_pos = stream.tell()
-    stream.seek(0)
-    header_bytes = stream.read(1024)
-    stream.seek(current_pos)
-    is_archive = header_bytes.startswith(
-        (b"PK\x03\x04", b"BZh", b"\xfd7zXZ\x00", b"\x1f\x8b")
-    ) or (len(header_bytes) >= 262 and header_bytes[257:262] == b"ustar")
-    if not is_pickle and not is_archive:
-      start_offset = utils.find_pickle_start_offset(stream)
-    else:
-      start_offset = 0
-
-    if start_offset > 0:
-      stream.seek(start_offset)
-      pickle_length -= start_offset
-    else:
-      stream.seek(current_pos)
-  except (OSError, AttributeError, io.UnsupportedOperation):
-    pass
-
-  pickle_file_path = None
-  shm = None
-  shm_name = None
-
-  if pickle_length >= constants.MIN_SIZE_FOR_CHUNKING:
+  if not is_pickle:
     try:
-      shm = shared_memory.SharedMemory(create=True, size=pickle_length)
-      shm_name = shm.name
+      current_pos = stream.tell()
+      header_bytes = stream.read(262)
+      stream.seek(current_pos)
+      is_archive = header_bytes.startswith(
+          (b"PK\x03\x04", b"BZh", b"\xfd7zXZ\x00", b"\x1f\x8b")
+      ) or (len(header_bytes) >= 262 and header_bytes[257:262] == b"ustar")
+      if not is_archive:
+        start_offset = utils.find_pickle_start_offset(stream)
 
-      # Fast path for BytesIO, chunked fallback for other streams
-      if isinstance(stream, io.BytesIO):
-        shm.buf[:pickle_length] = stream.getbuffer()[  # pyrefly: ignore[unsupported-operation]
-            start_offset : start_offset + pickle_length
-        ]
+      if start_offset > 0:
+        stream.seek(current_pos + start_offset)
+        pickle_length -= current_pos + start_offset
       else:
-        offset = 0
-        current_pos = stream.tell()
-        stream.seek(start_offset)
-        try:
-          while True:
-            chunk = stream.read(1024 * 1024)
-            if not chunk:
-              break
-            shm.buf[offset : offset + len(chunk)] = chunk  # pyrefly: ignore[unsupported-operation]
-            offset += len(chunk)
-        finally:
-          stream.seek(current_pos)
-    except OSError:
-      # Fallback to tempfile with chunked buffering
-      with tempfile.NamedTemporaryFile(delete=False) as temp_file:
-        pickle_file_path = temp_file.name
-        if isinstance(stream, io.BytesIO):
-          temp_file.write(
-              stream.getbuffer()[start_offset : start_offset + pickle_length]
-          )
-        else:
-          current_pos = stream.tell()
-          stream.seek(start_offset)
-          try:
-            while True:
-              chunk = stream.read(1024 * 1024)
-              if not chunk:
-                break
-              temp_file.write(chunk)
-          finally:
-            stream.seek(current_pos)
+        stream.seek(current_pos)
+    except (OSError, AttributeError, io.UnsupportedOperation):
+      pass
 
-  original_stream_pos = None
-  try:
-    original_stream_pos = stream.tell()
-  except (OSError, AttributeError, io.UnsupportedOperation):
-    pass
+  original_stream_pos = _get_stream_pos(stream)
 
   try:
     final_scores = {"unsafe": 0, "suspicious": 0, "unknown": 0}
@@ -1561,11 +1574,10 @@ def _security_scan_internal(
       scores = apply_approach(
           scan_approach,
           stream,
-          pickle_file_path,
-          shm_name,
           fail_fast=fail_fast,
           pickle_length=pickle_length,
       )
+
       # Restore stream pointer after each scan approach to prevent EOF errors
       if original_stream_pos is not None and hasattr(stream, "seek"):
         try:
@@ -1576,6 +1588,7 @@ def _security_scan_internal(
       if scores["unsafe"] > 0 or scores["suspicious"] > 0:
         return scores
       final_scores["unknown"] += scores["unknown"]
+
     return final_scores
   finally:
     # Ensure stream is seeked back before exiting so load_func gets
@@ -1585,12 +1598,6 @@ def _security_scan_internal(
         stream.seek(original_stream_pos)
       except (OSError, AttributeError, io.UnsupportedOperation):
         logging.debug("Failed to restore stream pointer before exiting scan.")
-
-    if shm:
-      shm.close()
-      shm.unlink()
-    if pickle_file_path:
-      os.remove(pickle_file_path)
 
 
 _ORIG_METHODS_BEFORE_HOOKING = {}
