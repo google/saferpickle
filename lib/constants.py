@@ -17,8 +17,8 @@
 import os
 import pickletools
 import string
+import types
 from typing import FrozenSet
-import immutabledict
 
 # List of globals below can be updated if additional modules are identified
 # Note: The strings in this list should be in the format of
@@ -42,7 +42,6 @@ SUSPICIOUS_STRINGS: FrozenSet[str] = frozenset([
     "__subclasses__",
     "attr",
     "builtins",
-    "cgitb.lookup",
     "cloudpickle",
     "cloudpickle.cloudpickle",
     "fnmatch",
@@ -50,7 +49,6 @@ SUSPICIOUS_STRINGS: FrozenSet[str] = frozenset([
     "glob",
     "hasattr",
     "itertools",
-    "lib2to3.fixer_util.attr_chain",
     "linecache",
     "operator",
     "pathlib",
@@ -59,16 +57,14 @@ SUSPICIOUS_STRINGS: FrozenSet[str] = frozenset([
     "setattr",
     "shlex",
     "str.join",
-    "sympy.utilities.lambdify.lambdify",
     "tempfile",
-    "test.support.get_attribute",
     "xml.etree",
-    "xmlrpc.server.resolve_dotted_attribute",
 ])
 
 UNSAFE_STRINGS: FrozenSet[str] = frozenset([
     "CreateThread",
     "Crypto",
+    "PIL.ImageMath",
     "RtlMoveMemory",
     "VirtualAlloc",
     "WaitForSingleObject",
@@ -85,7 +81,6 @@ UNSAFE_STRINGS: FrozenSet[str] = frozenset([
     "_codecs.decode",
     "aiohttp",
     "asyncio",
-    "base64",
     "base64.b64decode",
     "base64.decode",
     "bdb",
@@ -97,6 +92,7 @@ UNSAFE_STRINGS: FrozenSet[str] = frozenset([
     "builtins.execfile",
     "builtins.open",
     "cProfile",
+    "cgitb.lookup",
     "cloudpickle.load",
     "cloudpickle.loads",
     "code.InteractiveConsole",
@@ -116,13 +112,18 @@ UNSAFE_STRINGS: FrozenSet[str] = frozenset([
     "eval",
     "exec",
     "fileinput",
+    "gensim.utils",
     "get_type_hints",
     "gzip.decompress",
     "httplib",
     "importlib",
     "io.open",
     "itemgetter",
-    "joblib",
+    "joblib.load",
+    "joblib.memory",
+    "joblib.numpy_pickle.NumpyArrayWrapper",
+    "keras.saving.pickle_utils",
+    "lib2to3.fixer_util.attr_chain",
     "load_module",
     "lzma.open",
     "malicious",
@@ -156,6 +157,7 @@ UNSAFE_STRINGS: FrozenSet[str] = frozenset([
     "pickle.load",
     "pickle.loads",
     "picklemagic",
+    "pip",
     "posix.exec",
     "posix.kill",
     "posix.open",
@@ -171,8 +173,20 @@ UNSAFE_STRINGS: FrozenSet[str] = frozenset([
     "pty.fork",
     "pycrypto",
     "pydoc.locate",
+    "pydoc.pager",
+    "pydoc.pipe_pager",
     "pydoc.pipepager",
     "pydoc.replace",
+    "pydoc.tempfile_pager",
+    "pydoc.ttypager",
+    "_osx_support",
+    "_osx_support._read_output",
+    "sympy.parsing",
+    "sympy.utilities.lambdify.lambdify",
+    "test.support",
+    "test.support.get_attribute",
+    "test.support.run_code",
+    "theano.gof.cmodule",
     "pywin32_system32",
     "pyyaml",
     "requests",
@@ -204,6 +218,7 @@ UNSAFE_STRINGS: FrozenSet[str] = frozenset([
     "torch.hub",
     "torch.jit.load",
     "torch.load",
+    "torch.package",
     "torch.unsupported_tensor_ops",
     "torch.utils.collect_env",
     "torch.utils.cpp_extension",
@@ -219,6 +234,7 @@ UNSAFE_STRINGS: FrozenSet[str] = frozenset([
     "webbrowser",
     "winapi",
     "winreg",
+    "xmlrpc.server.resolve_dotted_attribute",
     "zlib",
 ])
 
@@ -230,6 +246,7 @@ UNSAFE_ROOT_PACKAGES: FrozenSet[str] = frozenset([
     "__main__",
     "_codecs",
     "_ctypes",
+    "_osx_support",
     "_pickle_copy",
     "_posixsubprocess",
     "antigravity",
@@ -249,6 +266,7 @@ UNSAFE_ROOT_PACKAGES: FrozenSet[str] = frozenset([
     "ctypes",
     "dill",
     "dill_copy",
+    "distutils",
     "doctest",
     "ensurepip",
     "faulthandler",
@@ -256,8 +274,8 @@ UNSAFE_ROOT_PACKAGES: FrozenSet[str] = frozenset([
     "httplib",
     "idlelib",
     "imp",
+    "imaplib",
     "importlib",
-    "joblib",
     "joblib_copy",
     "lib2to3",
     "logging",
@@ -282,6 +300,7 @@ UNSAFE_ROOT_PACKAGES: FrozenSet[str] = frozenset([
     "subprocess",
     "sys",
     "sysconfig",
+    "test",
     "tkinter",
     "torch_copy",
     "trace",
@@ -326,41 +345,12 @@ SAFE_STRINGS: FrozenSet[str] = frozenset([
 ERROR_STRING = string.Template(
     "ERROR: Loading this pickle file may result in code execution."
     " Only proceed if you trust the file.\nClassification: $classification\nIf"
-    " this file was flagged inappropriately, please contact"
-    " ise-static-analysis@ with details."
+    " this file was flagged inappropriately, please open an issue at"
+    " https://github.com/google/saferpickle/issues with details."
 )
 
 # Combination of all the globals for exclusion to identify unknown method calls
 ALL_STRINGS = UNSAFE_STRINGS.union(SUSPICIOUS_STRINGS).union(SAFE_STRINGS)
-
-NON_PICKLE_MAGIC_BYTES = (
-    b"\x7fELF",  # ELF executable
-    b"MZ",  # PE executable
-    b"\x93NUMPY",  # numpy npy
-    b"\x89PNG\r\n\x1a\n",  # png
-    b"\xff\xd8\xff",  # jpeg
-    b"GIF8",  # gif
-    b"II*\x00",  # tiff little-endian
-    b"MM\x00*",  # tiff big-endian
-    b"%PDF-",  # pdf
-    b"\x00asm",  # wasm
-    b"\xca\xfe\xba\xbe",  # Java class
-    b"\xfe\xed\xfa\xce",  # Mach-O 32-bit big-endian
-    b"\xce\xfa\xed\xfe",  # Mach-O 32-bit little-endian
-    b"\xfe\xed\xfa\xcf",  # Mach-O 64-bit big-endian
-    b"\xcf\xfa\xed\xfe",  # Mach-O 64-bit little-endian
-    b"dex\n",  # dex
-    b"SQLite format 3",  # sqlite
-    b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1",  # OLE Compound File (DOC, XLS, PPT)
-    b"BM",  # BMP Image
-    b"FWS",  # Uncompressed Flash SWF
-    b"CWS",  # Compressed Flash SWF
-    b"MSCF",  # Microsoft Cabinet File
-    b"dey\n",  # Dalvik ODEX
-    b"\x1bLua",  # Lua bytecode
-    b"\x30\x82",  # DER certificate
-    b"L\x00\x00\x00",  # Windows Shortcut (LNK)
-)
 
 CODE_KEYWORDS = (
     b"import ",  # Javascript/Python
@@ -401,27 +391,16 @@ TEXT_BASED_PREFIXES = (
     b"Windows Registry Editor",  # Windows Registry file
 )
 
-
-# These are substrings of opcodes that declare strings often before
-# REDUCE, BUILD, and MEMOIZE opcodes
-OPCODE_SUBSTRS_THAT_DECLARE_STRINGS: FrozenSet[str] = frozenset([
-    "GLOBAL",
-    "INST",
-    "UNICODE",
-    "STRING",
-])
-
-OPCODES_INFO = immutabledict.immutabledict(
+OPCODES_INFO = types.MappingProxyType(
     {opcode.code: opcode for opcode in pickletools.opcodes}
 )
 # Integer-based lookup for opcodes for faster lookups
-OPCODES_INFO_INT = immutabledict.immutabledict(
+OPCODES_INFO_INT = types.MappingProxyType(
     {ord(opcode.code): opcode for opcode in pickletools.opcodes}
 )
 
 MAX_BYTES_TO_CHECK = 128
 MIN_SIZE_FOR_CHUNKING = 30 * 1024 * 1024  # 30 MB
-CHUNK_OVERLAP = 512  # Bytes to overlap between chunks
 
 # Tiers for dynamically scaling the number of workers based on file size.
 # Each tuple is (file_size_threshold, num_workers). The threshold is the upper
@@ -441,23 +420,59 @@ MAX_NUM_CHUNKS = (os.cpu_count() or 1) // 2
 # High score to indicate definite unsafety due to a detected zip slip.
 HIGH_SEVERITY_ZIPSLIP = 1337
 
+MAX_ARCHIVE_RECURSION_DEPTH: int = 10
+MAX_ARCHIVE_DECOMPRESSED_BYTES: int = 512 * 1024 * 1024  # 512 MB
 
-OPCODES_4BYTE_LEN = (b"B",)
-OPCODES_8BYTE_LEN = (b"\x8e", b"\x96")
-OPCODES_1BYTE_LEN = (b"C",)
-LENGTH_PREFIXED_OPCODES = (
-    OPCODES_4BYTE_LEN + OPCODES_8BYTE_LEN + OPCODES_1BYTE_LEN
-)
-
-PAYLOAD_PREFIX_SIZES = immutabledict.immutabledict({
+PAYLOAD_PREFIX_SIZES = types.MappingProxyType({
     "SHORT_BINBYTES": 1,
     "SHORT_BINUNICODE": 1,
+    "SHORT_BINSTRING": 1,
     "BINBYTES": 4,
     "BINUNICODE": 4,
+    "BINSTRING": 4,
     "BINBYTES8": 8,
     "BINUNICODE8": 8,
     "BYTEARRAY8": 8,
 })
+
+OPCODE_STRIDE_GROUPS: tuple[tuple[int, FrozenSet[int]], ...] = (
+    (
+        1,
+        frozenset({
+            0x28,
+            0x29,
+            0x2E,
+            0x30,
+            0x31,
+            0x32,
+            0x4E,
+            0x7D,
+            0x5D,
+            0x61,
+            0x65,
+            0x73,
+            0x75,
+            0x74,
+            0x6C,
+            0x64,
+            0x85,
+            0x86,
+            0x87,
+            0x88,
+            0x89,
+            0x8F,
+            0x90,
+            0x91,
+            0x94,
+            0x97,
+            0x98,
+        }),
+    ),
+    (2, frozenset({0x80, 0x4B, 0x68, 0x71, 0x82})),
+    (3, frozenset({0x4D, 0x83})),
+    (5, frozenset({0x4A, 0x6A, 0x72, 0x84})),
+    (9, frozenset({0x47, 0x95})),
+)
 
 APPROVED_ROOT_PACKAGES: FrozenSet[str] = frozenset({
     "PIL",
@@ -524,11 +539,36 @@ SAFE_METADATA_ATTRIBUTES: FrozenSet[str] = frozenset({
     "__qualname__",
 })
 
+SAFE_DUNDER_RECONSTRUCTORS: FrozenSet[str] = frozenset({
+    "__newobj__",
+    "__newobj_ex__",
+})
+
+INTROSPECTION_ATTRIBUTE_PREFIXES: tuple[str, ...] = (
+    "f_",
+    "gi_",
+    "cr_",
+    "ag_",
+    "tb_",
+    "co_",
+    "func_",
+)
+
+INTROSPECTION_ATTRIBUTES: FrozenSet[str] = frozenset({
+    "_frame",
+    "cell_contents",
+    "mro",
+})
+
 ALL_BASE_CLASS_SPECS: tuple[str, ...] = (
     "torch.nn.Module",
     "torch.Tensor",
     "torch.nn.parameter.Parameter",
     "torch.dtype",
+    "torch.UntypedStorage",
+    "torch.storage.TypedStorage",
+    "torch.storage._StorageBase",
+    "torch.storage._LegacyStorage",
     "flax.linen.Module",
     "flax.struct.dataclass",
     "jax.Array",
@@ -545,6 +585,7 @@ ALL_BASE_CLASS_SPECS: tuple[str, ...] = (
     "datetime.time",
     "datetime.timedelta",
     "datetime.timezone",
+    "decimal.Decimal",
     "enum.Enum",
     "enum.IntEnum",
     "enum.Flag",
@@ -554,9 +595,11 @@ ALL_BASE_CLASS_SPECS: tuple[str, ...] = (
     "collections.Counter",
     "collections.deque",
     "collections.UserDict",
+    "uuid.UUID",
 )
 
 SAFE_BUILTIN_TYPES: FrozenSet[str] = frozenset({
+    "Ellipsis",
     "NotImplemented",
     "bool",
     "bytearray",
@@ -606,21 +649,34 @@ UNSAFE_INLINE_PATTERNS: FrozenSet[str] = frozenset({
     "compile(",
     "os.system(",
     "os.popen(",
+    "os.environ",
     "posix.system(",
     "posix.popen(",
     ".system(",
     ".popen(",
-    "import os",
-    "import posix",
-    "import subprocess",
-    "import requests",
-    "import urllib",
-    "import socket",
-    ".requests.",
-    ".urllib.",
-    ".socket.",
-    ".http.",
-    ".subprocess.",
+    "subprocess.popen(",
+    "subprocess.run(",
+    "subprocess.call(",
+    "subprocess.check_output(",
+    "import os;",
+    "import os ",
+    "from os import ",
+    "import posix;",
+    "from posix import ",
+    "import subprocess;",
+    "from subprocess import ",
+    "import pty;",
+    "from pty import ",
+    "import ctypes;",
+    "from ctypes import ",
+    "import runpy;",
+    "from runpy import ",
+    "import requests;",
+    "from requests import ",
+    "import urllib;",
+    "from urllib import ",
+    "import socket;",
+    "from socket import ",
 })
 
 DANGEROUS_EXEC_MODULES: FrozenSet[str] = frozenset({
@@ -651,6 +707,7 @@ DANGEROUS_PACKAGE_MEMBERS: FrozenSet[str] = frozenset({
     "_lanscan_getnode",
     "_netstat_getnode",
     "_popen",
+    "_read_output",
     "_run_entry_point",
     "_unix_getnode",
     "_windll_getnode",
@@ -685,7 +742,9 @@ DANGEROUS_PACKAGE_MEMBERS: FrozenSet[str] = frozenset({
     "make_dataclass",
     "methodcaller",
     "pager",
+    "pipe_pager",
     "pipepager",
+    "plainpager",
     "popen",
     "read_csv",
     "read_feather",
@@ -698,6 +757,9 @@ DANGEROUS_PACKAGE_MEMBERS: FrozenSet[str] = frozenset({
     "read_sql",
     "read_table",
     "read_xml",
+    "run_code",
+    "run_module",
+    "run_path",
     "safeimport",
     "save",
     "savemat",
@@ -708,9 +770,11 @@ DANGEROUS_PACKAGE_MEMBERS: FrozenSet[str] = frozenset({
     "spawnv_passfds",
     "sympify",
     "system",
+    "tempfile_pager",
     "tempfilepager",
     "testfile",
     "tofile",
+    "ttypager",
 })
 
 APPROVED_RECONSTRUCTOR_FUNCTIONS: FrozenSet[str] = frozenset({
@@ -718,6 +782,7 @@ APPROVED_RECONSTRUCTOR_FUNCTIONS: FrozenSet[str] = frozenset({
     "__newobj__",
     "__newobj_ex__",
     "_from_backing_data",
+    "_frombuffer",
     "_new_Index",
     "_pickle_ufunc",
     "_rebuild_device_tensor_from_numpy",
@@ -725,12 +790,12 @@ APPROVED_RECONSTRUCTOR_FUNCTIONS: FrozenSet[str] = frozenset({
     "_rebuild_qtensor",
     "_rebuild_tensor",
     "_rebuild_tensor_v2",
+    "_rebuild_tensor_v3",
     "_reconstruct",
     "_reconstructor",
     "_unpickle_block",
     "_unpickle_named_sharding",
     "dataclass",
-    "from_buffer",
     "new_block",
     "scalar",
     "unpickle_pspec",
@@ -797,22 +862,59 @@ INTERNAL_SANDBOX_SAFE_SYMBOLS: FrozenSet[str] = (
     })
 )
 
-SAFE_DUNDER_RECONSTRUCTORS: FrozenSet[str] = frozenset({
-    "__newobj__",
-    "__newobj_ex__",
+IMPORT_OPCODES: FrozenSet[str] = frozenset({
+    "GLOBAL",
+    "STACK_GLOBAL",
+    "INST",
+    "EXT1",
+    "EXT2",
+    "EXT4",
+    "PERSID",
+    "BINPERSID",
 })
 
-INTROSPECTION_ATTRIBUTE_PREFIXES: tuple[str, ...] = (
-    "func_",
-    "f_",
-    "gi_",
-    "cr_",
-    "ag_",
-    "co_",
-)
+DANGEROUS_BUILD_STATE_KEYS: FrozenSet[str] = frozenset({
+    "__setstate__",
+    "__getstate__",
+    "__reduce__",
+    "__reduce_ex__",
+    "__getattr__",
+    "__getattribute__",
+    "__setattr__",
+    "__delattr__",
+    "__del__",
+    "__call__",
+    "__setitem__",
+    "__getitem__",
+    "__delitem__",
+    "__hash__",
+    "__eq__",
+    "__ne__",
+    "__lt__",
+    "__le__",
+    "__gt__",
+    "__ge__",
+    "__enter__",
+    "__exit__",
+    "__class__",
+    "__dict__",
+    "__bases__",
+    "__mro__",
+    "__subclasses__",
+    "__init_subclass__",
+    "__new__",
+    "__init__",
+    "append",
+    "extend",
+    "add",
+    "update",
+})
 
-INTROSPECTION_ATTRIBUTES: FrozenSet[str] = frozenset({
-    "cell_contents",
-    "tb_frame",
-    "tb_next",
+FAKE_CLASS_INTERNAL_ATTRIBUTES: FrozenSet[str] = frozenset({
+    "_args",
+    "_kwargs",
+    "_new_args",
+    "_new_kwargs",
+    "_list_items",
+    "_setstate_args",
 })
