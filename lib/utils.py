@@ -16,6 +16,8 @@
 
 import ast
 import bz2
+import collections
+import dataclasses
 import enum
 import functools
 import gzip
@@ -42,6 +44,7 @@ from typing import (
     FrozenSet,
     Generator,
     IO,
+    Iterable,
     Iterator,
     Mapping,
     Optional,
@@ -159,13 +162,13 @@ def copy_module(original_name: str, new_name: str) -> types.ModuleType | None:
   except IOError:
     if original_name in sys.modules:
       logging.debug(
-          "FileError during import of %s, but module is in sys.modules",
+          "I/O error during import of %s, but module is in sys.modules",
           original_name,
       )
       original_module = sys.modules[original_name]
     else:
       logging.debug(
-          "Failed to import module %s due to FileError and module not in"
+          "Failed to import module %s due to I/O error and module not in"
           " sys.modules",
           original_name,
       )
@@ -948,62 +951,128 @@ def is_sys_executable_patched() -> bool:
   return False
 
 
-@functools.lru_cache(maxsize=1)
-def get_all_active_approved_base_classes() -> tuple[type[Any], ...]:
-  """Resolves active approved base classes currently loaded in `sys.modules`.
-
-  Combines safe Python builtin primitive and container types with any class
-  specifications in `constants.ALL_BASE_CLASS_SPECS` that are currently
-  loaded in `sys.modules`, without importing new modules.
-
-  Returns:
-    A tuple of resolved `type` objects representing approved base classes.
-  """
+@functools.lru_cache(maxsize=32)
+def _resolve_approved_base_classes(
+    loaded_specs: tuple[str, ...],
+) -> tuple[type[Any], ...]:
+  """Resolves approved base classes for the given loaded module specs."""
   bases = (dict, list, tuple, set, frozenset, int, float, str, bytes, bool)
   resolved = tuple(
       cls
-      for spec in constants.ALL_BASE_CLASS_SPECS
+      for spec in loaded_specs
       if isinstance(cls := _resolve_dotted_path_in_sys_modules(spec), type)
   )
   return bases + resolved
 
 
-def _find_module_source_file(mod_path: str) -> str | None:
-  """Locates a module's `.py` source file on disk without importing submodules.
+def get_all_active_approved_base_classes() -> tuple[type[Any], ...]:
+  """Resolves active approved base classes currently loaded in `sys.modules`.
 
-  Walks backward from the most specific module prefix in `sys.modules` and
-  resolves the remaining relative path segments against the loaded package's
-  `__path__` directories.
+  Combines safe Python builtin primitive and container types with any class
+  specifications in `constants.ALL_BASE_CLASS_SPECS` whose owning modules are
+  currently loaded in `sys.modules`, without importing new modules.
+
+  Returns:
+    A tuple of resolved `type` objects representing approved base classes.
+  """
+  loaded_specs = tuple(
+      spec
+      for spec in constants.ALL_BASE_CLASS_SPECS
+      if spec.rsplit(".", 1)[0] in sys.modules
+  )
+  return _resolve_approved_base_classes(loaded_specs)
+
+
+@functools.lru_cache(maxsize=256)
+def _find_root_package_spec_info(
+    root_package: str,
+) -> tuple[bool, tuple[str, ...], str | None]:
+  """Resolves and caches `find_spec` metadata for an unimported root package."""
+  if not root_package or not root_package.isidentifier():
+    return False, (), None
+
+  try:
+    spec = importlib.util.find_spec(root_package)
+  except (ImportError, AttributeError, ValueError):
+    return False, (), None
+
+  if spec is None:
+    return False, (), None
+
+  search_locations = tuple(spec.submodule_search_locations or ())
+  origin_file = (
+      spec.origin
+      if isinstance(spec.origin, str) and os.path.isfile(spec.origin)
+      else None
+  )
+  return True, search_locations, origin_file
+
+
+def _find_module_source_file(
+    mod_path: str, *, compiled: bool = False
+) -> str | None:
+  """Locates a module's `.py` or extension file on disk without importing it.
 
   Args:
     mod_path: Dotted module path (e.g., `'torch.nn.modules.linear'`).
+    compiled: Whether to search for a compiled extension instead of `.py`.
 
   Returns:
-    The filesystem path to the module's `.py` or `__init__.py` file if found
-    on disk, or None otherwise.
+    The filesystem path to the module file if found on disk, or None otherwise.
   """
   parts = mod_path.split(".")
+  if not mod_path or not all(part.isidentifier() for part in parts):
+    return None
+
+  suffixes = constants.EXTENSION_SUFFIXES if compiled else (".py",)
+  base_dirs: tuple[str, ...] | None = None
+  rel_parts: list[str] = []
+
   for idx in range(len(parts), 0, -1):
     loaded_mod = sys.modules.get(".".join(parts[:idx]))
     if (
         idx == len(parts)
         and isinstance(mod_file := getattr(loaded_mod, "__file__", None), str)
+        and mod_file.endswith(suffixes)
         and os.path.isfile(mod_file)
     ):
       return mod_file
 
     if mod_paths := getattr(loaded_mod, "__path__", None):
-      for base_dir in mod_paths:
-        candidate = os.path.join(base_dir, *parts[idx:])
-        for path in (f"{candidate}.py", os.path.join(candidate, "__init__.py")):
-          if os.path.isfile(path):
-            return path
+      base_dirs = tuple(mod_paths)
+      rel_parts = parts[idx:]
       break
+
+  if base_dirs is None:
+    is_installed, base_dirs, origin_file = _find_root_package_spec_info(
+        parts[0]
+    )
+    if not is_installed:
+      return None
+    if len(parts) == 1 and origin_file and origin_file.endswith(suffixes):
+      return origin_file
+    rel_parts = parts[1:]
+
+  for base_dir in base_dirs:
+    candidate = os.path.join(base_dir, *rel_parts) if rel_parts else base_dir
+    if compiled:
+      exts = constants.EXTENSION_SUFFIXES if rel_parts else ()
+      candidates = tuple(f"{candidate}{ext}" for ext in exts)
+    elif rel_parts:
+      candidates = (f"{candidate}.py", os.path.join(candidate, "__init__.py"))
+    else:
+      candidates = (os.path.join(candidate, "__init__.py"),)
+
+    for path in candidates:
+      if os.path.isfile(path):
+        return path
 
   return None
 
 
-def _ast_expr_to_dotted_name(expr: ast.AST, import_map: dict[str, str]) -> str:
+def _ast_expr_to_dotted_name(
+    expr: ast.AST, import_map: Mapping[str, str]
+) -> str:
   """Resolves an AST expression node into a fully qualified dotted string.
 
   Reconstructs dotted names from `ast.Name`, `ast.Attribute`, `ast.Call`, and
@@ -1031,82 +1100,372 @@ def _ast_expr_to_dotted_name(expr: ast.AST, import_map: dict[str, str]) -> str:
   return ""
 
 
-def _code_object_has_dangerous_names(
-    code_object: types.CodeType, visited_code_ids: set[int]
+def _is_compiled_callable(obj: Any) -> bool:
+  """Checks whether `obj` is a built-in C or Cython callable/descriptor."""
+  if isinstance(obj, constants.COMPILED_CALLABLE_TYPES):
+    return True
+  obj_type = type(obj)
+  if obj_type.__name__.startswith("cython_function_or_method"):
+    return True
+  type_root = (getattr(obj_type, "__module__", "") or "").split(".")[0]
+  is_non_heap_c_type = not bool(
+      getattr(obj_type, "__flags__", constants.PY_TPFLAGS_HEAPTYPE)
+      & constants.PY_TPFLAGS_HEAPTYPE
+  )
+  return (
+      is_non_heap_c_type
+      and type_root in constants.APPROVED_ROOT_PACKAGES
+      and type_root not in constants.RESTRICTED_APPROVED_ROOTS
+  )
+
+
+def _is_reconstructor_name(symbol_name: str) -> bool:
+  """Checks whether `symbol_name` matches an approved reconstructor identifier."""
+  symbol_lower = symbol_name.lower()
+  return symbol_name in constants.APPROVED_RECONSTRUCTOR_FUNCTIONS or any(
+      marker in symbol_lower for marker in constants.RECONSTRUCTOR_NAME_MARKERS
+  )
+
+
+def _collect_referenced_code_names(
+    code_object: types.CodeType,
+) -> frozenset[str]:
+  """Collects `co_names` across `code_object` and nested `CodeType` constants."""
+  referenced_names: set[str] = set()
+  code_stack = [code_object]
+  while code_stack:
+    cur_code = code_stack.pop()
+    referenced_names.update(cur_code.co_names)
+    for const in cur_code.co_consts:
+      if isinstance(const, types.CodeType):
+        code_stack.append(const)
+
+  return frozenset(referenced_names)
+
+
+def _seed_bytecode_worklist(
+    unwrapped: types.FunctionType,
+    referenced_names: frozenset[str],
+    owner_ancestors: Sequence[type[Any]],
+) -> collections.deque[tuple[Any, str, Sequence[type[Any]]]]:
+  """Seeds the bytecode inspection worklist from globals, closures, and MRO."""
+  worklist: collections.deque[tuple[Any, str, Sequence[type[Any]]]] = (
+      collections.deque()
+  )
+  fn_globals = getattr(unwrapped, "__globals__", None)
+  for name in referenced_names:
+    if isinstance(fn_globals, Mapping) and name in fn_globals:
+      worklist.append((fn_globals[name], "", owner_ancestors))
+    for anc in owner_ancestors:
+      member = anc.__dict__.get(name)
+      if member is None:
+        continue
+      anc_mod = getattr(anc, "__module__", "") or ""
+      if isinstance(member, property):
+        for accessor in (member.fget, member.fset, member.fdel):
+          if accessor is not None:
+            worklist.append((accessor, anc_mod, owner_ancestors))
+      else:
+        worklist.append((member, anc_mod, owner_ancestors))
+
+  for cell in getattr(unwrapped, "__closure__", None) or ():
+    try:
+      worklist.append((cell.cell_contents, "", owner_ancestors))
+    except ValueError:
+      continue
+
+  defaults = tuple(getattr(unwrapped, "__defaults__", None) or ()) + tuple(
+      (getattr(unwrapped, "__kwdefaults__", None) or {}).values()
+  )
+  for default_val in defaults:
+    worklist.append((default_val, "", owner_ancestors))
+
+  return worklist
+
+
+def _is_dangerous_referenced_module(
+    module_obj: types.ModuleType,
+    referenced_names: frozenset[str],
+    *,
+    is_restricted: bool,
 ) -> bool:
-  """Checks whether a bytecode object references any dangerous global names.
+  """Checks whether a referenced `ModuleType` exposes dangerous attributes."""
+  mod_name = getattr(module_obj, "__name__", "") or ""
+  mod_root = mod_name.split(".")[0]
+  return (
+      mod_root in constants.UNSAFE_ROOT_PACKAGES
+      or _is_unsafe_class_path(mod_name)
+      or mod_name in constants.SUSPICIOUS_STRINGS
+      or (
+          is_restricted
+          and mod_root not in constants.SAFE_RESTRICTED_STDLIB_ROOTS
+      )
+      or any(
+          _is_unsafe_class_path(f"{mod_name}.{attr}")
+          or f"{mod_name}.{attr}" in constants.SUSPICIOUS_STRINGS
+          for attr in referenced_names
+      )
+  )
 
-  Inspects `code_object.co_names` and recursively traverses nested code
-  objects in `code_object.co_consts` to detect references to symbols in
-  `constants.DANGEROUS_CODE_NAMES`.
 
-  Args:
-    code_object: The Python `CodeType` object to inspect.
-    visited_code_ids: Set of already-visited `id(code_object)` values used to
-      prevent cycles.
-
-  Returns:
-    True if `code_object` or any nested code constant references a dangerous
-    name, or False otherwise.
-  """
-  if id(code_object) in visited_code_ids:
+def _inspect_referenced_class(
+    target_cls: type[Any],
+    target_mod: str,
+    target_ancs: Sequence[type[Any]],
+    referenced_names: frozenset[str],
+    approved_bases: tuple[type[Any], ...],
+    seen_ids: set[Any],
+    worklist: collections.deque[tuple[Any, str, Sequence[type[Any]]]],
+) -> bool:
+  """Checks a referenced helper `type` MRO and enqueues relevant class members."""
+  target_root = target_mod.split(".")[0] if target_mod else ""
+  if (
+      (target_root in ("builtins", "__builtin__") and target_cls is not type)
+      or issubclass(target_cls, BaseException)
+      or target_cls in approved_bases
+      or target_cls in target_ancs
+      or target_mod == "collections.abc"
+  ):
     return False
-  visited_code_ids.add(id(code_object))
+  if target_root not in constants.APPROVED_ROOT_PACKAGES:
+    return True
 
-  if any(
-      name in constants.DANGEROUS_CODE_NAMES for name in code_object.co_names
+  cls_ancs = tuple(
+      anc
+      for anc in target_cls.__mro__
+      if anc is not object and anc not in approved_bases
+  )
+  for cls_anc in cls_ancs:
+    cls_mod = getattr(cls_anc, "__module__", "") or target_mod
+    if ("anc", id(cls_anc)) not in seen_ids:
+      seen_ids.add(("anc", id(cls_anc)))
+      cls_qual = getattr(cls_anc, "__qualname__", cls_anc.__name__)
+      if _is_unsafe_class_path(f"{cls_mod}.{cls_qual}"):
+        return True
+    for member_name, member in cls_anc.__dict__.items():
+      is_relevant = (
+          member_name in referenced_names
+          or member_name in constants.UNPICKLE_LIFECYCLE_HOOKS
+          or member_name == "__call__"
+      )
+      member_key = ("mem", id(cls_anc), member_name)
+      if is_relevant and member_key not in seen_ids:
+        seen_ids.add(member_key)
+        if isinstance(member, property):
+          for accessor in (member.fget, member.fset, member.fdel):
+            if accessor is not None:
+              worklist.append((accessor, cls_mod, cls_ancs))
+        else:
+          worklist.append((member, cls_mod, cls_ancs))
+
+  return False
+
+
+def _callable_has_dangerous_bytecode(
+    func: Any,
+    *,
+    owner_ancestors: Sequence[type[Any]] = (),
+    is_restricted: bool = False,
+    require_setattr: bool = False,
+    depth: int = 0,
+    visited_ids: set[Any] | None = None,
+) -> bool:
+  """Checks a Python function's bytecode, globals, closures, and helpers."""
+  if isinstance(func, (staticmethod, classmethod)):
+    func = func.__func__
+  try:
+    unwrapped = inspect.unwrap(func)
+  except (TypeError, ValueError):
+    unwrapped = func
+
+  code_object = getattr(unwrapped, "__code__", None)
+  if not isinstance(unwrapped, types.FunctionType) or not isinstance(
+      code_object, types.CodeType
   ):
     return True
 
-  return any(
-      isinstance(const, types.CodeType)
-      and _code_object_has_dangerous_names(const, visited_code_ids)
-      for const in code_object.co_consts
+  referenced_names = _collect_referenced_code_names(code_object)
+  if referenced_names & constants.DANGEROUS_CODE_NAMES:
+    return True
+  if require_setattr and not ({"object", "__setattr__"} <= referenced_names):
+    return True
+
+  approved_bases = get_all_active_approved_base_classes()
+  seen_ids = visited_ids if visited_ids is not None else {id(unwrapped)}
+  worklist = _seed_bytecode_worklist(
+      unwrapped, referenced_names, owner_ancestors
   )
 
+  while worklist:
+    target, fallback_mod, target_ancs = worklist.popleft()
+    if isinstance(target, (staticmethod, classmethod)):
+      target = target.__func__
+    try:
+      target_unwrapped = inspect.unwrap(target)
+    except (TypeError, ValueError):
+      target_unwrapped = target
 
-def _is_safe_approved_root_function(
-    target_callable: Any, symbol_name: str, module_path: str
-) -> bool:
-  """Verifies whether a callable in an approved root is a safe reconstructor.
+    if isinstance(target_unwrapped, types.ModuleType):
+      if _is_dangerous_referenced_module(
+          target_unwrapped, referenced_names, is_restricted=is_restricted
+      ):
+        return True
+      continue
 
-  Checks whether `symbol_name` matches known reconstructor names or markers
-  in an approved package root, unwraps decorators, and inspects the
-  underlying bytecode (`__code__`) to ensure no dangerous globals or builtins
-  are used.
+    if not (callable(target_unwrapped) or isinstance(target_unwrapped, type)):
+      continue
 
-  Args:
-    target_callable: The live function or callable object from `sys.modules`.
-    symbol_name: The attribute name of the callable.
-    module_path: The dotted module path from which the callable was resolved.
+    raw_mod = getattr(target_unwrapped, "__module__", "") or ""
+    t_mod = (
+        fallback_mod
+        if fallback_mod and raw_mod in ("", "__main__")
+        else raw_mod
+    )
+    t_name = getattr(target_unwrapped, "__name__", "") or ""
+    t_qual = getattr(target_unwrapped, "__qualname__", t_name) or t_name
+    t_root = t_mod.split(".")[0] if t_mod else ""
+    if (
+        _is_unsafe_class_path(f"{t_mod}.{t_qual}")
+        or t_name in constants.DANGEROUS_CODE_NAMES
+        or t_qual.split(".")[-1] in constants.DANGEROUS_CODE_NAMES
+    ):
+      return True
 
-  Returns:
-    True if `target_callable` is a verified-safe reconstructor function, or
-    False otherwise.
-  """
-  symbol_lower = symbol_name.lower()
+    if isinstance(target_unwrapped, type):
+      if _inspect_referenced_class(
+          target_unwrapped,
+          t_mod,
+          target_ancs,
+          referenced_names,
+          approved_bases,
+          seen_ids,
+          worklist,
+      ):
+        return True
+      continue
+
+    if t_root in ("builtins", "__builtin__"):
+      continue
+    if _is_compiled_callable(target_unwrapped) and not is_restricted:
+      if not t_root or (
+          t_root in constants.APPROVED_ROOT_PACKAGES
+          and t_root not in constants.RESTRICTED_APPROVED_ROOTS
+      ):
+        continue
+    if (
+        t_root not in constants.APPROVED_ROOT_PACKAGES
+        and t_root not in sys.stdlib_module_names
+    ):
+      return True
+    if is_restricted and t_root not in constants.APPROVED_ROOT_PACKAGES:
+      return True
+    if (t_mod, t_name) == ("dataclasses", "fields") or (
+        t_mod in ("numpy._core.fromnumeric", "numpy.core.fromnumeric")
+    ):
+      continue
+
+    if isinstance(target_unwrapped, types.FunctionType):
+      if id(target_unwrapped) in seen_ids:
+        continue
+      if depth >= constants.MAX_HELPER_CALL_DEPTH:
+        return True
+      seen_ids.add(id(target_unwrapped))
+      if _callable_has_dangerous_bytecode(
+          target_unwrapped,
+          owner_ancestors=target_ancs,
+          is_restricted=is_restricted,
+          depth=depth + 1,
+          visited_ids=seen_ids,
+      ):
+        return True
+    elif (
+        is_restricted
+        or t_root in constants.RESTRICTED_APPROVED_ROOTS
+        or not _is_compiled_callable(target_unwrapped)
+    ):
+      return True
+
+  return False
+
+
+def _classify_approved_root_function(
+    target_callable: Any,
+    symbol_name: str,
+    module_path: str,
+    root_package: str,
+) -> Classification:
+  """Classifies a live non-type callable under an approved root package."""
+  if root_package in constants.RESTRICTED_APPROVED_ROOTS:
+    if (
+        root_package == "dataclasses" and symbol_name == "dataclass"
+    ) or symbol_name in constants.SAFE_DUNDER_RECONSTRUCTORS:
+      return Classification.SAFE
+    return Classification.UNKNOWN
+
   callable_module = getattr(target_callable, "__module__", "") or module_path
-  is_candidate_reconstructor = (
-      symbol_name in constants.APPROVED_RECONSTRUCTOR_FUNCTIONS
-      or any(
-          marker in symbol_lower
-          for marker in constants.RECONSTRUCTOR_NAME_MARKERS
-      )
-      or bool(
-          {module_path, callable_module}
-          & {"numpy._core.fromnumeric", "numpy.core.fromnumeric"}
-      )
+  is_numpy_fromnumeric = bool(
+      {module_path, callable_module}
+      & {"numpy._core.fromnumeric", "numpy.core.fromnumeric"}
   )
-  if not is_candidate_reconstructor:
-    return False
+  if not (_is_reconstructor_name(symbol_name) or is_numpy_fromnumeric):
+    return Classification.UNKNOWN
 
   unwrapped = inspect.unwrap(target_callable)
-  if isinstance(
-      code_object := getattr(unwrapped, "__code__", None), types.CodeType
-  ):
-    return not _code_object_has_dangerous_names(code_object, set())
+  u_mod = (
+      getattr(unwrapped, "__module__", "")
+      or getattr(getattr(unwrapped, "__objclass__", None), "__module__", "")
+      or ""
+  )
+  if not u_mod:
+    t_root = (getattr(type(unwrapped), "__module__", "") or "").split(".")[0]
+    if (
+        t_root in constants.APPROVED_ROOT_PACKAGES
+        and t_root not in constants.RESTRICTED_APPROVED_ROOTS
+    ):
+      u_mod = t_root
+  u_name = getattr(unwrapped, "__name__", "") or ""
+  u_qual = getattr(unwrapped, "__qualname__", u_name) or u_name
+  u_root = u_mod.split(".")[0] if u_mod else ""
+  u_full = f"{u_mod}.{u_qual}" if u_mod and u_qual else u_mod
+  sym_full = f"{module_path}.{symbol_name}"
 
-  return symbol_name in constants.APPROVED_RECONSTRUCTOR_FUNCTIONS
+  if (
+      _is_unsafe_class_path(u_full)
+      or _is_unsafe_class_path(sym_full)
+      or u_name in constants.UNSAFE_STRINGS
+      or (
+          u_root in constants.UNSAFE_ROOT_PACKAGES
+          and u_root not in ("builtins", "__builtin__")
+      )
+  ):
+    return Classification.UNSAFE
+  if (
+      u_name in constants.DANGEROUS_CODE_NAMES
+      or u_qual.split(".")[-1] in constants.DANGEROUS_CODE_NAMES
+      or u_name in constants.SUSPICIOUS_STRINGS
+      or u_full in constants.SUSPICIOUS_STRINGS
+      or sym_full in constants.SUSPICIOUS_STRINGS
+      or u_root in constants.RESTRICTED_APPROVED_ROOTS
+  ):
+    return Classification.SUSPICIOUS
+
+  if isinstance(unwrapped, types.FunctionType):
+    if u_root not in constants.APPROVED_ROOT_PACKAGES:
+      return Classification.UNKNOWN
+    return (
+        Classification.SUSPICIOUS
+        if _callable_has_dangerous_bytecode(unwrapped)
+        else Classification.SAFE
+    )
+
+  if (
+      u_root in constants.APPROVED_ROOT_PACKAGES
+      and u_root not in constants.RESTRICTED_APPROVED_ROOTS
+      and _is_compiled_callable(unwrapped)
+  ):
+    return Classification.SAFE
+
+  return Classification.UNKNOWN
 
 
 def _is_unsafe_class_path(full_name: str) -> bool:
@@ -1142,44 +1501,544 @@ def _is_unsafe_class_path(full_name: str) -> bool:
   )
 
 
-def _ast_method_has_dangerous_names(
-    func_node: ast.AST, import_map: Mapping[str, str]
-) -> bool:
-  """Checks whether a method AST node references dangerous names or imports.
+def _collect_ast_imports(
+    nodes: Iterable[ast.AST],
+    pkg_parts: Sequence[str],
+) -> tuple[dict[str, str], list[str], bool]:
+  """Resolves `Import` and `ImportFrom` bindings across AST `nodes`."""
+  imports: dict[str, str] = {}
+  imported_names: list[str] = []
+  had_invalid_rel = False
 
-  Walks `func_node` for identifiers, attributes, and imports matching
-  `constants.DANGEROUS_CODE_NAMES`, resolving aliases via `import_map`.
+  for node in nodes:
+    if isinstance(node, ast.Import):
+      for alias in node.names:
+        if alias.asname:
+          imports[alias.asname] = alias.name
+        else:
+          top_name = alias.name.split(".")[0]
+          imports[top_name] = top_name
+        imported_names.append(alias.name)
+    elif isinstance(node, ast.ImportFrom):
+      if node.level > 0:
+        if pkg_parts and (node.level - 1) <= len(pkg_parts):
+          anchor = list(pkg_parts[: len(pkg_parts) - (node.level - 1)])
+          resolved_mod = ".".join(
+              anchor + ([node.module] if node.module else [])
+          )
+        else:
+          had_invalid_rel = True
+          resolved_mod = ""
+      else:
+        resolved_mod = node.module or ""
 
-  Args:
-    func_node: The `ast.FunctionDef` or `ast.AsyncFunctionDef` node to inspect.
-    import_map: Mapping from top-level local alias names to dotted import paths.
+      if node.module:
+        imported_names.append(node.module)
+      for alias in node.names:
+        imported_names.append(alias.name)
+        if resolved_mod:
+          imports[alias.asname or alias.name] = f"{resolved_mod}.{alias.name}"
 
-  Returns:
-    True if `func_node` references or imports any symbol in
-    `constants.DANGEROUS_CODE_NAMES`, or False otherwise.
-  """
-  candidates: list[str] = []
-  for child in ast.walk(func_node):
-    if isinstance(child, ast.Name):
-      candidates.extend((child.id, import_map.get(child.id, "")))
-    elif isinstance(child, ast.Attribute):
-      candidates.append(child.attr)
-    elif isinstance(child, (ast.Import, ast.ImportFrom)):
-      candidates.append(getattr(child, "module", None) or "")
-      candidates.extend(alias.name for alias in child.names)
+  return imports, imported_names, had_invalid_rel
 
-  for candidate in candidates:
-    if candidate and (
-        set(candidate.split(".")) & constants.DANGEROUS_CODE_NAMES
+
+def _has_unapproved_ast_externals(
+    ext_syms: Iterable[str],
+    call_attrs: frozenset[str],
+    *,
+    is_restricted: bool,
+    depth: int,
+) -> Classification:
+  """Verifies imported external symbols referenced within an AST hook."""
+  verified_non_modules: set[str] = set()
+  failed = False
+
+  for ext_sym in sorted(set(ext_syms), key=len):
+    if not ext_sym:
+      continue
+    ext_parts = ext_sym.split(".")
+    ext_root = ext_parts[0]
+    if (
+        _is_unsafe_class_path(ext_sym)
+        or ext_sym in constants.SUSPICIOUS_STRINGS
+        or ext_root in constants.UNSAFE_ROOT_PACKAGES
+        or (
+            ext_root not in constants.APPROVED_ROOT_PACKAGES
+            and ext_root not in sys.stdlib_module_names
+        )
+        or (
+            is_restricted
+            and ext_sym not in constants.APPROVED_AST_BASE_NAMES
+            and ext_sym not in constants.NEUTRAL_AST_BASE_NAMES
+            and ext_root not in constants.SAFE_RESTRICTED_STDLIB_ROOTS
+        )
     ):
-      return True
+      failed = True
+      continue
+    if (
+        "." not in ext_sym
+        or (
+            ext_root in sys.stdlib_module_names
+            and ext_root not in constants.RESTRICTED_APPROVED_ROOTS
+        )
+        or ext_sym in constants.APPROVED_AST_BASE_NAMES
+        or ext_sym in constants.NEUTRAL_AST_BASE_NAMES
+        or ext_sym.startswith(
+            ("abc.", "collections.abc.", "dataclasses.", "typing.")
+        )
+        or ext_parts[-1] in constants.SAFE_METADATA_ATTRIBUTES
+        or ext_parts[-1] == "__version__"
+        or ".".join(ext_parts[:-1]) in verified_non_modules
+        or isinstance(
+            _resolve_dotted_path_in_sys_modules(ext_sym), types.ModuleType
+        )
+        or _find_module_source_file(ext_sym) is not None
+        or _find_module_source_file(ext_sym, compiled=True) is not None
+    ):
+      continue
+    if is_restricted or depth >= constants.MAX_AST_BASE_DEPTH:
+      failed = True
+      continue
 
-  return False
+    verdict = classify_approved_root_symbol(
+        ext_sym, _depth=depth + 1, _extra_hooks=call_attrs
+    )
+    if verdict == Classification.UNSAFE:
+      return Classification.UNSAFE
+    if verdict != Classification.SAFE:
+      failed = True
+      continue
+    verified_non_modules.add(ext_sym)
+
+  return Classification.SUSPICIOUS if failed else Classification.SAFE
+
+
+def _ast_hook_status(
+    func_node: ast.AST,
+    file_ctx: tuple[str, str, str, tuple[str, ...]],
+    import_map: Mapping[str, str],
+    top_funcs: Mapping[str, ast.AST],
+    top_classes: Mapping[str, ast.ClassDef],
+    class_methods: Mapping[str, ast.AST] | None = None,
+    *,
+    owner_name: str = "",
+    is_restricted: bool = False,
+    require_setattr: bool = False,
+    depth: int = 0,
+    visited: frozenset[str] = frozenset(),
+) -> Classification:
+  """Checks an AST hook and its local helpers for dangerous references."""
+  file_path, root_pkg, module_path, pkg_parts = file_ctx
+  walk_nodes = tuple(ast.walk(func_node))
+  fn_imports, candidates, failed = _collect_ast_imports(walk_nodes, pkg_parts)
+  local_imports = {**import_map, **fn_imports}
+
+  first_arg = ""
+  if class_methods is not None and isinstance(
+      func_node, (ast.FunctionDef, ast.AsyncFunctionDef)
+  ):
+    is_static = any(
+        _ast_expr_to_dotted_name(dec, local_imports).endswith("staticmethod")
+        for dec in func_node.decorator_list
+    )
+    pos_args = func_node.args.posonlyargs + func_node.args.args
+    if not is_static:
+      if pos_args:
+        first_arg = pos_args[0].arg
+      else:
+        failed = True
+
+  assigned_self_attrs = {
+      node.attr
+      for node in walk_nodes
+      if first_arg
+      and isinstance(node, ast.Attribute)
+      and isinstance(node.ctx, ast.Store)
+      and isinstance(node.value, ast.Name)
+      and node.value.id == first_arg
+  }
+  load_attrs = {
+      node.attr
+      for node in walk_nodes
+      if isinstance(node, ast.Attribute) and not isinstance(node.ctx, ast.Store)
+  }
+  call_attrs = frozenset(load_attrs | {"__call__"})
+
+  names_seen: set[str] = set()
+  attrs_seen: set[str] = set()
+  helpers: list[tuple[str, str]] = []
+  ext_syms: set[str] = set()
+
+  for child in walk_nodes:
+    if isinstance(child, ast.Call) and isinstance(child.func, ast.Subscript):
+      failed = True
+    if isinstance(child, ast.Name):
+      names_seen.add(child.id)
+      resolved = local_imports.get(child.id, "")
+      candidates.extend((child.id, resolved))
+      if resolved:
+        ext_syms.add(resolved)
+      if child.id not in fn_imports:
+        if child.id in top_funcs:
+          helpers.append(("mod", child.id))
+        elif child.id in top_classes and child.id != owner_name:
+          if is_restricted or depth >= constants.MAX_AST_BASE_DEPTH:
+            failed = True
+          else:
+            cls_verdict = _inspect_class_via_ast(
+                file_path,
+                child.id,
+                root_pkg,
+                module_path,
+                depth + 1,
+                call_attrs,
+            )
+            if cls_verdict == Classification.UNSAFE:
+              return Classification.UNSAFE
+            if cls_verdict != Classification.SAFE:
+              failed = True
+    elif isinstance(child, ast.Attribute):
+      attrs_seen.add(child.attr)
+      dotted = _ast_expr_to_dotted_name(child, local_imports)
+      candidates.extend((child.attr, dotted))
+      if (
+          _is_unsafe_class_path(dotted)
+          or dotted in constants.SUSPICIOUS_STRINGS
+      ):
+        failed = True
+      root_expr: ast.AST = child
+      while isinstance(root_expr, ast.Attribute):
+        root_expr = root_expr.value
+      if isinstance(root_expr, ast.Name) and root_expr.id in local_imports:
+        ext_syms.add(dotted)
+
+      is_super = (
+          isinstance(child.value, ast.Call)
+          and _ast_expr_to_dotted_name(child.value.func, local_imports)
+          == "super"
+      )
+      is_self = (
+          bool(first_arg)
+          and isinstance(child.value, ast.Name)
+          and child.value.id == first_arg
+      )
+      is_owner = (
+          bool(owner_name)
+          and isinstance(child.value, ast.Name)
+          and child.value.id == owner_name
+          and child.value.id not in fn_imports
+      )
+      if is_super and not isinstance(child.ctx, ast.Store):
+        if child.attr not in constants.UNPICKLE_LIFECYCLE_HOOKS:
+          failed = True
+      elif (
+          (is_self or is_owner)
+          and class_methods
+          and child.attr in class_methods
+      ):
+        helpers.append(("cls", child.attr))
+      elif is_self and not isinstance(child.ctx, ast.Store):
+        allowed_self = (
+            constants.UNPICKLE_LIFECYCLE_HOOKS
+            | assigned_self_attrs
+            | {"__class__", "__dict__"}
+        )
+        if child.attr not in allowed_self:
+          failed = True
+
+  if require_setattr and not (
+      "object" in names_seen and "__setattr__" in attrs_seen
+  ):
+    failed = True
+  if any(
+      cand and (set(cand.split(".")) & constants.DANGEROUS_CODE_NAMES)
+      for cand in candidates
+  ):
+    failed = True
+
+  ext_verdict = _has_unapproved_ast_externals(
+      ext_syms, call_attrs, is_restricted=is_restricted, depth=depth
+  )
+  if ext_verdict == Classification.UNSAFE:
+    return Classification.UNSAFE
+  if ext_verdict != Classification.SAFE:
+    failed = True
+
+  for kind, helper_name in helpers:
+    tag = f"{kind}:{helper_name}"
+    if tag in visited:
+      continue
+    if len(visited) >= constants.MAX_HELPER_CALL_DEPTH:
+      failed = True
+      continue
+    helper_node = (
+        top_funcs[helper_name]
+        if kind == "mod"
+        else (class_methods[helper_name] if class_methods is not None else None)
+    )
+    if helper_node is None:
+      failed = True
+      continue
+    helper_verdict = _ast_hook_status(
+        helper_node,
+        file_ctx,
+        import_map,
+        top_funcs,
+        top_classes,
+        class_methods,
+        owner_name=owner_name,
+        is_restricted=is_restricted,
+        depth=depth,
+        visited=visited | {tag},
+    )
+    if helper_verdict == Classification.UNSAFE:
+      return Classification.UNSAFE
+    if helper_verdict != Classification.SAFE:
+      failed = True
+
+  return Classification.SUSPICIOUS if failed else Classification.SAFE
+
+
+def _classify_ast_reexport(
+    reexported: str,
+    depth: int,
+    extra_hooks: frozenset[str] = frozenset(),
+) -> Classification:
+  """Classifies an imported symbol re-exported at top level of an AST module."""
+  reexport_root = reexported.split(".")[0]
+  if reexport_root in constants.UNSAFE_ROOT_PACKAGES:
+    return Classification.UNSAFE
+  if reexport_root not in constants.APPROVED_ROOT_PACKAGES:
+    return classify_symbol(reexported)
+
+  re_segs = reexported.split(".")[1:]
+  if _is_unsafe_class_path(reexported) or any(
+      seg in constants.DANGEROUS_PACKAGE_MEMBERS
+      or seg in constants.DANGEROUS_EXEC_MODULES
+      for seg in re_segs
+  ):
+    return Classification.UNSAFE
+  if reexported in constants.SUSPICIOUS_STRINGS or any(
+      reexported.startswith(f"{s}.") for s in constants.SUSPICIOUS_STRINGS
+  ):
+    return Classification.SUSPICIOUS
+
+  return (
+      classify_approved_root_symbol(
+          reexported, _depth=depth + 1, _extra_hooks=extra_hooks
+      )
+      or Classification.UNKNOWN
+  )
+
+
+def _resolve_ast_bases(
+    resolved_bases: Sequence[str],
+    file_ctx: tuple[str, str, str, tuple[str, ...]],
+    top_classes: Mapping[str, ast.ClassDef],
+    *,
+    is_restricted: bool,
+    is_dataclass: bool,
+    saw_unknown: bool,
+    depth: int,
+    extra_hooks: frozenset[str] = frozenset(),
+) -> Classification:
+  """Resolves AST base-class classifications into a final class verdict."""
+  file_path, root_pkg, module_path, _ = file_ctx
+  base_verdicts: list[Classification] = []
+
+  for base_name in resolved_bases:
+    if (
+        base_name in constants.APPROVED_AST_BASE_NAMES
+        or base_name in constants.NEUTRAL_AST_BASE_NAMES
+    ):
+      base_verdicts.append(Classification.SAFE)
+    elif depth >= constants.MAX_AST_BASE_DEPTH:
+      base_verdicts.append(Classification.UNKNOWN)
+    elif "." not in base_name:
+      same_file_verdict = None
+      if base_name in top_classes:
+        same_file_verdict = _inspect_class_via_ast(
+            file_path,
+            base_name,
+            root_pkg,
+            module_path,
+            depth + 1,
+            extra_hooks,
+        )
+      base_verdicts.append(same_file_verdict or Classification.UNKNOWN)
+    else:
+      base_verdicts.append(
+          classify_approved_root_symbol(
+              base_name, _depth=depth + 1, _extra_hooks=extra_hooks
+          )
+          or Classification.UNKNOWN
+      )
+
+  if Classification.UNSAFE in base_verdicts:
+    return Classification.UNSAFE
+  if Classification.SUSPICIOUS in base_verdicts:
+    return Classification.SUSPICIOUS
+  if saw_unknown:
+    return Classification.UNKNOWN
+
+  if is_restricted and not is_dataclass:
+    active_bases = get_all_active_approved_base_classes()
+    if not any(
+        base_name in constants.APPROVED_AST_BASE_NAMES
+        or (
+            isinstance(
+                live_base := _resolve_dotted_path_in_sys_modules(base_name),
+                type,
+            )
+            and issubclass(live_base, active_bases)
+        )
+        for base_name in resolved_bases
+    ):
+      return Classification.UNKNOWN
+
+  if all(verdict == Classification.SAFE for verdict in base_verdicts):
+    return Classification.SAFE
+  return Classification.UNKNOWN
+
+
+def _inspect_ast_class_node(
+    node: ast.ClassDef,
+    symbol_name: str,
+    file_ctx: tuple[str, str, str, tuple[str, ...]],
+    import_map: Mapping[str, str],
+    top_funcs: Mapping[str, ast.AST],
+    top_classes: Mapping[str, ast.ClassDef],
+    depth: int,
+    extra_hooks: frozenset[str] = frozenset(),
+) -> Classification:
+  """Classifies an `ast.ClassDef` node by checking its bases and hooks."""
+  is_restricted = file_ctx[1] in constants.RESTRICTED_APPROVED_ROOTS
+  method_nodes: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+  class_methods: dict[str, ast.AST] = {}
+  assigned_names: set[str] = set()
+  stmt_stack = list(node.body)
+
+  while stmt_stack:
+    item = stmt_stack.pop()
+    if isinstance(item, ast.ClassDef):
+      continue
+    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+      method_nodes.append(item)
+      class_methods[item.name] = item
+      continue
+    targets = (
+        item.targets
+        if isinstance(item, ast.Assign)
+        else ([item.target] if isinstance(item, ast.AnnAssign) else [])
+    )
+    for target in targets:
+      if isinstance(target, ast.Name):
+        assigned_names.add(target.id)
+    for child in ast.iter_child_nodes(item):
+      if isinstance(child, ast.stmt):
+        stmt_stack.append(child)
+
+  member_names = set(class_methods) | assigned_names
+  resolved_bases = [
+      _ast_expr_to_dotted_name(base_expr, import_map)
+      for base_expr in node.bases
+  ]
+  for kw in node.keywords:
+    if kw.arg == "metaclass":
+      meta_name = _ast_expr_to_dotted_name(kw.value, import_map)
+      if meta_name not in ("ABCMeta", "abc.ABCMeta", "type", "builtins.type"):
+        resolved_bases.append(meta_name)
+
+  for base_name in resolved_bases:
+    if _is_unsafe_class_path(base_name) or any(
+        seg in constants.DANGEROUS_PACKAGE_MEMBERS
+        or seg in constants.DANGEROUS_EXEC_MODULES
+        for seg in base_name.split(".")[1:]
+    ):
+      return Classification.UNSAFE
+
+  saw_unknown = any(not base_name for base_name in resolved_bases)
+  resolved_bases = [base for base in resolved_bases if base]
+  is_dataclass = any(
+      _ast_expr_to_dotted_name(dec, import_map).endswith("dataclass")
+      for dec in node.decorator_list
+  )
+
+  if is_restricted:
+    if {"__reduce__", "__reduce_ex__"} & member_names:
+      return Classification.SUSPICIOUS
+    if symbol_name.startswith("_"):
+      saw_unknown = True
+    disallowed = (
+        constants.RESTRICTED_DATACLASS_DISALLOWED_HOOKS
+        if is_dataclass
+        else constants.DANGEROUS_CLASS_LIFECYCLE_HOOKS
+    )
+    if disallowed & member_names:
+      return Classification.SUSPICIOUS
+
+  hooks_to_check = constants.UNPICKLE_LIFECYCLE_HOOKS | extra_hooks
+  unknown_only = (
+      {"__init__"} | (set() if is_restricted else {"__new__"})
+  ) - extra_hooks
+  ordered_hooks = sorted(hooks_to_check, key=lambda h: h in unknown_only)
+  for hook_name in ordered_hooks:
+    fail_cls = (
+        Classification.UNKNOWN
+        if hook_name in unknown_only
+        else Classification.SUSPICIOUS
+    )
+    if hook_name in assigned_names:
+      if fail_cls != Classification.UNKNOWN:
+        return fail_cls
+      saw_unknown = True
+      continue
+
+    need_setattr = (
+        is_restricted and is_dataclass and hook_name == "__setstate__"
+    )
+    for method_node in method_nodes:
+      if method_node.name != hook_name:
+        continue
+      hook_verdict = _ast_hook_status(
+          method_node,
+          file_ctx,
+          import_map,
+          top_funcs,
+          top_classes,
+          class_methods,
+          owner_name=symbol_name,
+          is_restricted=is_restricted,
+          require_setattr=need_setattr,
+          depth=depth,
+      )
+      if hook_verdict == Classification.UNSAFE:
+        return Classification.UNSAFE
+      if hook_verdict != Classification.SAFE:
+        if fail_cls != Classification.UNKNOWN:
+          return fail_cls
+        saw_unknown = True
+
+  return _resolve_ast_bases(
+      resolved_bases,
+      file_ctx,
+      top_classes,
+      is_restricted=is_restricted,
+      is_dataclass=is_dataclass,
+      saw_unknown=saw_unknown,
+      depth=depth,
+      extra_hooks=extra_hooks,
+  )
 
 
 @functools.lru_cache(maxsize=512)
 def _inspect_class_via_ast(
-    file_path: str, symbol_name: str, root_pkg: str
+    file_path: str,
+    symbol_name: str,
+    root_pkg: str,
+    module_path: str = "",
+    depth: int = 0,
+    extra_hooks: frozenset[str] = frozenset(),
 ) -> Classification | None:
   """Classifies a class definition by statically parsing its `.py` source file.
 
@@ -1189,13 +2048,16 @@ def _inspect_class_via_ast(
 
   Args:
     file_path: Filesystem path to the `.py` module source file.
-    symbol_name: Name of the class symbol to inspect within `file_path`.
-    root_pkg: Top-level root package name (e.g., `"torch"` or `"custom_pkg"`).
+    symbol_name: Name of the class or function symbol to inspect.
+    root_pkg: Top-level root package name (e.g., `"torch"` or `"dataclasses"`).
+    module_path: Optional dotted module path used for relative imports.
+    depth: Recursion depth for base-class and re-export resolution.
+    extra_hooks: Additional method names required safe on helper classes.
 
   Returns:
     A `Classification` (`SAFE`, `UNSAFE`, `SUSPICIOUS`, or `UNKNOWN`) if the
-    symbol is defined at top level in `file_path`, or None if the file cannot
-    be parsed or the symbol is not found.
+    symbol is resolved in `file_path`, or None if the file cannot be parsed or
+    the symbol is absent.
   """
   try:
     with open(
@@ -1205,85 +2067,51 @@ def _inspect_class_via_ast(
   except (IOError, OSError, SyntaxError, ValueError, TypeError):
     return None
 
-  import_map: dict[str, str] = {}
-  for node in tree.body:
-    if isinstance(node, ast.Import):
-      for alias in node.names:
-        import_map[alias.asname or alias.name] = alias.name
-    elif isinstance(node, ast.ImportFrom) and node.module:
-      for alias in node.names:
-        import_map[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+  mod_parts = tuple(module_path.split(".")) if module_path else ()
+  pkg_parts = (
+      mod_parts
+      if os.path.basename(file_path) == "__init__.py"
+      else mod_parts[:-1]
+  )
+  import_map, _, _ = _collect_ast_imports(tree.body, pkg_parts)
+  top_classes = {
+      stmt.name: stmt for stmt in tree.body if isinstance(stmt, ast.ClassDef)
+  }
+  top_funcs = {
+      stmt.name: stmt
+      for stmt in tree.body
+      if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+  }
+  file_ctx = (file_path, root_pkg, module_path, pkg_parts)
 
-  for node in tree.body:
-    if getattr(node, "name", None) != symbol_name:
-      continue
-    if not isinstance(node, ast.ClassDef) or symbol_name.startswith("_"):
+  if symbol_name in top_funcs:
+    is_restricted = root_pkg in constants.RESTRICTED_APPROVED_ROOTS
+    if is_restricted or not _is_reconstructor_name(symbol_name):
       return Classification.UNKNOWN
+    return _ast_hook_status(
+        top_funcs[symbol_name],
+        file_ctx,
+        import_map,
+        top_funcs,
+        top_classes,
+        depth=depth,
+    )
 
-    method_names = {
-        item.name
-        for item in node.body
-        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    resolved_bases = [
-        _ast_expr_to_dotted_name(base_expr, import_map)
-        for base_expr in node.bases
-    ]
-    if any(_is_unsafe_class_path(base_name) for base_name in resolved_bases):
-      return Classification.UNSAFE
+  if symbol_name not in top_classes:
+    if symbol_name not in import_map:
+      return None
+    return _classify_ast_reexport(import_map[symbol_name], depth, extra_hooks)
 
-    if method_names & {"__reduce__", "__reduce_ex__"}:
-      return Classification.SUSPICIOUS
-
-    if any(
-        _ast_expr_to_dotted_name(dec, import_map).endswith("dataclass")
-        for dec in node.decorator_list
-    ):
-      return Classification.SAFE
-
-    if any(
-        base_name in constants.APPROVED_AST_BASE_NAMES
-        or (
-            isinstance(
-                live_base := _resolve_dotted_path_in_sys_modules(base_name),
-                type,
-            )
-            and issubclass(live_base, get_all_active_approved_base_classes())
-        )
-        for base_name in resolved_bases
-    ):
-      return Classification.SAFE
-
-    if (
-        root_pkg not in ("custom_pkg", "collections", "datetime", "enum")
-        and set(resolved_bases) <= {"object", "builtins.object"}
-        and not (method_names & constants.DANGEROUS_CLASS_LIFECYCLE_HOOKS)
-    ):
-      for item in node.body:
-        assigned_targets = (
-            item.targets
-            if isinstance(item, ast.Assign)
-            else ([item.target] if isinstance(item, ast.AnnAssign) else [])
-        )
-        if any(
-            isinstance(target, ast.Name)
-            and target.id in ("__new__", "__init__")
-            for target in assigned_targets
-        ):
-          return Classification.UNKNOWN
-
-        if (
-            isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and item.name in ("__new__", "__init__")
-            and _ast_method_has_dangerous_names(item, import_map)
-        ):
-          return Classification.UNKNOWN
-
-      return Classification.SAFE
-
-    return Classification.UNKNOWN
-
-  return None
+  return _inspect_ast_class_node(
+      top_classes[symbol_name],
+      symbol_name,
+      file_ctx,
+      import_map,
+      top_funcs,
+      top_classes,
+      depth,
+      extra_hooks,
+  )
 
 
 def _resolve_dotted_path_in_sys_modules(dotted_path: str) -> Any | None:
@@ -1329,50 +2157,53 @@ def _is_installed_root_package(root_package: str) -> bool:
   """
   if not root_package or not root_package.isidentifier():
     return False
+  if root_package in sys.modules:
+    return True
 
-  try:
-    return (
-        root_package in sys.modules
-        or importlib.util.find_spec(root_package) is not None
-    )
-  except (ImportError, AttributeError, ValueError):
-    return False
+  is_installed, _, _ = _find_root_package_spec_info(root_package)
+  return is_installed
 
 
 def _classify_loaded_class_mro(
-    target_class: type[Any], symbol_name: str, root_package: str
+    target_class: type[Any],
+    symbol_name: str,
+    root_package: str,
+    extra_hooks: frozenset[str] = frozenset(),
 ) -> Classification:
   """Classifies a live class object by inspecting its module, MRO, and methods.
 
   Walks `target_class.__mro__` to verify that no ancestor originates from an
   unsafe package or defines dangerous pickle lifecycle hooks, and checks
-  whether `target_class` inherits from an approved base class or is a simple
-  data class with safe constructor bytecode.
+  whether `target_class` inherits from an approved base class or has safe
+  unpickling lifecycle hooks.
 
   Args:
     target_class: The live `type` object resolved from `sys.modules`.
     symbol_name: Name of the class symbol being classified.
     root_package: Expected top-level root package name from the symbol path.
+    extra_hooks: Additional method names required safe on helper classes.
 
   Returns:
     The `Classification` (`SAFE`, `UNSAFE`, `SUSPICIOUS`, or `UNKNOWN`) for
     `target_class`.
   """
   try:
+    approved_bases = get_all_active_approved_base_classes()
     class_module = getattr(target_class, "__module__", "") or ""
     class_root = class_module.split(".")[0] if class_module else ""
-    if (
-        class_root != root_package
-        and class_root not in constants.APPROVED_ROOT_PACKAGES
+    if class_root in constants.UNSAFE_ROOT_PACKAGES:
+      return Classification.UNSAFE
+    if class_root != root_package and (
+        class_root not in constants.APPROVED_ROOT_PACKAGES
+        or (
+            root_package not in constants.RESTRICTED_APPROVED_ROOTS
+            and class_root in constants.RESTRICTED_APPROVED_ROOTS
+            and target_class not in approved_bases
+        )
     ):
-      if class_root in constants.UNSAFE_ROOT_PACKAGES:
-        return Classification.UNSAFE
       return Classification.SUSPICIOUS
 
-    approved_bases = get_all_active_approved_base_classes()
-    is_approved_subclass = issubclass(target_class, approved_bases)
-    has_suspicious_hook = False
-
+    non_approved_ancestors: list[type[Any]] = []
     for ancestor in target_class.__mro__:
       if ancestor is object:
         continue
@@ -1384,84 +2215,145 @@ def _classify_loaded_class_mro(
       if _is_unsafe_class_path(f"{ancestor_mod}.{ancestor_qual}"):
         return Classification.UNSAFE
 
-      if ancestor in approved_bases:
-        continue
+      if ancestor not in approved_bases:
+        non_approved_ancestors.append(ancestor)
 
-      if not is_approved_subclass and any(
-          hook in ancestor.__dict__
-          for hook in constants.DANGEROUS_CLASS_LIFECYCLE_HOOKS
-      ):
-        has_suspicious_hook = True
-
-      if root_package == "custom_pkg" and (
-          "__reduce__" in ancestor.__dict__
-          or "__reduce_ex__" in ancestor.__dict__
-      ):
-        has_suspicious_hook = True
-
-    if target_class in approved_bases:
+    if target_class in approved_bases and not extra_hooks:
       return Classification.SAFE
 
-    if has_suspicious_hook:
+    is_restricted_root = root_package in constants.RESTRICTED_APPROVED_ROOTS
+    is_dataclass_type = dataclasses.is_dataclass(target_class)
+
+    if is_restricted_root and any(
+        "__reduce__" in anc.__dict__ or "__reduce_ex__" in anc.__dict__
+        for anc in non_approved_ancestors
+    ):
       return Classification.SUSPICIOUS
 
-    if symbol_name.startswith("_"):
+    saw_unknown = is_restricted_root and symbol_name.startswith("_")
+    disallowed_hooks: frozenset[str] = frozenset()
+    if is_restricted_root:
+      disallowed_hooks = constants.DANGEROUS_CLASS_LIFECYCLE_HOOKS
+      if is_dataclass_type:
+        disallowed_hooks = constants.RESTRICTED_DATACLASS_DISALLOWED_HOOKS
+
+    anc_hooks = constants.UNPICKLE_LIFECYCLE_HOOKS | extra_hooks
+    unknown_only = (
+        {"__init__"} | (set() if is_restricted_root else {"__new__"})
+    ) - extra_hooks
+    for ancestor in non_approved_ancestors:
+      if disallowed_hooks.intersection(ancestor.__dict__):
+        return Classification.SUSPICIOUS
+
+      is_c_ext_ancestor = not bool(
+          getattr(ancestor, "__flags__", constants.PY_TPFLAGS_HEAPTYPE)
+          & constants.PY_TPFLAGS_HEAPTYPE
+      ) or ("__pyx_vtable__" in ancestor.__dict__)
+
+      for hook_name in anc_hooks:
+        if hook_name not in ancestor.__dict__:
+          continue
+        fail_cls = (
+            Classification.UNKNOWN
+            if hook_name in unknown_only
+            else Classification.SUSPICIOUS
+        )
+        raw_hook = ancestor.__dict__[hook_name]
+        unwrapped_hook = inspect.unwrap(
+            raw_hook.__func__
+            if isinstance(raw_hook, (staticmethod, classmethod))
+            else raw_hook
+        )
+        if (
+            is_restricted_root
+            and hook_name == "__setstate__"
+            and getattr(unwrapped_hook, "__module__", "") == "dataclasses"
+        ):
+          continue
+        if isinstance(unwrapped_hook, types.FunctionType):
+          if _callable_has_dangerous_bytecode(
+              unwrapped_hook,
+              owner_ancestors=non_approved_ancestors,
+              is_restricted=is_restricted_root,
+              require_setattr=(
+                  is_restricted_root
+                  and is_dataclass_type
+                  and hook_name == "__setstate__"
+              ),
+          ):
+            if fail_cls != Classification.UNKNOWN:
+              return fail_cls
+            saw_unknown = True
+        elif (
+            is_restricted_root
+            or not is_c_ext_ancestor
+            or not _is_compiled_callable(unwrapped_hook)
+        ):
+          if fail_cls != Classification.UNKNOWN:
+            return fail_cls
+          saw_unknown = True
+
+    if saw_unknown:
       return Classification.UNKNOWN
 
-    if is_approved_subclass:
-      return Classification.SAFE
+    if is_restricted_root and not is_dataclass_type:
+      return (
+          Classification.SAFE
+          if issubclass(target_class, approved_bases)
+          else Classification.UNKNOWN
+      )
 
-    if (
-        root_package not in ("custom_pkg", "collections", "datetime", "enum")
-        and type(target_class) is type  # pylint: disable=unidiomatic-typecheck
-        and target_class.__bases__ == (object,)
-    ):
-      for ctor_name in ("__new__", "__init__"):
-        if ctor_name not in target_class.__dict__:
-          continue
-        ctor_code = getattr(target_class.__dict__[ctor_name], "__code__", None)
-        if not isinstance(ctor_code, types.CodeType) or (
-            _code_object_has_dangerous_names(ctor_code, set())
-        ):
-          return Classification.UNKNOWN
-      return Classification.SAFE
+    return Classification.SAFE
   except (TypeError, AttributeError, ValueError, RuntimeError):
     return Classification.UNKNOWN
 
-  return Classification.UNKNOWN
 
-
-def classify_approved_root_symbol(symbol: str) -> Classification | None:
+def classify_approved_root_symbol(
+    symbol: str,
+    *,
+    _depth: int = 0,
+    _extra_hooks: frozenset[str] = frozenset(),
+) -> Classification | None:
   """Classifies a dotted symbol under an approved root package.
 
   Inspects a dotted symbol without executing arbitrary module imports by
   checking (1) loaded modules and objects in `sys.modules` (verifying class
   MROs or reconstructor bytecode), (2) static `.py` source files on disk via
-  `ast.parse`, and (3) structural naming rules for uninstalled approved
-  roots.
+  `ast.parse`, (3) compiled C/Cython extension modules on disk, and (4)
+  structural naming rules for uninstalled approved roots.
 
   Args:
     symbol: Fully qualified dotted symbol string (e.g., `'torch.nn.Linear'`).
+    _depth: Internal recursion depth for AST base and re-export resolution.
+    _extra_hooks: Internal method names required safe on helper classes.
 
   Returns:
     The `Classification` (`SAFE`, `UNSAFE`, `SUSPICIOUS`, or `UNKNOWN`) if
     the symbol belongs to an unsafe or approved root package, or None if the
-    symbol is unqualified or belongs to an unlisted root package.
+    symbol is unqualified, malformed, or belongs to an unlisted root package.
   """
   if not symbol or "." not in symbol:
     return None
+  if _depth > constants.MAX_AST_BASE_DEPTH:
+    return Classification.UNKNOWN
 
   symbol_parts = symbol.split(".")
+  if not all(part.isidentifier() for part in symbol_parts):
+    return None
+
   root_package = symbol_parts[0]
   if root_package in constants.UNSAFE_ROOT_PACKAGES:
     return Classification.UNSAFE
   if root_package not in constants.APPROVED_ROOT_PACKAGES:
     return None
 
+  if any(is_dunder_or_introspection_attr(seg) for seg in symbol_parts[1:]):
+    return Classification.SUSPICIOUS
+
   module_path = ".".join(symbol_parts[:-1])
   symbol_name = symbol_parts[-1]
 
-  if symbol in constants.ALL_BASE_CLASS_SPECS:
+  if symbol in constants.ALL_BASE_CLASS_SPECS and not _extra_hooks:
     return Classification.SAFE
 
   target_module = _resolve_dotted_path_in_sys_modules(module_path)
@@ -1471,46 +2363,57 @@ def classify_approved_root_symbol(symbol: str) -> Classification | None:
       return Classification.UNKNOWN
 
     if isinstance(target_object, types.ModuleType):
-      module_root = (getattr(target_object, "__name__", "") or "").split(".")[0]
-      if module_root in constants.UNSAFE_ROOT_PACKAGES:
+      module_name = getattr(target_object, "__name__", "") or ""
+      module_root = module_name.split(".")[0]
+      if (
+          module_root in constants.UNSAFE_ROOT_PACKAGES
+          or _is_unsafe_class_path(module_name)
+      ):
         return Classification.UNSAFE
-      has_private_segment = any(
-          seg.startswith("_") and seg != "_core" for seg in symbol_parts[1:]
-      )
-      if module_root != root_package or has_private_segment:
+      if module_root != root_package and (
+          module_root not in constants.APPROVED_ROOT_PACKAGES
+          or module_root in constants.RESTRICTED_APPROVED_ROOTS
+      ):
         return Classification.SUSPICIOUS
       return Classification.SAFE
 
     if not isinstance(target_object, type):
-      if _is_safe_approved_root_function(
-          target_object, symbol_name, module_path
-      ):
-        return Classification.SAFE
-      return Classification.UNKNOWN
+      return _classify_approved_root_function(
+          target_object, symbol_name, module_path, root_package
+      )
 
-    return _classify_loaded_class_mro(target_object, symbol_name, root_package)
+    return _classify_loaded_class_mro(
+        target_object, symbol_name, root_package, _extra_hooks
+    )
 
   if (source_file := _find_module_source_file(module_path)) is not None:
     return (
-        _inspect_class_via_ast(source_file, symbol_name, root_package)
+        _inspect_class_via_ast(
+            source_file,
+            symbol_name,
+            root_package,
+            module_path,
+            _depth,
+            _extra_hooks,
+        )
         or Classification.UNKNOWN
     )
 
-  if _find_module_source_file(symbol) is not None:
+  if _find_module_source_file(symbol) is not None or (
+      root_package not in constants.RESTRICTED_APPROVED_ROOTS
+      and _find_module_source_file(symbol, compiled=True) is not None
+  ):
     return Classification.SAFE
 
-  is_public_pascal_case = symbol_name[
-      :1
-  ].isupper() and not symbol_name.startswith("_")
-  has_only_module_segments = all(
-      not part.startswith("_") and part.islower() for part in symbol_parts[1:-1]
+  is_pascal_class = symbol_name[:1].isupper() or (
+      symbol_name.startswith("_") and symbol_name[1:2].isupper()
   )
   if (
-      is_public_pascal_case
-      and has_only_module_segments
+      root_package not in constants.RESTRICTED_APPROVED_ROOTS
+      and (is_pascal_class or _is_reconstructor_name(symbol_name))
       and (
-          not _is_installed_root_package(root_package)
-          or (root_package == "custom_pkg" and module_path not in sys.modules)
+          _find_module_source_file(module_path, compiled=True) is not None
+          or not _is_installed_root_package(root_package)
       )
   ):
     return Classification.SAFE
@@ -1646,9 +2549,10 @@ def classify_symbol(symbol: str) -> Classification:
       return Classification.SAFE
 
   if parts and parts[0] in constants.APPROVED_ROOT_PACKAGES:
-    if parts[-1] in constants.APPROVED_RECONSTRUCTOR_FUNCTIONS:
+    if parts[-1] in constants.SAFE_DUNDER_RECONSTRUCTORS or (
+        parts[0] == "dataclasses" and parts[-1] == "dataclass"
+    ):
       return Classification.SAFE
-
     return classify_approved_root_symbol(symbol_clean) or Classification.UNKNOWN
 
   if any(symbol_clean.startswith(f"{s}.") for s in constants.SAFE_STRINGS):

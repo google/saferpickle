@@ -534,6 +534,11 @@ class SaferUnpickler(picklemagic.SafeUnpickler):
     if len(self.stack) >= 2:
       state = self.stack[-1]
       inst = self.stack[-2]
+      if self._state_contains_fake_class(state, only_suspicious=True):
+        self.has_blocked_unsafe_build_instr = True
+        self.stack.pop()
+        return
+
       if (
           isinstance(inst, dict)
           and not isinstance(inst, picklemagic.FakeClass)
@@ -807,7 +812,7 @@ def get_class_instantiations(
       unpickler = SaferUnpickler(
           pickle_stream,
           class_factory=factory,
-          safe_modules=constants.SAFE_STRINGS,
+          safe_modules=(),
           unsafe_modules=constants.UNSAFE_STRINGS,
       )
       factory.default.unpickler = unpickler

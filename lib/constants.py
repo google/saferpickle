@@ -14,10 +14,12 @@
 
 """Constants used by the safer_pickle library."""
 
+import importlib.machinery
 import os
 import pickletools
 import string
-from typing import FrozenSet
+import types
+from typing import Any, FrozenSet
 import immutabledict
 
 # List of globals below can be updated if additional modules are identified
@@ -326,8 +328,8 @@ SAFE_STRINGS: FrozenSet[str] = frozenset([
 ERROR_STRING = string.Template(
     "ERROR: Loading this pickle file may result in code execution."
     " Only proceed if you trust the file.\nClassification: $classification\nIf"
-    " this file was flagged inappropriately, please contact"
-    " ise-static-analysis@ with details."
+    " this file was flagged inappropriately, please open an issue at"
+    " https://github.com/google/saferpickle/issues with details."
 )
 
 # Combination of all the globals for exclusion to identify unknown method calls
@@ -471,7 +473,6 @@ APPROVED_ROOT_PACKAGES: FrozenSet[str] = frozenset({
     "functools",
     "gensim",
     "geopandas",
-    "custom_pkg",
     "jax",
     "jaxlib",
     "keras",
@@ -577,8 +578,23 @@ SAFE_BUILTIN_TYPES: FrozenSet[str] = frozenset({
     "tuple",
 })
 
+_NON_BASE_BUILTIN_TYPES: FrozenSet[str] = frozenset({
+    "NotImplemented",
+    "ellipsis",
+    "memoryview",
+    "object",
+    "range",
+    "slice",
+})
+
+_SAFE_CLASS_BUILTINS: FrozenSet[str] = (
+    SAFE_BUILTIN_TYPES - _NON_BASE_BUILTIN_TYPES
+)
+
 APPROVED_AST_BASE_NAMES: FrozenSet[str] = (
-    SAFE_BUILTIN_TYPES
+    _SAFE_CLASS_BUILTINS
+    | frozenset(f"builtins.{t}" for t in _SAFE_CLASS_BUILTINS)
+    | frozenset(f"__builtin__.{t}" for t in _SAFE_CLASS_BUILTINS)
     | frozenset(ALL_BASE_CLASS_SPECS)
     | frozenset(spec.rsplit(".", 1)[-1] for spec in ALL_BASE_CLASS_SPECS)
     | frozenset(spec.split(".", 1)[-1] for spec in ALL_BASE_CLASS_SPECS)
@@ -589,6 +605,33 @@ APPROVED_AST_BASE_NAMES: FrozenSet[str] = (
         "pathlib.PurePath",
     })
 )
+
+NEUTRAL_AST_BASE_NAMES: FrozenSet[str] = frozenset({
+    "ABC",
+    "BaseException",
+    "DeprecationWarning",
+    "Exception",
+    "FutureWarning",
+    "Generic",
+    "KeyError",
+    "Protocol",
+    "RuntimeError",
+    "RuntimeWarning",
+    "TypeError",
+    "UserWarning",
+    "ValueError",
+    "Warning",
+    "__builtin__.object",
+    "abc.ABC",
+    "builtins.BaseException",
+    "builtins.Exception",
+    "builtins.UserWarning",
+    "builtins.Warning",
+    "builtins.object",
+    "object",
+    "typing.Generic",
+    "typing.Protocol",
+})
 
 SELF_PROTECTED_PREFIXES: FrozenSet[str] = frozenset({
     "config.set_config_path",
@@ -745,6 +788,59 @@ DANGEROUS_CLASS_LIFECYCLE_HOOKS: FrozenSet[str] = frozenset({
     "__setstate__",
 })
 
+UNPICKLE_LIFECYCLE_HOOKS: FrozenSet[str] = (
+    DANGEROUS_CLASS_LIFECYCLE_HOOKS
+    | frozenset({
+        "__init__",
+        "__new__",
+        "__post_init__",
+    })
+)
+
+RESTRICTED_DATACLASS_DISALLOWED_HOOKS: FrozenSet[str] = (
+    DANGEROUS_CLASS_LIFECYCLE_HOOKS - {"__setstate__"}
+) | frozenset({"__new__"})
+
+RESTRICTED_APPROVED_ROOTS: FrozenSet[str] = frozenset({
+    "collections",
+    "dataclasses",
+    "datetime",
+    "enum",
+    "functools",
+    "types",
+    "typing",
+})
+
+SAFE_RESTRICTED_STDLIB_ROOTS: FrozenSet[str] = frozenset({
+    "abc",
+    "collections",
+    "copy",
+    "dataclasses",
+    "datetime",
+    "decimal",
+    "enum",
+    "functools",
+    "json",
+    "math",
+    "numbers",
+    "re",
+    "types",
+    "typing",
+})
+
+PY_TPFLAGS_HEAPTYPE = 1 << 9
+MAX_HELPER_CALL_DEPTH = 6
+MAX_AST_BASE_DEPTH = 6
+EXTENSION_SUFFIXES: tuple[str, ...] = tuple(
+    importlib.machinery.EXTENSION_SUFFIXES
+)
+COMPILED_CALLABLE_TYPES: tuple[type[Any], ...] = (
+    types.BuiltinFunctionType,
+    types.WrapperDescriptorType,
+    types.MethodDescriptorType,
+    types.GetSetDescriptorType,
+)
+
 RECONSTRUCTOR_NAME_MARKERS: tuple[str, ...] = (
     "reconstruct",
     "rebuild",
@@ -752,6 +848,8 @@ RECONSTRUCTOR_NAME_MARKERS: tuple[str, ...] = (
     "frombuffer",
     "from_backing",
     "_new_",
+    "_ctor",
+    "newobj",
 )
 
 DANGEROUS_CODE_NAMES: FrozenSet[str] = (
@@ -760,13 +858,18 @@ DANGEROUS_CODE_NAMES: FrozenSet[str] = (
     | frozenset({
         "CodeType",
         "FunctionType",
+        "Popen",
         "__builtins__",
         "__import__",
         "__subclasses__",
         "_pickle",
         "builtins",
+        "check_call",
+        "check_output",
         "delattr",
         "getattr",
+        "getoutput",
+        "getstatusoutput",
         "globals",
         "import_module",
         "io",
