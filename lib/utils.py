@@ -16,7 +16,9 @@
 
 import ast
 import bz2
+import codecs
 import collections
+import copyreg
 import dataclasses
 import enum
 import functools
@@ -31,7 +33,6 @@ import mmap
 import os
 import pickletools
 import re
-import subprocess
 import sys
 import tarfile
 import threading
@@ -41,8 +42,6 @@ from typing import (
     BinaryIO,
     Callable,
     Dict,
-    FrozenSet,
-    Generator,
     IO,
     Iterable,
     Iterator,
@@ -54,6 +53,7 @@ from typing import (
     cast,
 )
 import zipfile
+import zlib
 
 from absl import logging
 from lib import config
@@ -71,14 +71,15 @@ class Classification(enum.Enum):
   UNKNOWN = "UNKNOWN"
 
 
-PICKLEMAGIC_PATTERNS = [
+_COMPAT_PICKLE = importlib.import_module("_compat_pickle")
+
+PICKLEMAGIC_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "FakeWarning.__new__",
         re.compile(
             r"FakeWarning\.__new__ called on <class '(?P<class_name>.*?)'> with"
             r" args=(?P<args>.*), kwargs=(?P<kwargs>.*)"
         ),
-        False,
     ),
     (
         "FakeWarning.__setstate__",
@@ -86,7 +87,6 @@ PICKLEMAGIC_PATTERNS = [
             r"FakeWarning\.__setstate__ called on <class '(?P<class_name>.*?)'>"
             r" with unexpected state=(?P<state>.*)"
         ),
-        True,
     ),
     (
         "FakeClass.__getattr__",
@@ -94,7 +94,6 @@ PICKLEMAGIC_PATTERNS = [
             r"FakeClass\.__getattr__ called on <class '(?P<class_name>.*?)'>"
             r" with name=(?P<attr_name>.*)"
         ),
-        False,
     ),
     (
         "FakeClass method",
@@ -103,7 +102,6 @@ PICKLEMAGIC_PATTERNS = [
             r" '(?P<class_name>.*?)'> with args=(?P<args>.*),"
             r" kwargs=(?P<kwargs>.*)"
         ),
-        False,
     ),
     (
         "FakeClass.__call__",
@@ -111,7 +109,6 @@ PICKLEMAGIC_PATTERNS = [
             r"FakeClass\.__call__ called on <class '(?P<class_name>.*?)'> with"
             r" args=(?P<args>.*), kwargs=(?P<kwargs>.*)"
         ),
-        False,
     ),
     (
         "FakeModule.__getattr__",
@@ -119,7 +116,6 @@ PICKLEMAGIC_PATTERNS = [
             r"FakeModule\.__getattr__ called on (?P<module_name>.*?) with"
             r" name=(?P<attr_name>.*)"
         ),
-        False,
     ),
     (
         "Failed to ",
@@ -127,9 +123,8 @@ PICKLEMAGIC_PATTERNS = [
             r"Failed to (?:reduce|set state|newobj|newobj_ex|instantiate)"
             r" <class '(?P<class_name>.*?)'> with (?P<args>.*?):"
         ),
-        False,
     ),
-]
+)
 
 _WHITESPACE_NORMALIZE_RE = re.compile(r"[ \t]+")
 _BINARY_BYTES_HEX_RE = re.compile(
@@ -141,6 +136,8 @@ _HEX_TOKEN_PREFIX_RE = re.compile(r"^x[0-9a-fA-F]{2}")
 _COMBINED_ARGS_TOKEN_RE = re.compile(
     r"'([^']*)'|\"([^\"]*)\"|([a-zA-Z_][a-zA-Z0-9_.]*(?:\(.*?\))?)"
 )
+_CLASS_REF_LOG_RE = re.compile(r"<class '([^']+)'>")
+_OBJECT_REF_LOG_RE = re.compile(r"<([a-zA-Z_][a-zA-Z0-9_.]*) object at 0x")
 
 
 # Creates a copy of the module
@@ -179,7 +176,6 @@ def copy_module(original_name: str, new_name: str) -> types.ModuleType | None:
   new_module.__name__ = new_name
   if hasattr(original_module, "__file__"):
     new_module.__file__ = f"{new_name}.py"
-  sys.modules[new_name] = new_module
 
   return new_module
 
@@ -222,32 +218,126 @@ def get_copied_module(name: str) -> types.ModuleType:
     return mod_copied
 
 
-def _peek_bytes(file_bytes: bytes | BinaryIO, size: int) -> bytes:
-  """Peeks at the first `size` bytes of a bytes object or file stream."""
-  if isinstance(file_bytes, bytes):
-    return file_bytes[:size]
+ARCHIVE_EXTRACTION_ERRORS: tuple[type[BaseException], ...] = (
+    zipfile.BadZipFile,
+    zipfile.LargeZipFile,
+    tarfile.TarError,
+    lzma.LZMAError,
+    zlib.error,
+    EOFError,
+    OSError,
+    ValueError,
+    RuntimeError,
+    exceptions.UnsafePickleDetectedError,
+)
+
+
+def is_seekable_stream(stream: Any) -> bool:
+  """Checks whether `stream` supports random-access `seek` and `tell` calls."""
+  if not callable(getattr(stream, "seek", None)) or not callable(
+      getattr(stream, "tell", None)
+  ):
+    return False
+
+  seekable_fn = getattr(stream, "seekable", None)
+  if callable(seekable_fn):
+    try:
+      return bool(seekable_fn())
+    except (OSError, AttributeError, io.UnsupportedOperation, ValueError):
+      return False
 
   try:
-    is_seekable = file_bytes.seekable()
-  except (AttributeError, ValueError):
-    is_seekable = False
+    stream.tell()
+    return True
+  except (OSError, AttributeError, io.UnsupportedOperation, ValueError):
+    return False
 
-  if is_seekable:
+
+def ensure_seekable_stream(data: Any) -> Any:
+  """Normalizes buffers or non-seekable streams into seekable inputs."""
+  if isinstance(data, (bytes, mmap.mmap)):
+    return data
+  if isinstance(data, (bytearray, memoryview)):
+    return bytes(data)
+  if is_seekable_stream(data):
+    return data
+  if callable(getattr(data, "read", None)):
+    return io.BytesIO(data.read())
+  return data
+
+
+def peek_bytes(file_bytes: bytes | IO[bytes] | io.IOBase, size: int) -> bytes:
+  """Peeks at the first `size` bytes of a byte buffer or stream.
+
+  Args:
+    file_bytes: The raw `bytes` buffer or binary stream to inspect.
+    size: Maximum number of leading bytes to return.
+
+  Returns:
+    Up to `size` leading bytes from `file_bytes`, or `b""` if the stream
+    cannot be peeked.
+  """
+  if isinstance(file_bytes, (bytes, bytearray, memoryview)):
+    return bytes(file_bytes[:size])
+
+  if is_seekable_stream(file_bytes):
+    seekable_stream = cast(IO[bytes], file_bytes)
     try:
-      current_pos = file_bytes.tell()
-      peeked = file_bytes.read(size)
-      file_bytes.seek(current_pos)
+      current_pos = seekable_stream.tell()
+      peeked = seekable_stream.read(size)
+      seekable_stream.seek(current_pos)
       return peeked
     except (OSError, io.UnsupportedOperation):
       pass
 
   if hasattr(file_bytes, "peek"):
     try:
-      return file_bytes.peek(size)[:size]
+      return file_bytes.peek(size)[:size]  # pyrefly: ignore[missing-attribute]
     except (OSError, io.UnsupportedOperation, AttributeError):
       pass
 
   return b""
+
+
+def _has_trailing_zip_eocd(
+    file_bytes: bytes | IO[bytes] | io.IOBase,
+) -> bool:
+  """Checks whether `file_bytes` has a valid trailing ZIP central directory."""
+  if bool(getattr(file_bytes, "_has_zip_eocd_tail", False)):
+    return True
+  # `ZIP_STORED` member tails are checked on the outer stream; deflated members
+  # are inflated here, bounded by the declared size and the archive byte budget.
+  if getattr(file_bytes, "_compress_type", None) == zipfile.ZIP_STORED or (
+      getattr(file_bytes, "_orig_file_size", 0)
+      > constants.MAX_ARCHIVE_DECOMPRESSED_BYTES
+  ):
+    return False
+
+  if isinstance(file_bytes, (bytes, bytearray, memoryview)):
+    file_bytes = io.BytesIO(file_bytes)
+
+  if is_seekable_stream(file_bytes):
+    seekable_stream = cast(IO[bytes], file_bytes)
+    pos = seekable_stream.tell()
+    try:
+      seekable_stream.seek(0, io.SEEK_END)
+      end_pos = seekable_stream.tell()
+      if end_pos < 22:
+        return False
+
+      tail_start = max(0, end_pos - 65558)
+      seekable_stream.seek(tail_start)
+      if b"PK\x05\x06" not in seekable_stream.read(end_pos - tail_start):
+        return False
+      return zipfile.is_zipfile(seekable_stream)
+    except (IOError, OSError, zipfile.BadZipFile, ValueError):
+      return False
+    finally:
+      try:
+        seekable_stream.seek(pos)
+      except (IOError, OSError, ValueError):
+        pass
+  return False
 
 
 def is_zip_bytes(file_bytes: bytes | BinaryIO) -> bool:
@@ -261,14 +351,101 @@ def is_zip_bytes(file_bytes: bytes | BinaryIO) -> bool:
   """
   if not file_bytes:
     return False
-  return _peek_bytes(file_bytes, 4).startswith(
+  return peek_bytes(file_bytes, 4).startswith(
       (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
   )
 
 
+def read_bounded(
+    stream: bytes | IO[bytes],
+    *,
+    remaining_budget: list[int],
+) -> bytes:
+  """Reads a stream or byte buffer while enforcing a decompression byte budget.
+
+  Args:
+    stream: Raw byte buffer or decompressed binary stream to read.
+    remaining_budget: Single-element mutable list tracking the cumulative
+      remaining byte budget across an archive tree.
+
+  Returns:
+    The complete byte contents read from `stream`.
+
+  Raises:
+    ValueError: If reading `stream` exceeds the allowed byte budget.
+  """
+  budget = remaining_budget[0]
+  if budget < 0:
+    raise ValueError("Archive decompression byte budget exceeded.")
+
+  if isinstance(stream, bytes):
+    if len(stream) > budget:
+      raise ValueError("Archive decompression byte budget exceeded.")
+    remaining_budget[0] -= len(stream)
+    return stream
+
+  chunks: list[bytes] = []
+  bytes_read = 0
+  while True:
+    read_size = min(1024 * 1024, (budget - bytes_read) + 1)
+    chunk = stream.read(read_size)
+    if not chunk:
+      break
+    bytes_read += len(chunk)
+    if bytes_read > budget:
+      raise ValueError("Archive decompression byte budget exceeded.")
+    chunks.append(chunk)
+
+  remaining_budget[0] -= bytes_read
+  return b"".join(chunks)
+
+
+def is_unsafe_archive_path(name: str) -> bool:
+  """Checks whether an archive member path or link target contains traversal."""
+  return (
+      ".." in name
+      or name.startswith(("/", "\\"))
+      or (len(name) >= 2 and name[1] == ":")
+  )
+
+
+def _has_stored_zip_eocd_tail(
+    outer_stream: IO[bytes],
+    info: zipfile.ZipInfo,
+) -> bool:
+  """Checks whether a `ZIP_STORED` entry carries a trailing ZIP EOCD marker."""
+  if info.compress_type != zipfile.ZIP_STORED or info.file_size < 22:
+    return False
+  if not is_seekable_stream(outer_stream):
+    return False
+
+  saved_pos = outer_stream.tell()
+  try:
+    outer_stream.seek(info.header_offset)
+    local_header = outer_stream.read(30)
+    if len(local_header) < 30 or local_header[:4] != b"PK\x03\x04":
+      return False
+
+    fname_len = int.from_bytes(local_header[26:28], "little")
+    extra_len = int.from_bytes(local_header[28:30], "little")
+    data_start = info.header_offset + 30 + fname_len + extra_len
+    data_end = data_start + info.file_size
+    tail_start = max(data_start, data_end - 65558)
+    outer_stream.seek(tail_start)
+    tail_bytes = outer_stream.read(data_end - tail_start)
+    return b"PK\x05\x06" in tail_bytes
+  except (OSError, io.UnsupportedOperation, ValueError):
+    return False
+  finally:
+    try:
+      outer_stream.seek(saved_pos)
+    except (OSError, io.UnsupportedOperation, ValueError):
+      pass
+
+
 def extract_zip_contents(
     file_bytes: bytes | BinaryIO,
-) -> Generator[Tuple[str, IO[bytes]], None, None]:
+) -> Iterator[tuple[str, IO[bytes]]]:
   """Extracts the list of files and their contents from a zip file/stream.
 
   Args:
@@ -281,27 +458,101 @@ def extract_zip_contents(
       io.BytesIO(file_bytes) if isinstance(file_bytes, bytes) else file_bytes
   )
   with zipfile.ZipFile(stream) as zf:
-    for name in zf.namelist():
-      with zf.open(name) as f:
-        yield name, f
+    for info in zf.infolist():
+      if is_unsafe_archive_path(info.filename):
+        yield info.filename, io.BytesIO(b"")
+        continue
+      if info.is_dir():
+        continue
+      has_zip_tail = _has_stored_zip_eocd_tail(stream, info)
+      with zf.open(info) as f:
+        if has_zip_tail:
+          setattr(f, "_has_zip_eocd_tail", True)
+        yield info.filename, f
 
 
 def is_bz2_bytes(file_bytes: bytes | BinaryIO) -> bool:
   """Checks if the provided bytes represent a bz2 file."""
-  return _peek_bytes(file_bytes, 3).startswith(b"\x42\x5a\x68")
+  return peek_bytes(file_bytes, 3).startswith(b"\x42\x5a\x68")
 
 
 def extract_bz2_contents(file_bytes: bytes | BinaryIO) -> IO[bytes]:
   """Extracts contents from bz2 bytes/stream as a stream."""
-  stream = (
+  return bz2.open(
       io.BytesIO(file_bytes) if isinstance(file_bytes, bytes) else file_bytes
   )
-  return bz2.open(stream)
 
 
-def is_lzma_bytes(file_bytes: bytes | BinaryIO) -> bool:
-  """Checks if the provided bytes represent an lzma file."""
-  return _peek_bytes(file_bytes, 6).startswith(b"\xfd\x37\x7a\x58\x5a\x00")
+_XZ_MAGIC = b"\xfd\x37\x7a\x58\x5a\x00"
+_LZ4_FRAME_MAGIC = b"\x04\x22\x4d\x18"
+_ARCHIVE_PEEK_BYTES = 265
+_TRIAL_DECODE_BYTES = 512
+
+
+def _decodes_to_scannable_payload(
+    decompressor: Any, data: bytes, nesting: int, is_full_peek: bool
+) -> bool:
+  """Checks whether trial-decoding `data` yields a pickle, `.npy`, or archive."""
+  # Weak-magic headers also match numeric tensor bytes, so a header only counts
+  # when its decoded prefix is scannable. At the nesting limit the header is
+  # trusted so deeper nesting still reaches the archive recursion check.
+  if nesting >= constants.MAX_ARCHIVE_RECURSION_DEPTH:
+    return True
+  try:
+    prefix = decompressor.decompress(data, _TRIAL_DECODE_BYTES)
+  except (lzma.LZMAError, zlib.error):
+    return False
+
+  if not prefix:
+    # No output: a finished empty stream or a full peek of empty blocks is
+    # still unwrapped, but a short input that merely ran out is not a stream.
+    return decompressor.eof or is_full_peek
+
+  return (
+      prefix.startswith(b"\x93NUMPY")
+      or (
+          prefix[0] in constants.OPCODES_INFO_INT
+          and prefix[0] not in constants.NON_INITIAL_PICKLE_OPCODES
+      )
+      or detect_archive_type(prefix, _nesting=nesting + 1) is not None
+  )
+
+
+def is_lzma_bytes(file_bytes: bytes | BinaryIO, *, _nesting: int = 0) -> bool:
+  """Checks if `file_bytes` is an `.xz` or scannable `FORMAT_ALONE` LZMA stream.
+
+  Args:
+    file_bytes: Raw byte buffer or binary stream to inspect.
+    _nesting: Internal trial-decode nesting depth.
+
+  Returns:
+    True if `file_bytes` matches a supported LZMA header, or False otherwise.
+  """
+  header = peek_bytes(file_bytes, _ARCHIVE_PEEK_BYTES)
+  if header.startswith(_XZ_MAGIC):
+    return True
+  # `FORMAT_ALONE` needs valid properties, a non-zero size, and a zero first
+  # range-coder byte.
+  if (
+      len(header) < 14
+      or header[0] >= 225
+      or header[13]
+      or not any(header[5:13])
+  ):
+    return False
+
+  # Probe with the smallest dictionary so the trial decode stays cheap.
+  probe = (
+      header[:1]
+      + constants.MIN_LZMA_ALONE_DICT_BYTES.to_bytes(4, "little")
+      + header[5:]
+  )
+  return _decodes_to_scannable_payload(
+      lzma.LZMADecompressor(lzma.FORMAT_ALONE),
+      probe,
+      _nesting,
+      len(header) == _ARCHIVE_PEEK_BYTES,
+  )
 
 
 def extract_lzma_contents(file_bytes: bytes | BinaryIO) -> IO[bytes]:
@@ -309,12 +560,67 @@ def extract_lzma_contents(file_bytes: bytes | BinaryIO) -> IO[bytes]:
   stream = (
       io.BytesIO(file_bytes) if isinstance(file_bytes, bytes) else file_bytes
   )
-  return lzma.open(stream)
+  header = peek_bytes(stream, 6)
+  if header.startswith(_XZ_MAGIC):
+    return lzma.open(stream)
+  if (
+      int.from_bytes(header[1:5], "little")
+      > constants.MAX_LZMA_ALONE_DICT_BYTES
+  ):
+    raise lzma.LZMAError("FORMAT_ALONE dictionary exceeds the allowed size.")
+  return lzma.open(stream, format=lzma.FORMAT_ALONE)
+
+
+def _zlib_stream_offset(header: bytes) -> int:
+  """Returns the zlib stream offset past any joblib `ZF` length header."""
+  if not header.startswith(b"ZF"):
+    return 0
+  return 22 if header[21:22] == b" " else 21
+
+
+def is_zlib_bytes(file_bytes: bytes | BinaryIO, *, _nesting: int = 0) -> bool:
+  """Checks if `file_bytes` is a scannable zlib stream or joblib `ZF` file."""
+  header = peek_bytes(file_bytes, _ARCHIVE_PEEK_BYTES)
+  stream = header[_zlib_stream_offset(header) :]
+  has_zlib_header = (
+      len(stream) >= 2
+      and stream[0] & 0x0F == 8
+      and stream[0] >> 4 <= 7
+      and int.from_bytes(stream[:2], "big") % 31 == 0
+  )
+  return has_zlib_header and _decodes_to_scannable_payload(
+      zlib.decompressobj(),
+      stream,
+      _nesting,
+      len(header) == _ARCHIVE_PEEK_BYTES,
+  )
+
+
+def extract_zlib_contents(file_bytes: bytes) -> IO[bytes]:
+  """Extracts concatenated zlib streams, bounded by the decompression budget."""
+  remaining = file_bytes[_zlib_stream_offset(file_bytes[:22]) :]
+  limit = constants.MAX_ARCHIVE_DECOMPRESSED_BYTES + 1
+  chunks: list[bytes] = []
+  while remaining and limit > 0:
+    decompressor = zlib.decompressobj()
+    chunks.append(decompressor.decompress(remaining, limit))
+    limit -= len(chunks[-1])
+    remaining = decompressor.unused_data
+  return io.BytesIO(b"".join(chunks))
+
+
+def extract_lz4_contents(file_bytes: bytes) -> IO[bytes]:
+  """Extracts an LZ4 frame as a stream, or raises if `lz4` is unavailable."""
+  try:
+    lz4_frame = importlib.import_module("lz4.frame")
+  except ImportError as e:
+    raise ValueError("Cannot scan LZ4 frame: lz4 is not installed.") from e
+  return lz4_frame.open(io.BytesIO(file_bytes))
 
 
 def is_gzip_bytes(file_bytes: bytes | BinaryIO) -> bool:
   """Checks if the provided bytes represent a gzip file."""
-  return _peek_bytes(file_bytes, 2).startswith(b"\x1f\x8b")
+  return peek_bytes(file_bytes, 2).startswith(b"\x1f\x8b")
 
 
 def extract_gzip_contents(file_bytes: bytes | IO[bytes]) -> IO[bytes]:
@@ -325,25 +631,322 @@ def extract_gzip_contents(file_bytes: bytes | IO[bytes]) -> IO[bytes]:
   return cast(IO[bytes], gzip.open(stream))
 
 
-def is_tar_bytes(file_bytes: bytes | BinaryIO) -> bool:
-  """Checks if the provided bytes represent a tar file."""
-  peeked = _peek_bytes(file_bytes, 262)
-  return len(peeked) >= 262 and peeked[257:262] == b"ustar"
+def is_tar_bytes(file_bytes: bytes | IO[bytes] | io.IOBase) -> bool:
+  """Checks if `file_bytes` represents a valid `ustar` or legacy V7 tar archive.
+
+  Args:
+    file_bytes: Raw byte buffer or binary stream to inspect.
+
+  Returns:
+    True if `file_bytes` has a valid tar header, or False otherwise.
+  """
+  peeked_bytes = peek_bytes(file_bytes, 512)
+  has_ustar = len(peeked_bytes) >= 262 and peeked_bytes[257:262] == b"ustar"
+  has_v7_magic = (
+      len(peeked_bytes) >= 512
+      and peeked_bytes[0] != 0
+      and peeked_bytes[257:265] == b"\x00" * 8
+  )
+  if not has_ustar and not has_v7_magic:
+    return False
+  if len(peeked_bytes) < 512:
+    return not (peeked_bytes[0] == 0x80 and 1 <= peeked_bytes[1] <= 5)
+
+  try:
+    tarfile.TarInfo.frombuf(peeked_bytes[:512], "latin1", "surrogateescape")
+    return True
+  except (tarfile.HeaderError, ValueError):
+    return False
+
+
+def detect_archive_type(
+    data: bytes | IO[bytes] | io.IOBase,
+    *,
+    _nesting: int = 0,
+) -> Optional[str]:
+  """Identifies the archive format of `data`, or returns None.
+
+  Args:
+    data: Raw byte buffer or binary stream to inspect.
+    _nesting: Internal trial-decode nesting depth for weak-magic formats.
+
+  Returns:
+    The archive format identifier (`'zip'`, `'bz2'`, `'gzip'`, `'lz4'`,
+    `'tar'`, `'lzma'`, or `'zlib'`), or None if `data` is not a recognized
+    archive.
+  """
+  header = peek_bytes(data, 265)
+  if is_zip_bytes(header):
+    return "zip"
+  if is_bz2_bytes(header):
+    return "bz2"
+  if is_gzip_bytes(header):
+    return "gzip"
+  if header.startswith(_LZ4_FRAME_MAGIC):
+    return "lz4"
+  has_tar_candidate = (len(header) >= 262 and header[257:262] == b"ustar") or (
+      len(header) >= 265 and header[0] != 0 and header[257:265] == b"\x00" * 8
+  )
+  if has_tar_candidate and is_tar_bytes(data):
+    return "tar"
+  # Weak-magic formats run after every strong signature.
+  if is_lzma_bytes(header, _nesting=_nesting):
+    return "lzma"
+  if is_zlib_bytes(header, _nesting=_nesting):
+    return "zlib"
+  if _has_trailing_zip_eocd(data):
+    return "zip"
+  return None
 
 
 def extract_tar_contents(
     file_bytes: bytes | BinaryIO,
-) -> Generator[Tuple[str, IO[bytes]], None, None]:
+) -> Iterator[tuple[str, IO[bytes]]]:
   """Extracts contents from tar bytes/stream."""
   stream = (
       io.BytesIO(file_bytes) if isinstance(file_bytes, bytes) else file_bytes
   )
-  with tarfile.open(fileobj=stream, mode="r:*") as tf:
+
+  with tarfile.open(fileobj=stream, mode="r:") as tf:
     for member in tf.getmembers():
+      if (member.issym() or member.islnk()) and is_unsafe_archive_path(
+          member.linkname
+      ):
+        raise tarfile.TarError(
+            f"Unsafe tar link target detected: {member.linkname}"
+        )
+
+      if not member.isfile() and is_unsafe_archive_path(member.name):
+        raise tarfile.TarError(
+            f"Unsafe tar member path detected: {member.name}"
+        )
+
       if member.isfile():
         f = tf.extractfile(member)
         if f is not None:
           yield member.name, cast(IO[bytes], f)
+
+
+def _npy_descr_has_object(descr: Any) -> bool:
+  """Mirrors `numpy.lib.format.descr_to_dtype` to find object-dtype fields."""
+  if isinstance(descr, list):
+    return any(_npy_descr_has_object(tuple(field)[1:]) for field in descr)
+  if isinstance(descr, tuple):
+    return any(_npy_descr_has_object(part) for part in descr)
+  return "O" in repr(descr) or "object" in repr(descr)
+
+
+def _is_object_npy_header(header_bytes: bytes) -> bool:
+  """Checks whether a NumPy `.npy` header declares an object-dtype array."""
+  text = header_bytes.decode("latin1")
+  # NumPy also retries Python 2 headers after stripping `L` integer suffixes.
+  for candidate in (text, re.sub(r"(\d)L", r"\1", text)):
+    try:
+      return _npy_descr_has_object(ast.literal_eval(candidate)["descr"])
+    except SyntaxError:
+      continue
+    except (ValueError, TypeError, LookupError, RecursionError, MemoryError):
+      break
+  return True
+
+
+def _find_object_npy_data_offset(
+    prefix: bytes,
+    source: bytes | IO[bytes] | None,
+) -> int:
+  """Returns the embedded pickle byte offset for an object `.npy`, or `0`.
+
+  Args:
+    prefix: Leading bytes already peeked from the `.npy` candidate.
+    source: Full byte buffer or seekable stream when header exceeds `prefix`.
+
+  Returns:
+    The byte offset where the embedded pickle payload begins, or `0` if the
+    input is not a supported object-dtype `.npy` header.
+  """
+  if len(prefix) < 10 or not prefix.startswith(b"\x93NUMPY"):
+    return 0
+  ver = (prefix[6], prefix[7])
+  if ver == (1, 0):
+    hdr_start, hlen = 10, int.from_bytes(prefix[8:10], "little")
+  elif ver in ((2, 0), (3, 0)) and len(prefix) >= 12:
+    hdr_start, hlen = 12, int.from_bytes(prefix[8:12], "little")
+  else:
+    return 0
+  if hlen == 0 or hlen > 65536:
+    return 0
+
+  data_offset = hdr_start + hlen
+  if len(prefix) >= data_offset:
+    hdr_bytes = prefix[hdr_start:data_offset]
+  elif isinstance(source, bytes):
+    hdr_bytes = source[hdr_start:data_offset]
+  elif source is not None:
+    hdr_bytes = peek_bytes(source, data_offset)[hdr_start:data_offset]
+  else:
+    return 0
+
+  if len(hdr_bytes) < hlen or not _is_object_npy_header(hdr_bytes):
+    return 0
+  return data_offset
+
+
+def _clean_protocol0_line(raw_bytes: bytes) -> bytes:
+  r"""Strips NUL-byte truncation and trailing carriage returns from a line."""
+  return raw_bytes.split(b"\x00", 1)[0].rstrip(b"\r")
+
+
+def _is_valid_protocol0_global_prefix(raw_bytes: bytes) -> bool:
+  """Checks whether `raw_bytes` begins with a valid Protocol 0 `GLOBAL`/`INST`.
+
+  Args:
+    raw_bytes: Leading bytes of the candidate stream.
+
+  Returns:
+    True if `raw_bytes` starts with a syntactically valid Protocol 0 `GLOBAL`
+    or `INST` instruction, or False otherwise.
+  """
+  if not raw_bytes or raw_bytes[0] not in (ord("c"), ord("i")):
+    return False
+
+  first_newline_index = raw_bytes.find(b"\n")
+  if first_newline_index <= 1:
+    return False
+
+  second_newline_index = raw_bytes.find(b"\n", first_newline_index + 1)
+  if second_newline_index <= first_newline_index + 1:
+    return False
+
+  module_bytes = _clean_protocol0_line(raw_bytes[1:first_newline_index])
+  attribute_bytes = _clean_protocol0_line(
+      raw_bytes[first_newline_index + 1 : second_newline_index]
+  )
+  module_name = module_bytes.decode("latin1", errors="ignore")
+  attribute_name = attribute_bytes.decode("latin1", errors="ignore")
+  if not module_name or not attribute_name:
+    return False
+
+  name_parts = module_name.split(".") + attribute_name.split(".")
+  parts_valid = all(part.isidentifier() for part in name_parts)
+  return parts_valid
+
+
+def _read_protocol0_line(stream: IO[bytes]) -> bytes:
+  """Reads one newline-terminated Protocol 0 argument without its newline."""
+  raw_line = stream.readline()
+  if not raw_line.endswith(b"\n"):
+    raise ValueError("Truncated newline-terminated argument")
+  return raw_line[:-1]
+
+
+def _check_pickle_stream(
+    raw_bytes: bytes,
+    pickle_stream: IO[bytes],
+    check_magic_bytes: bool,
+) -> tuple[bool, int]:
+  """Validates whether `pickle_stream` starts with valid pickle opcodes.
+
+  Args:
+    raw_bytes: Leading bytes peeked from the start of `pickle_stream`.
+    pickle_stream: Binary stream positioned at the start of the candidate data.
+    check_magic_bytes: Whether to fast-path reject text files and non-object
+      NumPy arrays using magic-byte heuristics.
+
+  Returns:
+    A tuple `(is_valid_pickle, valid_opcodes_count)` indicating whether the
+    stream is likely a valid pickle payload and how many opcodes were read.
+  """
+  if raw_bytes and raw_bytes[0] not in constants.OPCODES_INFO_INT:
+    return (False, 0)
+
+  if raw_bytes.startswith(b"\x93NUMPY"):
+    offset = _find_object_npy_data_offset(raw_bytes, pickle_stream)
+    return (offset > 0, 1 if offset > 0 else 0)
+
+  if check_magic_bytes:
+    if raw_bytes.isascii():
+      stripped_bytes = raw_bytes.lstrip()
+      has_non_pickle_text_prefix = (
+          stripped_bytes.startswith(constants.TEXT_BASED_PREFIXES)
+          or stripped_bytes.startswith(constants.CODE_KEYWORDS)
+          or stripped_bytes.isalpha()
+      )
+      if has_non_pickle_text_prefix and not _is_valid_protocol0_global_prefix(
+          raw_bytes
+      ):
+        return (False, 0)
+
+  valid_opcodes_count = 0
+  while True:
+    charcode = pickle_stream.read(1)
+    if not charcode:
+      return (valid_opcodes_count >= 3, valid_opcodes_count)
+
+    decoded_char = charcode.decode("latin-1")
+    if decoded_char == ".":
+      valid_opcodes_count += 1
+      return (True, valid_opcodes_count)
+
+    opcode = constants.OPCODES_INFO.get(decoded_char)
+    if opcode is None:
+      return (valid_opcodes_count >= 3, valid_opcodes_count)
+
+    valid_opcodes_count += 1
+    if valid_opcodes_count > constants.MAX_BYTES_TO_CHECK:
+      return (True, valid_opcodes_count)
+
+    if opcode.arg is None:
+      continue
+
+    if opcode.name in constants.PAYLOAD_PREFIX_SIZES and is_seekable_stream(
+        pickle_stream
+    ):
+      prefix_size = constants.PAYLOAD_PREFIX_SIZES[opcode.name]
+      len_bytes = pickle_stream.read(prefix_size)
+      if len(len_bytes) != prefix_size:
+        return (valid_opcodes_count >= 3, valid_opcodes_count)
+
+      payload_len = int.from_bytes(len_bytes, "little")
+      cur_pos = pickle_stream.tell()
+      known_end_pos = getattr(pickle_stream, "_orig_file_size", None)
+      if known_end_pos is None:
+        known_end_pos = getattr(pickle_stream, "size", None)
+      if isinstance(known_end_pos, int):
+        end_pos = known_end_pos
+      else:
+        pickle_stream.seek(0, io.SEEK_END)
+        end_pos = pickle_stream.tell()
+      if cur_pos + payload_len > end_pos:
+        return (valid_opcodes_count >= 3, valid_opcodes_count)
+
+      pickle_stream.seek(cur_pos + payload_len)
+      continue
+
+    try:
+      if opcode.name in ("INT", "LONG", "PUT", "GET"):
+        raw_line = _read_protocol0_line(pickle_stream)
+        clean_number_bytes = _clean_protocol0_line(raw_line).rstrip(b"L")
+        if clean_number_bytes not in (b"00", b"01"):
+          int(clean_number_bytes, 0)
+      elif opcode.name == "FLOAT":
+        float(_clean_protocol0_line(_read_protocol0_line(pickle_stream)))
+      elif opcode.name == "STRING":
+        clean_str_bytes = _read_protocol0_line(pickle_stream).rstrip(b"\r")
+        if (
+            len(clean_str_bytes) < 2
+            or clean_str_bytes[0:1] not in (b"'", b'"')
+            or clean_str_bytes[-1:] != clean_str_bytes[0:1]
+        ):
+          raise ValueError("Unquoted string argument")
+      elif opcode.name in ("UNICODE", "PERSID"):
+        _read_protocol0_line(pickle_stream)
+      elif opcode.name in ("GLOBAL", "INST"):
+        _read_protocol0_line(pickle_stream)
+        _read_protocol0_line(pickle_stream)
+      else:
+        _ = opcode.arg.reader(pickle_stream)
+    except ValueError:
+      return (valid_opcodes_count >= 3, valid_opcodes_count)
 
 
 def is_pickle_file(
@@ -377,188 +980,89 @@ def is_pickle_file(
         - False if the input is not a valid pickle file.
   """
   original_pos = None
-  is_seekable = True
-  if isinstance(pickle_bytes, bytes):
-    raw_bytes = pickle_bytes
-    pickle_stream = io.BytesIO(pickle_bytes)
+  if isinstance(pickle_bytes, (bytes, bytearray, memoryview)):
+    raw_bytes = bytes(pickle_bytes[:1024])
+    pickle_stream: IO[bytes] = io.BytesIO(bytes(pickle_bytes))
+  elif is_seekable_stream(pickle_bytes):
+    original_pos = pickle_bytes.tell()
+    raw_bytes = peek_bytes(pickle_bytes, 1024)
+    pickle_stream = pickle_bytes
   else:
-    try:
-      original_pos = pickle_bytes.tell()
-    except (OSError, io.UnsupportedOperation, AttributeError):
-      is_seekable = False
+    raw_bytes = peek_bytes(pickle_bytes, 1024) or pickle_bytes.read(1024)
+    pickle_stream = io.BytesIO(raw_bytes)
 
-    if is_seekable:
-      # Read a chunk to check text-based and non-pickle-magic prefixes safely
-      raw_bytes = pickle_bytes.read(1024)
-      pickle_bytes.seek(original_pos)  # pyrefly: ignore[bad-argument-type]
-      pickle_stream = pickle_bytes
-    else:
-      # Fallback for non-seekable stream: try to peek without advancing pointer
-      if hasattr(pickle_bytes, "peek"):
-        try:
-          raw_bytes = pickle_bytes.peek(1024)
-          pickle_stream = pickle_bytes
-        except (OSError, io.UnsupportedOperation):
-          raw_bytes = pickle_bytes.read(1024)
-          pickle_stream = io.BytesIO(raw_bytes)
-      else:
-        raw_bytes = pickle_bytes.read(1024)
-        pickle_stream = io.BytesIO(raw_bytes)
-
-  if raw_bytes:
-    first_byte = raw_bytes[0]
-    if first_byte not in constants.OPCODES_INFO_INT:
-      if return_num_bytes_read:
-        return (False, 0)
-      return False
-
-  if check_magic_bytes:
-    pickle_file_is_ascii = raw_bytes.isascii()
-
-    if pickle_file_is_ascii:
-      stripped_bytes = raw_bytes.lstrip()
-      if stripped_bytes.startswith(
-          constants.TEXT_BASED_PREFIXES
-      ) or stripped_bytes.startswith(constants.CODE_KEYWORDS):
-        if return_num_bytes_read:
-          return (False, 0)
-        return False
-
-    if raw_bytes.startswith(constants.NON_PICKLE_MAGIC_BYTES):
-      if raw_bytes[0] not in constants.OPCODES_INFO_INT:
-        if return_num_bytes_read:
-          return (False, 0)
-        return False
-
-  valid_opcodes_count = 0
   try:
-    while True:
-      charcode = pickle_stream.read(1)
-      if not charcode:  # EOF reached without STOP
-        is_suspected_pickle = valid_opcodes_count >= 3
-        if return_num_bytes_read:
-          return (is_suspected_pickle, valid_opcodes_count)
-        return is_suspected_pickle
-
-      decoded_char = charcode.decode("latin-1")
-      if decoded_char == ".":  # STOP opcode found
-        valid_opcodes_count += 1
-        if return_num_bytes_read:
-          return (True, valid_opcodes_count)
-        return True
-
-      opcode = constants.OPCODES_INFO.get(decoded_char)
-      if opcode is None:  # Invalid opcode before STOP
-        is_suspected_pickle = valid_opcodes_count >= 3
-        if return_num_bytes_read:
-          return (is_suspected_pickle, valid_opcodes_count)
-        return is_suspected_pickle
-
-      valid_opcodes_count += 1
-      if valid_opcodes_count > constants.MAX_BYTES_TO_CHECK:
-        if return_num_bytes_read:
-          return (True, valid_opcodes_count)
-        return True
-
-      if opcode.arg is None:
-        continue
-
-      if opcode.name in constants.PAYLOAD_PREFIX_SIZES and hasattr(
-          pickle_stream, "seek"
-      ):
-        prefix_size = constants.PAYLOAD_PREFIX_SIZES[opcode.name]
-        len_bytes = pickle_stream.read(prefix_size)
-        if len(len_bytes) != prefix_size:
-          is_suspected_pickle = valid_opcodes_count >= 3
-          return (
-              (is_suspected_pickle, valid_opcodes_count)
-              if return_num_bytes_read
-              else is_suspected_pickle
-          )
-
-        payload_len = int.from_bytes(len_bytes, "little")
-        cur_pos = pickle_stream.tell()
-        stream_end_pos = pickle_stream.seek(0, io.SEEK_END)
-        if cur_pos + payload_len > stream_end_pos:
-          is_suspected_pickle = valid_opcodes_count >= 3
-          return (
-              (is_suspected_pickle, valid_opcodes_count)
-              if return_num_bytes_read
-              else is_suspected_pickle
-          )
-
-        pickle_stream.seek(cur_pos + payload_len)
-        continue
-
-      try:
-        _ = opcode.arg.reader(pickle_stream)
-      except ValueError:
-        is_suspected_pickle = valid_opcodes_count >= 3
-        if return_num_bytes_read:
-          return (is_suspected_pickle, valid_opcodes_count)
-        return is_suspected_pickle
+    is_valid, opcodes_count = _check_pickle_stream(
+        raw_bytes, pickle_stream, check_magic_bytes
+    )
+    return (is_valid, opcodes_count) if return_num_bytes_read else is_valid
   finally:
     if original_pos is not None:
       pickle_stream.seek(original_pos)
 
 
-def find_pickle_start_offset(pickle_bytes: bytes | IO[bytes]) -> int:
-  """Finds the start offset of a valid pickle payload in the bytes."""
-  if isinstance(pickle_bytes, bytes):
-    max_search_len = min(len(pickle_bytes), 1024)
-    for offset in range(max_search_len):
-      char = pickle_bytes[offset : offset + 1]
-      if not char:
-        break
-      try:
-        decoded_char = char.decode("latin-1")
-      except UnicodeDecodeError:
-        continue
-      if decoded_char not in constants.OPCODES_INFO:
-        continue
-      if is_pickle_file(pickle_bytes[offset:]):
+def find_pickle_start_offset(
+    pickle_bytes: bytes | IO[bytes] | io.IOBase,
+) -> int:
+  """Finds the start offset of a valid pickle payload in `pickle_bytes`.
+
+  Args:
+    pickle_bytes: Raw byte buffer or seekable binary stream to inspect.
+
+  Returns:
+    The integer byte offset where a valid pickle stream starts, or `0` if none
+    is found within the leading window.
+  """
+  if isinstance(pickle_bytes, (bytes, bytearray, memoryview)):
+    raw_buffer = bytes(pickle_bytes)
+    header_bytes = raw_buffer[:1024]
+    original_pos = 0
+    seekable_stream = None
+  elif is_seekable_stream(pickle_bytes):
+    seekable_stream = cast(IO[bytes], pickle_bytes)
+    original_pos = seekable_stream.tell()
+    header_bytes = peek_bytes(seekable_stream, 1024)
+    raw_buffer = None
+  else:
+    return 0
+
+  if header_bytes.startswith(b"\x93NUMPY"):
+    offset = _find_object_npy_data_offset(
+        header_bytes, raw_buffer if raw_buffer is not None else seekable_stream
+    )
+    if offset > 0 and (
+        raw_buffer is None or is_pickle_file(raw_buffer[offset:])
+    ):
+      return offset
+    return 0
+
+  for offset in range(len(header_bytes)):
+    opcode_byte = header_bytes[offset]
+    if opcode_byte not in constants.OPCODES_INFO_INT or (
+        offset > 0 and opcode_byte in constants.NON_INITIAL_PICKLE_OPCODES
+    ):
+      continue
+    if raw_buffer is not None:
+      if is_pickle_file(raw_buffer[offset:]):
         return offset
-    return 0
-
-  # It is a stream
-  stream = pickle_bytes
-  try:
-    original_pos = stream.tell()
-    # Read 1024 bytes to find candidates
-    header_bytes = stream.read(1024)
-    stream.seek(original_pos)
-  except (OSError, AttributeError, io.UnsupportedOperation):
-    return 0
-
-  max_search_len = len(header_bytes)
-  for offset in range(max_search_len):
-    char = header_bytes[offset : offset + 1]
-    if not char:
-      break
-    try:
-      decoded_char = char.decode("latin-1")
-    except UnicodeDecodeError:
       continue
-    if decoded_char not in constants.OPCODES_INFO:
-      continue
-
-    # Verify candidate offset using the stream
+    assert seekable_stream is not None
     try:
-      stream.seek(original_pos + offset)
-      if is_pickle_file(stream):
+      seekable_stream.seek(original_pos + offset)
+      if is_pickle_file(seekable_stream):
         return offset
     except (OSError, AttributeError, io.UnsupportedOperation):
       pass
     finally:
       try:
-        stream.seek(original_pos)
+        seekable_stream.seek(original_pos)
       except (OSError, AttributeError, io.UnsupportedOperation):
-        pass  # If we can't seek back, it poses an issue
+        pass
 
   return 0
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def get_module_members(module_name: str) -> Set[str] | None:
   """Tries to get module members by parsing the source file without execution of __init__.py.
 
@@ -573,25 +1077,31 @@ def get_module_members(module_name: str) -> Set[str] | None:
     4. If spec is not present and its origin does not exist.
   """
 
-  # If module is already imported, __init__.py will not be called while
-  # importing the module again
-  if module_name in sys.modules:
-    try:
-      imported_module = importlib.import_module(module_name)
-    except ImportError:
-      return None
-    members = {member for member, _ in inspect.getmembers(imported_module)}
+  # Use dir() on already-loaded modules instead of inspect.getmembers() so
+  # PEP 562 module __getattr__ hooks do not execute lazy submodules on scan.
+  if (imported_module := sys.modules.get(module_name)) is not None:
+    members = set(dir(imported_module))
     return members
 
-  if (spec := importlib.util.find_spec(module_name)) is None:
+  try:
+    spec = importlib.util.find_spec(module_name)
+  except (ImportError, AttributeError, ValueError):
     return None
-  if (origin := spec.origin) is None:
+  if spec is None:
+    return None
+  if (origin := spec.origin) is None or origin in ("built-in", "frozen"):
     return None
 
   try:
     with open(origin, "r") as f:
       tree = ast.parse(f.read(), filename=origin)
-  except (IOError, ValueError, SyntaxError, RecursionError):
+  except (
+      IOError,
+      OSError,
+      ValueError,
+      SyntaxError,
+      RecursionError,
+  ):
     return None
 
   members = {
@@ -632,7 +1142,7 @@ def get_optimal_workers(file_size: int) -> int:
 
 def matches_symbol_prefix_list(
     symbol: str,
-    prefixes: Sequence[str] | Set[str] | FrozenSet[str],
+    prefixes: Iterable[str],
     *,
     match_suffix: bool = False,
 ) -> bool:
@@ -707,6 +1217,14 @@ def is_self_protected_symbol(symbol: str) -> bool:
   ):
     return False
 
+  segments = normalized_symbol.replace(" ", ".").split(".")
+  if any(
+      segment in constants.SELF_PROTECTED_MODULES
+      or segment == "set_config_path"
+      for segment in segments
+  ):
+    return True
+
   return matches_symbol_prefix_list(
       normalized_symbol, constants.SELF_PROTECTED_PREFIXES, match_suffix=True
   )
@@ -750,30 +1268,26 @@ def resolve_library_modules_from_results(
     final_results: A set of strings with libraries and their corresponding
     members joined by a dot, along with any other strings from the original set.
   """
-  # Items with a dot are assumed to be fully qualified already.
-  # In case we run into cases such as os.path and join, this is a non-issue
-  # since this is moreso for better readability than precise library-to-member
-  # connections (ideal final result being os.path.join).
-  # Without explicit runtime introspection, the above case is not
-  # possible to resolve without risks of accidentally importing a
-  # module we don't want to.
-  final_results = {s for s in set_of_results if "." in s}
+  final_results = {symbol for symbol in set_of_results if "." in symbol}
   candidates = set_of_results - final_results
 
   # Identify which of the remaining candidates are actual importable modules.
   importable_modules = {}
-  for name in candidates:
-    module_name = name.split(".")[0]
-    if module_name == "__main__":
+  for candidate_name in candidates:
+    module_name = candidate_name.split(".")[0]
+    if module_name == "__main__" or is_self_protected_symbol(candidate_name):
       continue
 
     # Find spec to avoid importing risky modules from a loose python file
     # like import.py or similar.
-    module_spec = importlib.util.find_spec(name)
+    try:
+      module_spec = importlib.util.find_spec(candidate_name)
+    except (ImportError, AttributeError, ValueError):
+      module_spec = None
     if module_spec is not None:
-      module_members = get_module_members(name)
+      module_members = get_module_members(candidate_name)
       if module_members is not None:
-        importable_modules[name] = module_members
+        importable_modules[candidate_name] = module_members
 
   resolved_candidates = set()
   # Combine modules with any members found in the candidates list.
@@ -809,7 +1323,7 @@ def resolve_library_modules_from_results(
     result_classification = classify_symbol(result)
     if (
         base_library in final_results
-        and base_library != "builtins"
+        and base_library not in ("builtins", "__builtin__")
         and (
             classify_symbol(base_library) == result_classification
             or result_classification == Classification.UNSAFE
@@ -821,6 +1335,8 @@ def resolve_library_modules_from_results(
         and base_module in final_results
         and base_module not in constants.UNSAFE_STRINGS
         and base_module not in constants.SUSPICIOUS_STRINGS
+        and base_module not in constants.DANGEROUS_PACKAGE_MEMBERS
+        and not is_dunder_or_introspection_attr(base_module)
         and (
             classify_symbol(base_module) == result_classification
             or result_classification == Classification.UNSAFE
@@ -852,103 +1368,6 @@ def resolve_library_modules_from_results(
   final_results.difference_update(underspecific_qualified_modules_to_remove)
 
   return final_results
-
-
-def is_valid_python_interpreter(path: str) -> bool:
-  """Checks if a given path points to a valid Python interpreter.
-
-  Args:
-    path: The path to the potential Python interpreter.
-
-  Returns:
-    True if the path is a valid and executable Python interpreter, False
-    otherwise.
-  """
-  if not path or not os.path.exists(path):
-    return False
-
-  if "python" not in path:
-    return False
-
-  try:
-    # pass is a valid python keyword to test in python -c
-    subprocess.check_call(
-        [path, "-c", "pass"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    return True
-  # If "python -c pass" doesn't work, we assume the interpreter is not valid.
-  except (OSError, subprocess.CalledProcessError):
-    return False
-
-
-def get_interpreter_path_to_patch() -> str | None:
-  """Returns a valid Python interpreter path if one can be found."""
-  py_intrp_candidate = sys.argv[0]
-  python_path = "/usr/bin/python3"
-
-  if is_valid_python_interpreter(py_intrp_candidate):
-    return py_intrp_candidate
-
-  logging.warning(
-      "Warning: %s (sys.argv[0]) is not a valid interpreter.",
-      py_intrp_candidate,
-  )
-  if os.path.exists(python_path):
-    return python_path
-
-  return None
-
-
-def is_sys_executable_to_path_set(path: str | None) -> bool:
-  """Checks if sys.executable is set to the given path."""
-  if sys.executable == path or (sys.executable and "python" in sys.executable):
-    return True
-  elif path:
-    logging.info("Patching sys.executable to %s", path)
-    sys.executable = path
-    return True
-
-  logging.warning("sys.executable is not set to a valid interpreter.")
-  sys.executable = None  # pyrefly: ignore[bad-assignment]
-  return False
-
-
-def is_sys_executable_patched() -> bool:
-  """Patches `sys.executable` if it's not set.
-
-  This function attempts to set `sys.executable` to a valid Python interpreter
-  path. It first tries `sys.argv[0]`. If that's not a valid interpreter, it
-  falls back to "/usr/bin/python3". If neither is valid, `sys.executable` is
-  set to None.
-
-  Returns:
-    True if `sys.executable` was successfully patched to a valid path, False
-    otherwise.
-  """
-  if sys.executable and os.path.exists(sys.executable):
-    return True
-
-  py_interpreter_candidate = sys.argv[0]
-
-  # If sys.executable is not set, we patch it with the interpreter path that
-  # was passed to the subprocess. If the path is not valid, we patch it with an
-  # empty string to indicate that it's invalid.
-  if not sys.executable:
-    valid_py_interpreter_path = get_interpreter_path_to_patch()
-
-    for interpreter_path in [
-        valid_py_interpreter_path,
-        py_interpreter_candidate,
-    ]:
-      if (
-          interpreter_path and os.path.exists(interpreter_path)
-      ) and is_sys_executable_to_path_set(interpreter_path):
-        return True
-
-  logging.warning("Warning: sys.executable is not set to a valid interpreter.")
-  return False
 
 
 @functools.lru_cache(maxsize=32)
@@ -1261,6 +1680,16 @@ def _inspect_referenced_class(
   return False
 
 
+def _unwrap_callable(func: Any) -> Any:
+  """Unwraps `staticmethod`/`classmethod` descriptors and function wrappers."""
+  if isinstance(func, (staticmethod, classmethod)):
+    func = func.__func__
+  try:
+    return inspect.unwrap(func)
+  except (TypeError, ValueError):
+    return func
+
+
 def _callable_has_dangerous_bytecode(
     func: Any,
     *,
@@ -1271,12 +1700,7 @@ def _callable_has_dangerous_bytecode(
     visited_ids: set[Any] | None = None,
 ) -> bool:
   """Checks a Python function's bytecode, globals, closures, and helpers."""
-  if isinstance(func, (staticmethod, classmethod)):
-    func = func.__func__
-  try:
-    unwrapped = inspect.unwrap(func)
-  except (TypeError, ValueError):
-    unwrapped = func
+  unwrapped = _unwrap_callable(func)
 
   code_object = getattr(unwrapped, "__code__", None)
   if not isinstance(unwrapped, types.FunctionType) or not isinstance(
@@ -1298,12 +1722,7 @@ def _callable_has_dangerous_bytecode(
 
   while worklist:
     target, fallback_mod, target_ancs = worklist.popleft()
-    if isinstance(target, (staticmethod, classmethod)):
-      target = target.__func__
-    try:
-      target_unwrapped = inspect.unwrap(target)
-    except (TypeError, ValueError):
-      target_unwrapped = target
+    target_unwrapped = _unwrap_callable(target)
 
     if isinstance(target_unwrapped, types.ModuleType):
       if _is_dangerous_referenced_module(
@@ -1396,9 +1815,7 @@ def _classify_approved_root_function(
 ) -> Classification:
   """Classifies a live non-type callable under an approved root package."""
   if root_package in constants.RESTRICTED_APPROVED_ROOTS:
-    if (
-        root_package == "dataclasses" and symbol_name == "dataclass"
-    ) or symbol_name in constants.SAFE_DUNDER_RECONSTRUCTORS:
+    if symbol_name in constants.SAFE_DUNDER_RECONSTRUCTORS:
       return Classification.SAFE
     return Classification.UNKNOWN
 
@@ -1495,10 +1912,7 @@ def _is_unsafe_class_path(full_name: str) -> bool:
       "__builtin__",
   ):
     return True
-  return any(
-      full_name == unsafe or full_name.startswith(f"{unsafe}.")
-      for unsafe in constants.UNSAFE_STRINGS
-  )
+  return matches_symbol_prefix_list(full_name, constants.UNSAFE_STRINGS)
 
 
 def _collect_ast_imports(
@@ -1657,6 +2071,9 @@ def _ast_hook_status(
       and isinstance(node.value, ast.Name)
       and node.value.id == first_arg
   }
+  call_func_ids = {
+      id(node.func) for node in walk_nodes if isinstance(node, ast.Call)
+  }
   load_attrs = {
       node.attr
       for node in walk_nodes
@@ -1738,6 +2155,12 @@ def _ast_hook_status(
       ):
         helpers.append(("cls", child.attr))
       elif is_self and not isinstance(child.ctx, ast.Store):
+        if (
+            not is_restricted
+            and id(child) not in call_func_ids
+            and not is_dunder_or_introspection_attr(child.attr)
+        ):
+          continue
         allowed_self = (
             constants.UNPICKLE_LIFECYCLE_HOOKS
             | assigned_self_attrs
@@ -1818,9 +2241,7 @@ def _classify_ast_reexport(
       for seg in re_segs
   ):
     return Classification.UNSAFE
-  if reexported in constants.SUSPICIOUS_STRINGS or any(
-      reexported.startswith(f"{s}.") for s in constants.SUSPICIOUS_STRINGS
-  ):
+  if matches_symbol_prefix_list(reexported, constants.SUSPICIOUS_STRINGS):
     return Classification.SUSPICIOUS
 
   return (
@@ -1979,9 +2400,10 @@ def _inspect_ast_class_node(
 
   hooks_to_check = constants.UNPICKLE_LIFECYCLE_HOOKS | extra_hooks
   unknown_only = (
-      {"__init__"} | (set() if is_restricted else {"__new__"})
+      {"__init__"}
+      | (set() if is_restricted else constants.NON_RESTRICTED_UNKNOWN_HOOKS)
   ) - extra_hooks
-  ordered_hooks = sorted(hooks_to_check, key=lambda h: h in unknown_only)
+  ordered_hooks = sorted(hooks_to_check, key=unknown_only.__contains__)
   for hook_name in ordered_hooks:
     fail_cls = (
         Classification.UNKNOWN
@@ -2088,7 +2510,7 @@ def _inspect_class_via_ast(
     is_restricted = root_pkg in constants.RESTRICTED_APPROVED_ROOTS
     if is_restricted or not _is_reconstructor_name(symbol_name):
       return Classification.UNKNOWN
-    return _ast_hook_status(
+    fn_verdict = _ast_hook_status(
         top_funcs[symbol_name],
         file_ctx,
         import_map,
@@ -2096,6 +2518,9 @@ def _inspect_class_via_ast(
         top_classes,
         depth=depth,
     )
+    if fn_verdict == Classification.SUSPICIOUS:
+      return Classification.UNKNOWN
+    return fn_verdict
 
   if symbol_name not in top_classes:
     if symbol_name not in import_map:
@@ -2144,10 +2569,6 @@ def _resolve_dotted_path_in_sys_modules(dotted_path: str) -> Any | None:
 def _is_installed_root_package(root_package: str) -> bool:
   """Checks whether a root package is loaded in `sys.modules` or installed.
 
-  Verifies that `root_package` is a valid Python identifier and checks
-  whether it is already present in `sys.modules` or discoverable via
-  `importlib.util.find_spec`.
-
   Args:
     root_package: Top-level package name to check.
 
@@ -2171,11 +2592,6 @@ def _classify_loaded_class_mro(
     extra_hooks: frozenset[str] = frozenset(),
 ) -> Classification:
   """Classifies a live class object by inspecting its module, MRO, and methods.
-
-  Walks `target_class.__mro__` to verify that no ancestor originates from an
-  unsafe package or defines dangerous pickle lifecycle hooks, and checks
-  whether `target_class` inherits from an approved base class or has safe
-  unpickling lifecycle hooks.
 
   Args:
     target_class: The live `type` object resolved from `sys.modules`.
@@ -2239,7 +2655,12 @@ def _classify_loaded_class_mro(
 
     anc_hooks = constants.UNPICKLE_LIFECYCLE_HOOKS | extra_hooks
     unknown_only = (
-        {"__init__"} | (set() if is_restricted_root else {"__new__"})
+        {"__init__"}
+        | (
+            set()
+            if is_restricted_root
+            else constants.NON_RESTRICTED_UNKNOWN_HOOKS
+        )
     ) - extra_hooks
     for ancestor in non_approved_ancestors:
       if disallowed_hooks.intersection(ancestor.__dict__):
@@ -2258,12 +2679,7 @@ def _classify_loaded_class_mro(
             if hook_name in unknown_only
             else Classification.SUSPICIOUS
         )
-        raw_hook = ancestor.__dict__[hook_name]
-        unwrapped_hook = inspect.unwrap(
-            raw_hook.__func__
-            if isinstance(raw_hook, (staticmethod, classmethod))
-            else raw_hook
-        )
+        unwrapped_hook = _unwrap_callable(ancestor.__dict__[hook_name])
         if (
             is_restricted_root
             and hook_name == "__setstate__"
@@ -2421,9 +2837,6 @@ def classify_approved_root_symbol(
   return Classification.UNKNOWN
 
 
-is_safe_class_dynamic = classify_approved_root_symbol
-
-
 def is_dunder_or_introspection_attr(attribute_name: str) -> bool:
   """Checks if `attribute_name` is a non-reconstructor dunder or frame attr.
 
@@ -2479,17 +2892,21 @@ def classify_symbol(symbol: str) -> Classification:
     joined = f"{tokens[0]}.{tokens[1]}"
     root_mod = tokens[0].split(".")[0]
     if all(part.isidentifier() for part in joined.split(".")) and (
-        root_mod in ("__builtin__",)
-        or root_mod in constants.APPROVED_ROOT_PACKAGES
+        root_mod in constants.APPROVED_ROOT_PACKAGES
         or root_mod in constants.UNSAFE_ROOT_PACKAGES
         or root_mod in constants.ALL_STRINGS
         or _is_installed_root_package(root_mod)
     ):
       symbol_clean = joined
 
-  parts = (
+  raw_parts = (
       symbol_clean.split(".")
       if ("." in symbol_clean and " " not in symbol_clean)
+      else []
+  )
+  parts = (
+      raw_parts
+      if all(identifier_part.isidentifier() for identifier_part in raw_parts)
       else []
   )
   if parts:
@@ -2513,24 +2930,35 @@ def classify_symbol(symbol: str) -> Classification:
   if symbol_clean in constants.SUSPICIOUS_STRINGS:
     return Classification.SUSPICIOUS
 
-  if (
-      symbol_clean in constants.SAFE_STRINGS
-      or symbol_clean in constants.INTERNAL_SANDBOX_SAFE_SYMBOLS
-  ):
+  if symbol_clean in constants.INTERNAL_SANDBOX_SAFE_SYMBOLS:
+    return Classification.SAFE
+
+  if is_self_protected_symbol(symbol_clean):
+    return Classification.UNSAFE
+
+  if symbol_clean in constants.SAFE_STRINGS:
     return Classification.SAFE
 
   if parts and (
       parts[0] in constants.UNSAFE_ROOT_PACKAGES
       or any(part in constants.DANGEROUS_EXEC_MODULES for part in parts[1:])
+      or matches_symbol_prefix_list(symbol_clean, constants.UNSAFE_STRINGS)
   ):
     return Classification.UNSAFE
 
-  if any(symbol_clean.startswith(f"{u}.") for u in constants.UNSAFE_STRINGS):
-    return Classification.UNSAFE
+  if (
+      len(parts) >= 2
+      and (mapped := _COMPAT_PICKLE.NAME_MAPPING.get((parts[0], parts[1])))
+      is not None
+  ):
+    mapped_symbol = ".".join((*mapped, *parts[2:]))
+    if mapped_symbol != symbol_clean:
+      return classify_symbol(mapped_symbol)
 
-  if any(
-      symbol_clean.startswith(f"{s}.") for s in constants.SUSPICIOUS_STRINGS
-  ) or (parts and parts[-1] in constants.SUSPICIOUS_STRINGS):
+  if parts and (
+      matches_symbol_prefix_list(symbol_clean, constants.SUSPICIOUS_STRINGS)
+      or parts[-1] in constants.SUSPICIOUS_STRINGS
+  ):
     return Classification.SUSPICIOUS
 
   if parts:
@@ -2548,17 +2976,107 @@ def classify_symbol(symbol: str) -> Classification:
     ):
       return Classification.SAFE
 
+    if any(is_dunder_or_introspection_attr(part) for part in parts[1:]):
+      return Classification.SUSPICIOUS
+  elif (
+      is_dunder_or_introspection_attr(symbol_clean)
+      and symbol_clean not in constants.SAFE_METADATA_ATTRIBUTES
+  ):
+    return Classification.SUSPICIOUS
+
   if parts and parts[0] in constants.APPROVED_ROOT_PACKAGES:
-    if parts[-1] in constants.SAFE_DUNDER_RECONSTRUCTORS or (
-        parts[0] == "dataclasses" and parts[-1] == "dataclass"
-    ):
+    if parts[-1] in constants.SAFE_DUNDER_RECONSTRUCTORS:
       return Classification.SAFE
     return classify_approved_root_symbol(symbol_clean) or Classification.UNKNOWN
 
-  if any(symbol_clean.startswith(f"{s}.") for s in constants.SAFE_STRINGS):
-    return Classification.SAFE
+  if len(parts) >= 2 and parts[0] in _COMPAT_PICKLE.IMPORT_MAPPING:
+    mapped_symbol = ".".join(
+        (_COMPAT_PICKLE.IMPORT_MAPPING[parts[0]], *parts[1:])
+    )
+    if mapped_symbol != symbol_clean:
+      return classify_symbol(mapped_symbol)
 
   return Classification.UNKNOWN
+
+
+def resolve_extension_code(code: int) -> str:
+  """Resolves a `copyreg` extension code to its registered `'module.name'`."""
+  inverted_registry = getattr(copyreg, "_inverted_registry", {})
+  key = inverted_registry.get(code)
+  if isinstance(key, tuple) and len(key) == 2:
+    return f"{key[0]}.{key[1]}"
+  return f"unregistered_extension.code_{code}"
+
+
+def is_potentially_dangerous_literal(operand: str) -> bool:
+  """Checks whether a string operand matches dangerous literal or dunder rules.
+
+  Args:
+    operand: Decoded string literal from a pickle string or persistent ID
+      opcode.
+
+  Returns:
+    True if `operand` matches a deny-listed or dangerous literal pattern, or
+    False otherwise.
+  """
+  if not operand:
+    return False
+
+  deny_list = config.get_deny_list()
+  if deny_list and matches_symbol_prefix_list(operand, deny_list):
+    return True
+
+  operand_lower = operand.lower()
+  operand_normalized = _WHITESPACE_NORMALIZE_RE.sub(" ", operand_lower)
+  if any(
+      inline_pattern in operand_normalized
+      for inline_pattern in constants.UNSAFE_INLINE_PATTERNS
+  ):
+    return True
+
+  if operand in (
+      "CodeType",
+      "_builtin_type",
+      "_make_function",
+      "__builtin__",
+  ) or (
+      is_dunder_or_introspection_attr(operand)
+      and operand not in constants.SAFE_METADATA_ATTRIBUTES
+  ):
+    return True
+
+  operand_parts = (
+      operand.split(".") if ("." in operand and " " not in operand) else []
+  )
+  if operand_parts and all(
+      identifier_part.isidentifier() for identifier_part in operand_parts
+  ):
+    has_dangerous_dunder_or_attr = any(
+        is_dunder_or_introspection_attr(identifier_part)
+        for identifier_part in operand_parts
+    )
+    is_safe_terminal_metadata = (
+        len(operand_parts) >= 2
+        and operand_parts[-1] in constants.SAFE_METADATA_ATTRIBUTES
+        and not any(
+            is_dunder_or_introspection_attr(part)
+            for part in operand_parts[1:-1]
+        )
+    )
+    if has_dangerous_dunder_or_attr and not is_safe_terminal_metadata:
+      return True
+
+    if (
+        len(operand_parts) >= 2
+        and any(
+            identifier_part in constants.DANGEROUS_EXEC_MODULES
+            for identifier_part in operand_parts[:-1]
+        )
+        and operand_parts[-1] in constants.DANGEROUS_CODE_NAMES
+    ):
+      return True
+
+  return False
 
 
 def _strip_binary_bytes_repr(text: str) -> str:
@@ -2582,7 +3100,6 @@ def _parse_and_process_pattern(
     line: str,
     pattern: re.Pattern[str],
     register_item: Callable[..., None],
-    is_suspicious_override: bool = False,
 ) -> bool:
   """Parses a `picklemagic` log line against `pattern` and registers symbols.
 
@@ -2590,8 +3107,6 @@ def _parse_and_process_pattern(
     line: Raw log line emitted by `corrupy.picklemagic`.
     pattern: Compiled regex with named capture groups for symbol extraction.
     register_item: Callback invoked to classify and record extracted symbols.
-    is_suspicious_override: Whether `UNKNOWN` class matches should be promoted
-      to `SUSPICIOUS`.
 
   Returns:
     True if `pattern` matched `line`, or False otherwise.
@@ -2612,12 +3127,7 @@ def _parse_and_process_pattern(
   if class_name:
     normalized_class = _normalize_corrupy_symbol(class_name)
     is_internal = normalized_class in constants.INTERNAL_FAKE_WARNING_CLASSES
-    register_item(
-        normalized_class,
-        Classification.SUSPICIOUS
-        if (is_suspicious_override and not is_internal)
-        else None,
-    )
+    register_item(normalized_class)
     if method_name:
       register_item(
           method_name if is_internal else f"{normalized_class}.{method_name}"
@@ -2632,11 +3142,24 @@ def _parse_and_process_pattern(
   combined_args = (args or state) + " " + kwargs
   if combined_args.strip():
     combined_args = _strip_binary_bytes_repr(combined_args)
-    for group in _COMBINED_ARGS_TOKEN_RE.findall(combined_args):
-      for token in group:
-        token = token.strip(".")
-        if token and not _HEX_TOKEN_PREFIX_RE.match(token):
-          register_item(token)
+    if "<" in combined_args:
+      for class_reference in _CLASS_REF_LOG_RE.findall(combined_args):
+        register_item(class_reference, allow_unknown=False)
+      for object_reference in _OBJECT_REF_LOG_RE.findall(combined_args):
+        register_item(object_reference, allow_unknown=False)
+
+    is_risky_target = bool(class_name) and classify_symbol(class_name) in (
+        Classification.UNSAFE,
+        Classification.SUSPICIOUS,
+    )
+    for regex_group in _COMBINED_ARGS_TOKEN_RE.findall(combined_args):
+      for candidate_token in regex_group:
+        candidate_token = candidate_token.strip(".")
+        if candidate_token and not _HEX_TOKEN_PREFIX_RE.match(candidate_token):
+          if is_risky_target or is_potentially_dangerous_literal(
+              candidate_token
+          ):
+            register_item(candidate_token, allow_unknown=False)
 
   return True
 
@@ -2676,15 +3199,16 @@ def categorize_picklemagic(
       Classification.UNKNOWN: set(),
   }
 
-  def register_item(item: str, override: Classification | None = None):
-    base_cls = classify_symbol(item) if item else None
-    cls = (
-        override
-        if (override is not None and base_cls == Classification.UNKNOWN)
-        else base_cls
-    )
-    if cls is not None:
-      results[cls].add(item)
+  def register_item(
+      item: str,
+      *,
+      allow_unknown: bool = True,
+  ) -> None:
+    classification = classify_symbol(item) if item else None
+    if classification is not None and (
+        allow_unknown or classification != Classification.UNKNOWN
+    ):
+      results[classification].add(item)
 
   lines = filtered_output.getvalue().split("\n")
   for line in lines:
@@ -2692,6 +3216,12 @@ def categorize_picklemagic(
       continue
 
     clean_line = line.removeprefix("WARNING:picklemagic:")
+    if clean_line.startswith("Safe module/class imported:"):
+      full_name = clean_line.removeprefix("Safe module/class imported:").strip()
+      if _is_valid_dotted_log_symbol(full_name):
+        results[Classification.SAFE].add(full_name)
+        continue
+
     if clean_line.startswith("Unsafe module/class invoked:"):
       full_name = clean_line.removeprefix(
           "Unsafe module/class invoked:"
@@ -2711,89 +3241,39 @@ def categorize_picklemagic(
           "Unknown module/class imported:"
       ).strip()
       if _is_valid_dotted_log_symbol(full_name):
-        results[Classification.UNKNOWN].add(full_name)
+        register_item(full_name)
         continue
 
-    matched = False
-    for keyword, pattern, is_override in PICKLEMAGIC_PATTERNS:
-      if keyword in line:
-        if _parse_and_process_pattern(
-            line,
-            pattern,
-            register_item,
-            is_suspicious_override=is_override,
-        ):
-          matched = True
-          break
+    for keyword, pattern in PICKLEMAGIC_PATTERNS:
+      if keyword in line and _parse_and_process_pattern(
+          line, pattern, register_item
+      ):
+        break
 
-    if matched:
-      continue
-
-  return (
+  categorized_results = (
       results[Classification.SAFE],
       results[Classification.UNSAFE],
       results[Classification.SUSPICIOUS],
       results[Classification.UNKNOWN],
   )
+  return categorized_results
 
 
-_OPCODES_STRIDE_1: frozenset[int] = frozenset({
-    0x28,
-    0x29,
-    0x2E,
-    0x30,
-    0x31,
-    0x32,
-    0x4E,
-    0x7D,
-    0x5D,
-    0x61,
-    0x65,
-    0x73,
-    0x75,
-    0x74,
-    0x6C,
-    0x64,
-    0x85,
-    0x86,
-    0x87,
-    0x88,
-    0x89,
-    0x8F,
-    0x90,
-    0x91,
-    0x94,
-    0x97,
-    0x98,
-})
-_OPCODES_STRIDE_2: frozenset[int] = frozenset({0x80, 0x4B, 0x68, 0x71})
-_OPCODES_STRIDE_3: frozenset[int] = frozenset({0x4D})
-_OPCODES_STRIDE_5: frozenset[int] = frozenset({0x4A, 0x6A, 0x72})
-_OPCODES_STRIDE_9: frozenset[int] = frozenset({0x47, 0x95})
-
-
-def _build_opcode_strides() -> list[int]:
+def _build_opcode_strides() -> tuple[int, ...]:
   """Constructs a 256-element byte stride lookup table for fixed-size opcodes.
 
   Precomputes fixed byte offset advances for standard pickle opcodes so the
   parser can skip non-string operands in O(1) time without unpacking arguments.
 
   Returns:
-    A 256-element integer list where indices represent opcode bytes and values
+    A 256-element integer tuple where indices represent opcode bytes and values
     represent the total stride in bytes, or -1 for variable-length opcodes.
   """
   strides = [-1] * 256
-  for opcode_byte in _OPCODES_STRIDE_1:
-    strides[opcode_byte] = 1
-  for opcode_byte in _OPCODES_STRIDE_2:
-    strides[opcode_byte] = 2
-  for opcode_byte in _OPCODES_STRIDE_3:
-    strides[opcode_byte] = 3
-  for opcode_byte in _OPCODES_STRIDE_5:
-    strides[opcode_byte] = 5
-  for opcode_byte in _OPCODES_STRIDE_9:
-    strides[opcode_byte] = 9
-  return strides
+  for stride, opcodes in constants.OPCODE_STRIDE_GROUPS:
+    for opcode_byte in opcodes:
+      strides[opcode_byte] = stride
+  return tuple(strides)
 
 
 OPCODE_STRIDES = _build_opcode_strides()
@@ -2804,28 +3284,61 @@ def decode_string_operand(
     start: int,
     length: int,
     encoding: str = "utf-8",
+    *,
+    min_length: int = 2,
 ) -> str | None:
   """Decodes a byte slice into a string operand safely.
-
-  Decodes string operands extracted from pickle byte streams while ignoring
-  decode errors and filtering out single-character strings.
 
   Args:
     data: The raw pickle byte buffer or memory-mapped file.
     start: The starting byte offset of the string payload.
     length: The byte length of the string payload.
     encoding: The character encoding to apply (defaults to utf-8).
+    min_length: Minimum character length required to return the string.
 
   Returns:
-    The decoded string operand if length exceeds 1 character, otherwise None.
+    The decoded string operand if length >= min_length, otherwise None.
   """
   try:
     decoded_string = data[start : start + length].decode(
         encoding, errors="ignore"
     )
-    return decoded_string if len(decoded_string) > 1 else None
+    return decoded_string if len(decoded_string) >= min_length else None
   except (UnicodeDecodeError, ValueError):
     return None
+
+
+def _decode_protocol0_string(raw_bytes: bytes) -> str | None:
+  """Decodes a Protocol 0 `STRING` (`0x53`) operand with escape sequences.
+
+  Args:
+    raw_bytes: Raw newline-stripped operand bytes following a `STRING` opcode.
+
+  Returns:
+    The decoded string if non-empty, or None otherwise.
+  """
+  if raw_bytes.endswith(b"\r"):
+    raw_bytes = raw_bytes[:-1]
+
+  if (
+      len(raw_bytes) >= 2
+      and raw_bytes[0] == raw_bytes[-1]
+      and raw_bytes[0] in (0x27, 0x22)
+  ):
+    raw_bytes = raw_bytes[1:-1]
+
+  if b"\\" in raw_bytes:
+    try:
+      raw_bytes = codecs.escape_decode(raw_bytes)[0]  # pyrefly: ignore[bad-assignment]
+    except (ValueError, UnicodeDecodeError):
+      pass
+
+  try:
+    decoded_string = raw_bytes.decode("utf-8")
+  except UnicodeDecodeError:
+    decoded_string = raw_bytes.decode("latin1", errors="ignore")
+
+  return decoded_string or None
 
 
 def _read_length_span(
@@ -2834,10 +3347,7 @@ def _read_length_span(
     total_length: int,
     header_size: int,
 ) -> tuple[int, int]:
-  """Returns (length, next_pos) for a length-prefixed opcode or raises error.
-
-  Validates that operand lengths do not exceed the bounds of the enclosing
-  pickle stream buffer.
+  """Returns `(length, next_pos)` for a length-prefixed opcode or raises error.
 
   Args:
     data: The raw pickle byte buffer or memory-mapped file.
@@ -2846,7 +3356,7 @@ def _read_length_span(
     header_size: Number of header bytes (1 opcode byte + length prefix bytes).
 
   Returns:
-    A tuple of (payload_length, next_opcode_offset).
+    A tuple of `(payload_length, next_opcode_offset)`.
 
   Raises:
     exceptions.UnsafePickleDetectedError: If payload bounds exceed the buffer.
@@ -2874,9 +3384,7 @@ def _read_newline(
     start: int,
     error_offset: int,
 ) -> int:
-  """Returns index of next newline at or after start offset, or raises error.
-
-  Locates the terminating newline delimiter for text-based pickle opcodes.
+  """Returns index of next newline at or after `start` offset, or raises error.
 
   Args:
     data: The raw pickle byte buffer or memory-mapped file.
@@ -2885,11 +3393,11 @@ def _read_newline(
       newline.
 
   Returns:
-    The integer index of the newline byte in data.
+    The integer index of the newline byte in `data`.
 
   Raises:
     exceptions.UnsafePickleDetectedError: If no newline is found before end of
-    data.
+      `data`.
   """
   newline_offset = data.find(b"\n", start)
   if newline_offset == -1:
@@ -2901,6 +3409,137 @@ def _read_newline(
 
 
 MAX_ABSTRACT_STACK_SIZE = 65536
+
+
+def is_benign_storage_arg(argument_value: str) -> bool:
+  """Checks whether a string token in a PyTorch `storage` tuple is benign.
+
+  Args:
+    argument_value: String element from a PyTorch `('storage', ...)` persistent
+      ID tuple.
+
+  Returns:
+    True if `argument_value` is a safe PyTorch storage parameter, or False
+    otherwise.
+  """
+  if is_potentially_dangerous_literal(argument_value):
+    return False
+
+  if (
+      argument_value.isdigit()
+      or argument_value in (
+          "cpu",
+          "cuda",
+          "mps",
+          "meta",
+          "xpu",
+          "hpu",
+          "xla",
+          "disk",
+      )
+      or argument_value.startswith(("cuda:", "xpu:", "hpu:", "mps:", "xla:"))
+  ):
+    return True
+
+  return classify_symbol(argument_value) == Classification.SAFE
+
+
+def _collapse_tuple_items(
+    tuple_items: Sequence[Optional[str]],
+) -> Optional[str]:
+  """Collapses popped tuple elements into a summary token for `BINPERSID`."""
+  if not tuple_items or tuple_items[0] != "storage":
+    return None
+  for tuple_element in tuple_items[1:]:
+    if tuple_element is not None and not is_benign_storage_arg(tuple_element):
+      return tuple_element
+  return "__pytorch_storage__"
+
+
+def _advance_past_stop_opcode(
+    data: bytes | mmap.mmap,
+    pos: int,
+    end: int,
+) -> Optional[int]:
+  """Advances past a STOP opcode and returns the next concatenated pickle offset."""
+  while pos < end and data[pos] in (0x00, 0x0A, 0x0D, 0x20):
+    pos += 1
+  if pos < end and is_pickle_file(bytes(data[pos : min(end, pos + 1024)])):
+    return pos
+  return None
+
+
+def _resolve_ext_opcode(
+    data: bytes | mmap.mmap,
+    current_offset: int,
+    opcode_byte: int,
+) -> str:
+  """Resolves the registered symbol for an EXT1, EXT2, or EXT4 opcode."""
+  stride = OPCODE_STRIDES[opcode_byte]
+  ext_code = int.from_bytes(
+      data[current_offset + 1 : current_offset + stride],
+      "little",
+      signed=(opcode_byte == 0x84),
+  )
+  return resolve_extension_code(ext_code)
+
+
+def _decode_protocol0_text_opcode(
+    data: bytes | mmap.mmap,
+    current_offset: int,
+    newline_offset: int,
+    opcode_byte: int,
+) -> Optional[str]:
+  r"""Decodes a Protocol 0 STRING (`0x53`) or UNICODE (`0x56`) opcode operand.
+
+  Args:
+    data: The pickle byte buffer or memory-mapped file.
+    current_offset: Byte offset of the `0x53` or `0x56` opcode byte.
+    newline_offset: Byte offset of the terminating newline (`\n`).
+    opcode_byte: Either `0x53` (`STRING`) or `0x56` (`UNICODE`).
+
+  Returns:
+    The decoded string operand if non-empty and non-binary, or None otherwise.
+  """
+  span_length = newline_offset - current_offset - 1
+  is_binary_protocol0_string = (
+      opcode_byte == 0x53
+      and span_length > 256
+      and b"\\x00" in data[
+          current_offset + 1 : min(newline_offset, current_offset + 65)
+      ]
+  )
+  if is_binary_protocol0_string:
+    return None
+
+  decode_length = min(span_length, 4096)
+  raw_slice = bytes(
+      data[current_offset + 1 : current_offset + 1 + decode_length]
+  )
+  if opcode_byte == 0x56:
+    cleaned_slice = raw_slice.rstrip(b"\r")
+    return decode_string_operand(
+        cleaned_slice,
+        0,
+        len(cleaned_slice),
+        "raw-unicode-escape",
+        min_length=1,
+    )
+  return _decode_protocol0_string(raw_slice)
+
+
+def _parse_protocol0_memo_index(
+    data: bytes | mmap.mmap,
+    current_offset: int,
+    newline_offset: int,
+) -> Optional[int]:
+  """Parses a newline-terminated integer memo key for PUT or GET opcodes."""
+  try:
+    return int(
+        _clean_protocol0_line(data[current_offset + 1 : newline_offset]), 0
+    )
+  except ValueError:
+    return None
 
 
 def _apply_fixed_opcode_stack_effect(
@@ -2928,7 +3567,13 @@ def _apply_fixed_opcode_stack_effect(
     case 0x28:  # MARK
       mark_stack.append(len(value_stack))
 
-    case 0x30 | 0x61 | 0x62:  # POP, APPEND, BUILD
+    case 0x30:  # POP
+      if mark_stack and len(value_stack) <= mark_stack[-1]:
+        mark_stack.pop()
+      elif value_stack:
+        value_stack.pop()
+
+    case 0x61 | 0x62:  # APPEND, BUILD
       if value_stack:
         value_stack.pop()
 
@@ -2944,8 +3589,19 @@ def _apply_fixed_opcode_stack_effect(
       else:
         value_stack.clear()
 
-    case 0x64 | 0x69 | 0x6C | 0x6F | 0x74 | 0x91:
-      # DICT, INST, LIST, OBJ, TUPLE, FROZENSET
+    case 0x74:  # TUPLE
+      if mark_stack:
+        mark_position = mark_stack.pop()
+        popped_items = value_stack[mark_position:]
+        del value_stack[mark_position:]
+      else:
+        popped_items = list(value_stack)
+        value_stack.clear()
+      if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+        value_stack.append(_collapse_tuple_items(popped_items))
+
+    case 0x64 | 0x6C | 0x6F | 0x91:
+      # DICT, LIST, OBJ, FROZENSET
       if mark_stack:
         mark_position = mark_stack.pop()
         del value_stack[mark_position:]
@@ -2955,7 +3611,11 @@ def _apply_fixed_opcode_stack_effect(
         value_stack.append(None)
 
     case 0x32:  # DUP
-      if value_stack and len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+      frame_floor = mark_stack[-1] if mark_stack else 0
+      if (
+          len(value_stack) > frame_floor
+          and len(value_stack) < MAX_ABSTRACT_STACK_SIZE
+      ):
         value_stack.append(value_stack[-1])
 
     case 0x94:  # MEMOIZE
@@ -2983,20 +3643,36 @@ def _apply_fixed_opcode_stack_effect(
       if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
         value_stack.append(memo_table.get(memo_key))
 
-    case 0x85 | 0x98:  # TUPLE1, READONLY_BUFFER
+    case 0x82 | 0x83 | 0x84:  # EXT1, EXT2, EXT4
+      if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+        value_stack.append(
+            _resolve_ext_opcode(data, current_offset, opcode_byte)
+        )
+
+    case 0x85 | 0x86 | 0x87:  # TUPLE1, TUPLE2, TUPLE3
+      tuple_arity = opcode_byte - 0x84
+      popped_items: list[Optional[str]] = []
+      for _ in range(tuple_arity):
+        if value_stack:
+          popped_items.append(value_stack.pop())
+      popped_items.reverse()
+      if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+        value_stack.append(_collapse_tuple_items(popped_items))
+
+    case 0x51 | 0x98:  # BINPERSID, READONLY_BUFFER
       if value_stack:
         value_stack.pop()
       if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
         value_stack.append(None)
 
-    case 0x52 | 0x81 | 0x86:  # REDUCE, NEWOBJ, TUPLE2
+    case 0x52 | 0x81:  # REDUCE, NEWOBJ
       for _ in range(2):
         if value_stack:
           value_stack.pop()
       if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
         value_stack.append(None)
 
-    case 0x87 | 0x92:  # TUPLE3, NEWOBJ_EX
+    case 0x92:  # NEWOBJ_EX
       for _ in range(3):
         if value_stack:
           value_stack.pop()
@@ -3015,22 +3691,230 @@ def _apply_fixed_opcode_stack_effect(
         | 0x4D  # BININT2
         | 0x4A  # BININT
         | 0x47  # BINFLOAT
-        | 0x82  # EXT1
-        | 0x83  # EXT2
-        | 0x84  # EXT4
-        | 0x8A  # LONG1
-        | 0x8B  # LONG4
-        | 0x43  # SHORT_BINBYTES
-        | 0x42  # BINBYTES
-        | 0x8E  # BINBYTES8
-        | 0x96  # BYTEARRAY8
         | 0x97  # NEXT_BUFFER
-        | 0x49  # INT
-        | 0x4C  # LONG
-        | 0x46  # FLOAT
     ):
       if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
         value_stack.append(None)
+
+
+_OPCODE_LENGTH_HEADER_SIZES: Mapping[int, int] = types.MappingProxyType({
+    0x8C: 2,
+    0x55: 2,
+    0x43: 2,
+    0x8A: 2,
+    0x58: 5,
+    0x54: 5,
+    0x42: 5,
+    0x8B: 5,
+    0x8D: 9,
+    0x8E: 9,
+    0x96: 9,
+})
+
+
+def _step_variable_opcode(
+    opcode_byte: int,
+    data: bytes | mmap.mmap,
+    current_offset: int,
+    limit_offset: int,
+    value_stack: list[Optional[str]],
+    mark_stack: list[int],
+    memo_table: dict[int, Optional[str]],
+    *,
+    strict: bool,
+) -> tuple[
+    Optional[int], Optional[tuple[Optional[pickletools.OpcodeInfo], Any]]
+]:
+  """Advances one variable-stride pickle opcode and updates abstract state.
+
+  Args:
+    opcode_byte: Current variable-stride opcode byte (`OPCODE_STRIDES <= 0`).
+    data: The raw pickle byte buffer or memory-mapped file.
+    current_offset: Byte offset of `opcode_byte` in `data`.
+    limit_offset: Exclusive upper byte bound of the scan range.
+    value_stack: Mutable abstract operand stack.
+    mark_stack: Mutable stack of `MARK` indices into `value_stack`.
+    memo_table: Mutable mapping from memo index to abstract operand.
+    strict: Whether to emit `(opcode_info, operand)` tuples and raise on
+      truncated arguments.
+
+  Returns:
+    A tuple `(next_offset, emitted)` where `next_offset` is None when non-strict
+    scanning hits EOF truncation and `emitted` is an optional `(opcode_info,
+    operand)` pair.
+
+  Raises:
+    exceptions.UnsafePickleDetectedError: If `strict` is True and an argument
+      is truncated.
+  """
+  try:
+    match opcode_byte:
+      case 0x8C | 0x55 | 0x58 | 0x54 | 0x8D:
+        header_size = _OPCODE_LENGTH_HEADER_SIZES[opcode_byte]
+        payload_length, next_offset = _read_length_span(
+            data, current_offset, limit_offset, header_size
+        )
+        encoding = "latin1" if opcode_byte in (0x55, 0x54) else "utf-8"
+        string_value = decode_string_operand(
+            data,
+            next_offset - payload_length,
+            min(payload_length, 4096),
+            encoding,
+            min_length=1,
+        )
+        if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+          value_stack.append(string_value)
+        emitted = None
+        if strict and string_value is not None and len(string_value) >= 2:
+          emitted = (constants.OPCODES_INFO_INT.get(opcode_byte), string_value)
+        return next_offset, emitted
+
+      case 0x43 | 0x8A | 0x42 | 0x8B | 0x8E | 0x96:
+        header_size = _OPCODE_LENGTH_HEADER_SIZES[opcode_byte]
+        _, next_offset = _read_length_span(
+            data, current_offset, limit_offset, header_size
+        )
+        if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+          value_stack.append(None)
+        return next_offset, None
+
+      case 0x56 | 0x53:
+        newline_offset = _read_newline(data, current_offset + 1, current_offset)
+        string_value = _decode_protocol0_text_opcode(
+            data, current_offset, newline_offset, opcode_byte
+        )
+        if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+          value_stack.append(string_value)
+        emitted = None
+        if strict and string_value is not None and len(string_value) >= 2:
+          emitted = (constants.OPCODES_INFO_INT.get(opcode_byte), string_value)
+        return newline_offset + 1, emitted
+
+      case 0x63 | 0x69:
+        module_newline = _read_newline(data, current_offset + 1, current_offset)
+        name_newline = _read_newline(data, module_newline + 1, current_offset)
+        if opcode_byte == 0x69:
+          if mark_stack:
+            del value_stack[mark_stack.pop() :]
+          else:
+            value_stack.clear()
+        if not strict:
+          if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+            value_stack.append(None)
+          return name_newline + 1, None
+
+        module_name = _clean_protocol0_line(
+            data[current_offset + 1 : module_newline]
+        ).decode("utf-8", errors="ignore")
+        attribute_name = _clean_protocol0_line(
+            data[module_newline + 1 : name_newline]
+        ).decode("utf-8", errors="ignore")
+        qualified_name = f"{module_name}.{attribute_name}"
+        if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+          value_stack.append(qualified_name if opcode_byte == 0x63 else None)
+        return (
+            name_newline + 1,
+            (constants.OPCODES_INFO_INT.get(opcode_byte), qualified_name),
+        )
+
+      case 0x93:
+        attribute_member = value_stack.pop() if value_stack else None
+        module_member = value_stack.pop() if value_stack else None
+        if isinstance(module_member, str) and isinstance(attribute_member, str):
+          qualified_name = f"{module_member}.{attribute_member}"
+          if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+            value_stack.append(qualified_name if strict else None)
+          emitted_val = qualified_name
+        else:
+          if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+            value_stack.append(None)
+          emitted_val = "STACK_GLOBAL"
+        emitted = (
+            (constants.OPCODES_INFO_INT.get(opcode_byte), emitted_val)
+            if strict
+            else None
+        )
+        return current_offset + 1, emitted
+
+      case 0x70:
+        newline_offset = _read_newline(data, current_offset + 1, current_offset)
+        memo_key = _parse_protocol0_memo_index(
+            data, current_offset, newline_offset
+        )
+        if memo_key is not None:
+          memo_table[memo_key] = value_stack[-1] if value_stack else None
+        return newline_offset + 1, None
+
+      case 0x67:
+        newline_offset = _read_newline(data, current_offset + 1, current_offset)
+        memo_key = _parse_protocol0_memo_index(
+            data, current_offset, newline_offset
+        )
+        if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+          value_stack.append(
+              memo_table.get(memo_key) if memo_key is not None else None
+          )
+        return newline_offset + 1, None
+
+      case 0x50:
+        newline_offset = _read_newline(data, current_offset + 1, current_offset)
+        if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+          value_stack.append(None)
+        if not strict:
+          return newline_offset + 1, None
+
+        pid_string = _clean_protocol0_line(
+            data[current_offset + 1 : newline_offset]
+        ).decode("utf-8", errors="ignore")
+        if not pid_string:
+          emitted_pid = "persistent_id.PERSID"
+        elif is_potentially_dangerous_literal(pid_string):
+          emitted_pid = pid_string
+        else:
+          emitted_pid = f"persistent_id.{pid_string}"
+        return (
+            newline_offset + 1,
+            (constants.OPCODES_INFO_INT.get(opcode_byte), emitted_pid),
+        )
+
+      case 0x51:
+        pid_string = value_stack.pop() if value_stack else None
+        if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+          value_stack.append(None)
+        if not strict or pid_string == "__pytorch_storage__":
+          return current_offset + 1, None
+
+        if not pid_string:
+          emitted_pid = "persistent_id.BINPERSID"
+        elif is_potentially_dangerous_literal(pid_string):
+          emitted_pid = pid_string
+        else:
+          emitted_pid = f"persistent_id.{pid_string}"
+        return (
+            current_offset + 1,
+            (constants.OPCODES_INFO_INT.get(opcode_byte), emitted_pid),
+        )
+
+      case 0x49 | 0x46 | 0x4C:
+        newline_offset = _read_newline(data, current_offset + 1, current_offset)
+        if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+          value_stack.append(None)
+        return newline_offset + 1, None
+
+      case _:
+        _apply_fixed_opcode_stack_effect(
+            opcode_byte,
+            data,
+            current_offset,
+            value_stack,
+            mark_stack,
+            memo_table,
+        )
+        return current_offset + 1, None
+  except exceptions.UnsafePickleDetectedError:
+    if strict:
+      raise
+    return None, None
 
 
 def partition_pickle_chunks(
@@ -3040,11 +3924,7 @@ def partition_pickle_chunks(
     *,
     include_memo: bool = False,
 ) -> list[Any]:
-  """Partitions pickle bytes into opcode-aligned chunk slices with seed stacks.
-
-  Scans opcode boundaries so large pickle buffers can be partitioned across
-  multiple threads without splitting multi-byte opcodes or losing string operand
-  context between boundaries.
+  """Partitions pickle bytes into opcode-aligned chunk slices with seed state.
 
   Args:
     data: The raw pickle byte buffer or memory-mapped file.
@@ -3073,85 +3953,39 @@ def partition_pickle_chunks(
       if current_offset + stride > effective_length:
         break
       if opcode_byte == 0x2E:
-        break
-      _apply_fixed_opcode_stack_effect(
+        value_stack.clear()
+        mark_stack.clear()
+        memo_table.clear()
+        next_pos = _advance_past_stop_opcode(
+            data, current_offset + 1, effective_length
+        )
+        if next_pos is None:
+          break
+        current_offset = next_pos
+      else:
+        _apply_fixed_opcode_stack_effect(
+            opcode_byte,
+            data,
+            current_offset,
+            value_stack,
+            mark_stack,
+            memo_table,
+        )
+        current_offset += stride
+    else:
+      next_offset, _ = _step_variable_opcode(
           opcode_byte,
           data,
           current_offset,
+          effective_length,
           value_stack,
           mark_stack,
           memo_table,
+          strict=False,
       )
-      current_offset += stride
-    else:
-      match opcode_byte:
-        # 1-byte prefix (SHORT_BINUNICODE) or 4-byte prefix (BINUNICODE)
-        case 0x8C | 0x58:
-          header_size = 2 if opcode_byte == 0x8C else 5
-          try:
-            operand_length, next_offset = _read_length_span(
-                data, current_offset, effective_length, header_size
-            )
-          except exceptions.UnsafePickleDetectedError:
-            break
-          decoded_value = decode_string_operand(
-              data, current_offset + header_size, operand_length, "utf-8"
-          )
-          if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
-            value_stack.append(decoded_value)
-          current_offset = next_offset
-
-        # 1-, 4-, or 8-byte length prefix binary/large payloads to skip safely
-        case 0x43 | 0x8A | 0x42 | 0x8B | 0x8D | 0x8E | 0x96:
-          header_size = (
-              2
-              if opcode_byte in (0x43, 0x8A)
-              else (5 if opcode_byte in (0x42, 0x8B) else 9)
-          )
-          try:
-            _, current_offset = _read_length_span(
-                data, current_offset, effective_length, header_size
-            )
-          except exceptions.UnsafePickleDetectedError:
-            break
-          if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
-            value_stack.append(None)
-
-        # Newline-terminated opcodes (INT, FLOAT, LONG, STRING, etc.)
-        case 0x49 | 0x46 | 0x4C | 0x70 | 0x67 | 0x50 | 0x56 | 0x53:
-          if (newline_offset := data.find(b"\n", current_offset + 1)) == -1:
-            break
-          if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
-            value_stack.append(None)
-          current_offset = newline_offset + 1
-
-        # Two newline-terminated strings for module and attribute (GLOBAL, INST)
-        case 0x63 | 0x69:
-          if (first_newline := data.find(b"\n", current_offset + 1)) == -1 or (
-              second_newline := data.find(b"\n", first_newline + 1)
-          ) == -1:
-            break
-          if opcode_byte == 0x69:
-            if mark_stack:
-              mark_position = mark_stack.pop()
-              del value_stack[mark_position:]
-            else:
-              value_stack.clear()
-          if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
-            value_stack.append(None)
-          current_offset = second_newline + 1
-
-        # Unrecognized or single-byte variable opcode fallback
-        case _:
-          _apply_fixed_opcode_stack_effect(
-              opcode_byte,
-              data,
-              current_offset,
-              value_stack,
-              mark_stack,
-              memo_table,
-          )
-          current_offset += 1
+      if next_offset is None:
+        break
+      current_offset = next_offset
 
     if (
         current_offset - chunk_starts[-1] >= target_chunk_size
@@ -3191,10 +4025,6 @@ def custom_genops_from_bytes(
 ) -> Iterator[tuple[Optional[pickletools.OpcodeInfo], Any | None]]:
   """Generates string-declaring opcodes and arguments from raw pickle bytes.
 
-  Traverses pickle opcodes starting from byte offset `start` up to `end`,
-  yielding discovered string operands and module references while tracking stack
-  state and skipping binary payloads in constant time.
-
   Args:
     data: The raw pickle byte buffer or memory-mapped file.
     start: Byte offset to start parsing from.
@@ -3227,7 +4057,23 @@ def custom_genops_from_bytes(
             f" {current_offset}"
         )
       if opcode_byte == 0x2E:
-        break
+        value_stack.clear()
+        mark_stack.clear()
+        memo_table.clear()
+        next_pos = _advance_past_stop_opcode(
+            data, current_offset + 1, limit_offset
+        )
+        if next_pos is None:
+          break
+        current_offset = next_pos
+        continue
+      if opcode_byte in (0x82, 0x83, 0x84):
+        resolved_ext = _resolve_ext_opcode(data, current_offset, opcode_byte)
+        if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
+          value_stack.append(resolved_ext)
+        yield constants.OPCODES_INFO_INT.get(opcode_byte), resolved_ext
+        current_offset += stride
+        continue
       _apply_fixed_opcode_stack_effect(
           opcode_byte,
           data,
@@ -3239,135 +4085,18 @@ def custom_genops_from_bytes(
       current_offset += stride
       continue
 
-    match opcode_byte:
-      # 1-byte, 4-byte, or 8-byte length-prefixed Unicode text strings
-      case 0x8C | 0x58 | 0x8D:
-        header_size = (
-            2 if opcode_byte == 0x8C else (5 if opcode_byte == 0x58 else 9)
-        )
-        payload_length, current_offset = _read_length_span(
-            data, current_offset, limit_offset, header_size
-        )
-        string_value = decode_string_operand(
-            data, current_offset - payload_length, payload_length, "utf-8"
-        )
-        if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
-          value_stack.append(string_value)
-        if string_value is not None:
-          yield constants.OPCODES_INFO_INT.get(opcode_byte), string_value
-
-      # Non-string binary byte buffers and bytearrays to skip safely
-      case 0x43 | 0x8A | 0x42 | 0x8B | 0x8E | 0x96:
-        header_size = (
-            2
-            if opcode_byte in (0x43, 0x8A)
-            else (5 if opcode_byte in (0x42, 0x8B) else 9)
-        )
-        _, current_offset = _read_length_span(
-            data, current_offset, limit_offset, header_size
-        )
-        if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
-          value_stack.append(None)
-
-      # Newline-terminated string literals (Protocol 0 UNICODE / STRING)
-      case 0x56 | 0x53:
-        newline_offset = _read_newline(data, current_offset + 1, current_offset)
-        encoding = "raw-unicode-escape" if opcode_byte == 0x56 else "latin1"
-        string_value = decode_string_operand(
-            data,
-            current_offset + 1,
-            newline_offset - current_offset - 1,
-            encoding,
-        )
-        if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
-          value_stack.append(string_value)
-        if string_value is not None:
-          yield constants.OPCODES_INFO_INT.get(opcode_byte), string_value
-        current_offset = newline_offset + 1
-
-      # Two newline-terminated strings for module and attribute names
-      case 0x63 | 0x69:
-        module_newline = _read_newline(data, current_offset + 1, current_offset)
-        name_newline = _read_newline(data, module_newline + 1, current_offset)
-        module_name = data[current_offset + 1 : module_newline].decode(
-            "utf-8", errors="ignore"
-        )
-        attribute_name = data[module_newline + 1 : name_newline].decode(
-            "utf-8", errors="ignore"
-        )
-        if opcode_byte == 0x69:
-          if mark_stack:
-            mark_position = mark_stack.pop()
-            del value_stack[mark_position:]
-          else:
-            value_stack.clear()
-        opcode_info = constants.OPCODES_INFO_INT.get(opcode_byte)
-        yield opcode_info, module_name
-        yield opcode_info, attribute_name
-        qualified_name = f"{module_name}.{attribute_name}"
-        if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
-          value_stack.append(qualified_name if opcode_byte == 0x63 else None)
-        yield opcode_info, qualified_name
-        current_offset = name_newline + 1
-
-      # Stack global resolution opcode referencing stack operands
-      case 0x93:
-        opcode_info = constants.OPCODES_INFO_INT.get(opcode_byte)
-        attribute_member = value_stack.pop() if value_stack else None
-        module_member = value_stack.pop() if value_stack else None
-        if isinstance(module_member, str) and isinstance(attribute_member, str):
-          qualified_name = f"{module_member}.{attribute_member}"
-          if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
-            value_stack.append(qualified_name)
-          yield opcode_info, qualified_name
-        else:
-          if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
-            value_stack.append(None)
-          yield opcode_info, "STACK_GLOBAL"
-        current_offset += 1
-
-      # Protocol 0 PUT (newline-terminated decimal memo index)
-      case 0x70:
-        newline_offset = _read_newline(data, current_offset + 1, current_offset)
-        try:
-          memo_key = int(
-              bytes(data[current_offset + 1 : newline_offset]).rstrip(b"\r"), 0
-          )
-          memo_table[memo_key] = value_stack[-1] if value_stack else None
-        except ValueError:
-          pass
-        current_offset = newline_offset + 1
-
-      # Protocol 0 GET (newline-terminated decimal memo index)
-      case 0x67:
-        newline_offset = _read_newline(data, current_offset + 1, current_offset)
-        try:
-          memo_key = int(
-              bytes(data[current_offset + 1 : newline_offset]).rstrip(b"\r"), 0
-          )
-          if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
-            value_stack.append(memo_table.get(memo_key))
-        except ValueError:
-          if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
-            value_stack.append(None)
-        current_offset = newline_offset + 1
-
-      # Newline-terminated non-string numeric and persistent ID arguments
-      case 0x49 | 0x46 | 0x4C | 0x50:
-        current_offset = (
-            _read_newline(data, current_offset + 1, current_offset) + 1
-        )
-        if len(value_stack) < MAX_ABSTRACT_STACK_SIZE:
-          value_stack.append(None)
-
-      # Unrecognized or variable-stride single-byte opcode (REDUCE, BUILD, etc.)
-      case _:
-        _apply_fixed_opcode_stack_effect(
-            opcode_byte,
-            data,
-            current_offset,
-            value_stack,
-            mark_stack,
-            memo_table,
-        )
-        current_offset += 1
+    next_offset, emitted = _step_variable_opcode(
+        opcode_byte,
+        data,
+        current_offset,
+        limit_offset,
+        value_stack,
+        mark_stack,
+        memo_table,
+        strict=True,
+    )
+    if emitted is not None:
+      yield emitted
+    if next_offset is None:
+      break
+    current_offset = next_offset
