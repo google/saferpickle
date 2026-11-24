@@ -209,8 +209,14 @@ def get_copied_module(name: str) -> types.ModuleType:
       # Try to copy the module
       mod_copied = copy_module(name, f"{name}_copy")
       if mod_copied is None:
-        # Fallback to pickle copy
-        logging.warning(
+        # Fallback to pickle copy. Optional libraries such as torch are often
+        # not linked into the binary, so only warn if the module is installed.
+        try:
+          spec = importlib.util.find_spec(name)
+        except (ImportError, ValueError):
+          spec = None
+        log_fn = logging.debug if spec is None else logging.warning
+        log_fn(
             "%s could not be imported/copied, falling back to pickle_copy", name
         )
         if "_pickle" not in _COPIED_MODS_CACHE:
