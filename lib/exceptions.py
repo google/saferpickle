@@ -39,3 +39,7 @@ class MaxRecursionDepthExceededError(Exception):
 
   def __str__(self) -> str:
     return self.message
+
+
+class UnsafeArchivePathError(Exception):
+  """Raised internally when an archive member contains path traversal."""

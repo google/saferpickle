@@ -42,7 +42,6 @@ from typing import (
     Callable,
     Dict,
     FrozenSet,
-    Generator,
     IO,
     Iterable,
     Iterator,
@@ -54,6 +53,7 @@ from typing import (
     cast,
 )
 import zipfile
+import zlib
 
 from absl import logging
 from lib import config
@@ -228,32 +228,149 @@ def get_copied_module(name: str) -> types.ModuleType:
     return mod_copied
 
 
-def _peek_bytes(file_bytes: bytes | BinaryIO, size: int) -> bytes:
-  """Peeks at the first `size` bytes of a bytes object or file stream."""
-  if isinstance(file_bytes, bytes):
-    return file_bytes[:size]
+ARCHIVE_EXTRACTION_ERRORS: tuple[type[BaseException], ...] = (
+    zipfile.BadZipFile,
+    zipfile.LargeZipFile,
+    tarfile.TarError,
+    lzma.LZMAError,
+    zlib.error,
+    EOFError,
+    OSError,
+    ValueError,
+    RuntimeError,
+)
+
+
+def is_seekable_stream(stream: Any) -> bool:
+  """Checks whether `stream` supports random-access `seek` and `tell` calls."""
+  if not callable(getattr(stream, "seek", None)) or not callable(
+      getattr(stream, "tell", None)
+  ):
+    return False
+
+  seekable_fn = getattr(stream, "seekable", None)
+  if callable(seekable_fn):
+    try:
+      return bool(seekable_fn())
+    except (OSError, AttributeError, io.UnsupportedOperation, ValueError):
+      return False
 
   try:
-    is_seekable = file_bytes.seekable()
-  except (AttributeError, ValueError):
-    is_seekable = False
+    stream.tell()
+    return True
+  except (OSError, AttributeError, io.UnsupportedOperation, ValueError):
+    return False
 
-  if is_seekable:
+
+def ensure_seekable_stream(data: Any) -> Any:
+  """Normalizes buffers or non-seekable streams into seekable inputs."""
+  if isinstance(data, (bytes, mmap.mmap)):
+    return data
+  if isinstance(data, (bytearray, memoryview)):
+    return bytes(data)
+  if is_seekable_stream(data):
+    return data
+  if callable(getattr(data, "read", None)):
+    return io.BytesIO(data.read())
+  return data
+
+
+def get_stream_pos(stream: Any) -> Optional[int]:
+  """Safely retrieves the current byte offset of a stream if supported.
+
+  Attempts to call `stream.tell()` and catches unsupported stream or OS errors
+  so non-seekable streams return `None` instead of raising.
+
+  Args:
+    stream: A file-like stream object.
+
+  Returns:
+    The current integer byte position of `stream`, or None if unavailable.
+  """
+  try:
+    return stream.tell()
+  except (OSError, AttributeError, io.UnsupportedOperation):
+    return None
+
+
+def safe_seek(stream: Any, position: Optional[int]) -> None:
+  """Restores `stream` to `position` if seekable."""
+  if position is None or not hasattr(stream, "seek"):
+    return
+  try:
+    stream.seek(position)
+  except (OSError, AttributeError, io.UnsupportedOperation, ValueError):
+    logging.debug("Failed to seek stream back to position %s.", position)
+
+
+def peek_bytes(file_bytes: bytes | IO[bytes] | io.IOBase, size: int) -> bytes:
+  """Peeks at the first `size` bytes of a byte buffer or stream.
+
+  Args:
+    file_bytes: The raw `bytes` buffer or binary stream to inspect.
+    size: Maximum number of leading bytes to return.
+
+  Returns:
+    Up to `size` leading bytes from `file_bytes`, or `b""` if the stream
+    cannot be peeked.
+  """
+  if isinstance(file_bytes, (bytes, bytearray, memoryview)):
+    return bytes(file_bytes[:size])
+
+  if is_seekable_stream(file_bytes):
+    seekable_stream = cast(IO[bytes], file_bytes)
     try:
-      current_pos = file_bytes.tell()
-      peeked = file_bytes.read(size)
-      file_bytes.seek(current_pos)
+      current_pos = seekable_stream.tell()
+      peeked = seekable_stream.read(size)
+      seekable_stream.seek(current_pos)
       return peeked
     except (OSError, io.UnsupportedOperation):
       pass
 
   if hasattr(file_bytes, "peek"):
     try:
-      return file_bytes.peek(size)[:size]
+      return file_bytes.peek(size)[:size]  # pyrefly: ignore[missing-attribute]
     except (OSError, io.UnsupportedOperation, AttributeError):
       pass
 
   return b""
+
+
+def _has_trailing_zip_eocd(
+    file_bytes: bytes | IO[bytes] | io.IOBase,
+) -> bool:
+  """Checks whether `file_bytes` has a valid trailing ZIP central directory."""
+  # ZIP member streams carry the outer-stream verdict for `ZIP_STORED` data;
+  # compressed members are checked by `has_inflated_zip_eocd_tail` instead.
+  member_verdict = getattr(file_bytes, "_has_zip_eocd_tail", None)
+  if member_verdict is not None:
+    return member_verdict
+
+  if isinstance(file_bytes, (bytes, bytearray, memoryview)):
+    file_bytes = io.BytesIO(file_bytes)
+
+  if is_seekable_stream(file_bytes):
+    seekable_stream = cast(IO[bytes], file_bytes)
+    pos = seekable_stream.tell()
+    try:
+      seekable_stream.seek(0, io.SEEK_END)
+      end_pos = seekable_stream.tell()
+      if end_pos < 22:
+        return False
+
+      tail_start = max(0, end_pos - 65558)
+      seekable_stream.seek(tail_start)
+      if b"PK\x05\x06" not in seekable_stream.read(end_pos - tail_start):
+        return False
+      return zipfile.is_zipfile(seekable_stream)
+    except (IOError, OSError, zipfile.BadZipFile, ValueError):
+      return False
+    finally:
+      try:
+        seekable_stream.seek(pos)
+      except (IOError, OSError, ValueError):
+        pass
+  return False
 
 
 def is_zip_bytes(file_bytes: bytes | BinaryIO) -> bool:
@@ -267,14 +384,103 @@ def is_zip_bytes(file_bytes: bytes | BinaryIO) -> bool:
   """
   if not file_bytes:
     return False
-  return _peek_bytes(file_bytes, 4).startswith(
+  return peek_bytes(file_bytes, 4).startswith(
       (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
   )
 
 
+def read_bounded(
+    stream: bytes | IO[bytes],
+    *,
+    remaining_budget: list[int],
+) -> bytes:
+  """Reads a stream or byte buffer while enforcing a decompression byte budget.
+
+  Args:
+    stream: Raw byte buffer or decompressed binary stream to read.
+    remaining_budget: Single-element mutable list tracking the cumulative
+      remaining byte budget across an archive tree.
+
+  Returns:
+    The complete byte contents read from `stream`.
+
+  Raises:
+    ValueError: If reading `stream` exceeds the allowed byte budget.
+  """
+  budget = remaining_budget[0]
+  if budget < 0:
+    raise ValueError("Archive decompression byte budget exceeded.")
+
+  if isinstance(stream, bytes):
+    if len(stream) > budget:
+      raise ValueError("Archive decompression byte budget exceeded.")
+    remaining_budget[0] -= len(stream)
+    return stream
+
+  chunks: list[bytes] = []
+  bytes_read = 0
+  while True:
+    read_size = min(1024 * 1024, (budget - bytes_read) + 1)
+    chunk = stream.read(read_size)
+    if not chunk:
+      break
+    bytes_read += len(chunk)
+    if bytes_read > budget:
+      raise ValueError("Archive decompression byte budget exceeded.")
+    chunks.append(chunk)
+
+  remaining_budget[0] -= bytes_read
+  return b"".join(chunks)
+
+
+def is_unsafe_archive_path(name: str) -> bool:
+  """Checks whether an archive member path or link target contains traversal."""
+  return (
+      ".." in name
+      or name.startswith(("/", "\\"))
+      or (len(name) >= 2 and name[1] == ":")
+  )
+
+
+def _has_stored_zip_eocd_tail(
+    outer_stream: IO[bytes],
+    info: zipfile.ZipInfo,
+) -> bool:
+  """Checks whether a `ZIP_STORED` entry carries a trailing ZIP EOCD marker."""
+  if info.compress_type != zipfile.ZIP_STORED or info.file_size < 22:
+    return False
+  if not is_seekable_stream(outer_stream):
+    return False
+
+  saved_pos = outer_stream.tell()
+  try:
+    outer_stream.seek(info.header_offset)
+    local_header = outer_stream.read(30)
+    if len(local_header) < 30 or local_header[:4] != b"PK\x03\x04":
+      return False
+
+    fname_len = int.from_bytes(local_header[26:28], "little")
+    extra_len = int.from_bytes(local_header[28:30], "little")
+    data_start = info.header_offset + 30 + fname_len + extra_len
+    # `zipfile` yields at most `compress_size` bytes for a stored member, so a
+    # larger declared `file_size` must not move the tail window.
+    data_end = data_start + min(info.file_size, info.compress_size)
+    tail_start = max(data_start, data_end - 65558)
+    outer_stream.seek(tail_start)
+    tail_bytes = outer_stream.read(data_end - tail_start)
+    return b"PK\x05\x06" in tail_bytes
+  except (OSError, io.UnsupportedOperation, ValueError):
+    return False
+  finally:
+    try:
+      outer_stream.seek(saved_pos)
+    except (OSError, io.UnsupportedOperation, ValueError):
+      pass
+
+
 def extract_zip_contents(
     file_bytes: bytes | BinaryIO,
-) -> Generator[Tuple[str, IO[bytes]], None, None]:
+) -> Iterator[Tuple[str, IO[bytes]]]:
   """Extracts the list of files and their contents from a zip file/stream.
 
   Args:
@@ -287,27 +493,134 @@ def extract_zip_contents(
       io.BytesIO(file_bytes) if isinstance(file_bytes, bytes) else file_bytes
   )
   with zipfile.ZipFile(stream) as zf:
-    for name in zf.namelist():
-      with zf.open(name) as f:
-        yield name, f
+    for info in zf.infolist():
+      if is_unsafe_archive_path(info.filename):
+        yield info.filename, io.BytesIO(b"")
+        continue
+      if info.is_dir():
+        continue
+      has_zip_tail = _has_stored_zip_eocd_tail(stream, info)
+      is_compressed = info.compress_type != zipfile.ZIP_STORED
+      with zf.open(info) as f:
+        setattr(f, "_has_zip_eocd_tail", has_zip_tail)
+        setattr(f, "_is_compressed_member", is_compressed)
+        yield info.filename, f
+
+
+def has_inflated_zip_eocd_tail(
+    stream: IO[bytes],
+    remaining_budget: list[int],
+) -> bool:
+  """Inflates a compressed ZIP member once to find a trailing ZIP EOCD marker.
+
+  Args:
+    stream: Member stream yielded by `extract_zip_contents`.
+    remaining_budget: Single-element mutable list tracking the cumulative
+      remaining byte budget; every inflated byte is charged to it.
+
+  Returns:
+    True if the inflated member ends with a ZIP EOCD marker, or False otherwise
+    (including for members that are not compressed).
+
+  Raises:
+    ValueError: If inflating the member exceeds the byte budget.
+  """
+  if not getattr(stream, "_is_compressed_member", False):
+    return False
+
+  tail = b""
+  while chunk := stream.read(1024 * 1024):
+    remaining_budget[0] -= len(chunk)
+    if remaining_budget[0] < 0:
+      raise ValueError("Archive decompression byte budget exceeded.")
+    tail = (tail + chunk)[-65558:]
+
+  stream.seek(0)
+  return b"PK\x05\x06" in tail
 
 
 def is_bz2_bytes(file_bytes: bytes | BinaryIO) -> bool:
   """Checks if the provided bytes represent a bz2 file."""
-  return _peek_bytes(file_bytes, 3).startswith(b"\x42\x5a\x68")
+  return peek_bytes(file_bytes, 3).startswith(b"\x42\x5a\x68")
 
 
 def extract_bz2_contents(file_bytes: bytes | BinaryIO) -> IO[bytes]:
   """Extracts contents from bz2 bytes/stream as a stream."""
-  stream = (
+  return bz2.open(
       io.BytesIO(file_bytes) if isinstance(file_bytes, bytes) else file_bytes
   )
-  return bz2.open(stream)
 
 
-def is_lzma_bytes(file_bytes: bytes | BinaryIO) -> bool:
-  """Checks if the provided bytes represent an lzma file."""
-  return _peek_bytes(file_bytes, 6).startswith(b"\xfd\x37\x7a\x58\x5a\x00")
+_XZ_MAGIC = b"\xfd\x37\x7a\x58\x5a\x00"
+_LZ4_FRAME_MAGIC = b"\x04\x22\x4d\x18"
+_ARCHIVE_PEEK_BYTES = 265
+_TRIAL_DECODE_BYTES = 512
+
+
+def _decodes_to_scannable_payload(
+    decompressor: Any, data: bytes, nesting: int, is_full_peek: bool
+) -> bool:
+  """Checks whether trial-decoding `data` yields a pickle, `.npy`, or archive."""
+  # Weak-magic headers also match numeric tensor bytes, so a header only counts
+  # when its decoded prefix is scannable. At the nesting limit the header is
+  # trusted so deeper nesting still reaches the archive recursion check.
+  if nesting >= constants.MAX_ARCHIVE_RECURSION_DEPTH:
+    return True
+  try:
+    prefix = decompressor.decompress(data, _TRIAL_DECODE_BYTES)
+  except (lzma.LZMAError, zlib.error):
+    return False
+
+  if not prefix:
+    # No output: a finished empty stream or a full peek of empty blocks is
+    # still unwrapped, but a short input that merely ran out is not a stream.
+    return decompressor.eof or is_full_peek
+
+  return (
+      prefix.startswith(b"\x93NUMPY")
+      or (
+          prefix[0] in constants.OPCODES_INFO_INT
+          and prefix[0] not in constants.NON_INITIAL_PICKLE_OPCODES
+      )
+      or detect_archive_type(prefix, _nesting=nesting + 1) is not None
+  )
+
+
+def is_lzma_bytes(file_bytes: bytes | BinaryIO, *, _nesting: int = 0) -> bool:
+  """Checks if `file_bytes` is an `.xz` or scannable `FORMAT_ALONE` LZMA stream.
+
+  Args:
+    file_bytes: Raw byte buffer or binary stream to inspect.
+    _nesting: Internal trial-decode nesting depth.
+
+  Returns:
+    True if `file_bytes` matches a supported LZMA header, or False otherwise.
+  """
+  header = peek_bytes(file_bytes, _ARCHIVE_PEEK_BYTES)
+  if header.startswith(_XZ_MAGIC):
+    return True
+  # `FORMAT_ALONE` needs valid properties, a non-zero size, and a zero first
+  # range-coder byte.
+  if (
+      len(header) < 14
+      or header[0] >= 225
+      or header[13]
+      or not any(header[5:13])
+  ):
+    return False
+
+  # Probe with the smallest dictionary so the trial decode stays cheap.
+  probe = (
+      header[:1]
+      + constants.MIN_LZMA_ALONE_DICT_BYTES.to_bytes(4, "little")
+      + header[5:]
+  )
+  return _decodes_to_scannable_payload(
+      lzma.LZMADecompressor(lzma.FORMAT_ALONE),
+      probe,
+      _nesting,
+      len(header) == _ARCHIVE_PEEK_BYTES,
+  )
 
 
 def extract_lzma_contents(file_bytes: bytes | BinaryIO) -> IO[bytes]:
@@ -315,12 +628,67 @@ def extract_lzma_contents(file_bytes: bytes | BinaryIO) -> IO[bytes]:
   stream = (
       io.BytesIO(file_bytes) if isinstance(file_bytes, bytes) else file_bytes
   )
-  return lzma.open(stream)
+  header = peek_bytes(stream, 6)
+  if header.startswith(_XZ_MAGIC):
+    return lzma.open(stream)
+  if (
+      int.from_bytes(header[1:5], "little")
+      > constants.MAX_LZMA_ALONE_DICT_BYTES
+  ):
+    raise lzma.LZMAError("FORMAT_ALONE dictionary exceeds the allowed size.")
+  return lzma.open(stream, format=lzma.FORMAT_ALONE)
+
+
+def _zlib_stream_offset(header: bytes) -> int:
+  """Returns the zlib stream offset past any joblib `ZF` length header."""
+  if not header.startswith(b"ZF"):
+    return 0
+  return 22 if header[21:22] == b" " else 21
+
+
+def is_zlib_bytes(file_bytes: bytes | BinaryIO, *, _nesting: int = 0) -> bool:
+  """Checks if `file_bytes` is a scannable zlib stream or joblib `ZF` file."""
+  header = peek_bytes(file_bytes, _ARCHIVE_PEEK_BYTES)
+  stream = header[_zlib_stream_offset(header) :]
+  has_zlib_header = (
+      len(stream) >= 2
+      and stream[0] & 0x0F == 8
+      and stream[0] >> 4 <= 7
+      and int.from_bytes(stream[:2], "big") % 31 == 0
+  )
+  return has_zlib_header and _decodes_to_scannable_payload(
+      zlib.decompressobj(),
+      stream,
+      _nesting,
+      len(header) == _ARCHIVE_PEEK_BYTES,
+  )
+
+
+def extract_zlib_contents(file_bytes: bytes) -> IO[bytes]:
+  """Extracts concatenated zlib streams, bounded by the decompression budget."""
+  remaining = file_bytes[_zlib_stream_offset(file_bytes[:22]) :]
+  limit = constants.MAX_ARCHIVE_DECOMPRESSED_BYTES + 1
+  chunks: list[bytes] = []
+  while remaining and limit > 0:
+    decompressor = zlib.decompressobj()
+    chunks.append(decompressor.decompress(remaining, limit))
+    limit -= len(chunks[-1])
+    remaining = decompressor.unused_data
+  return io.BytesIO(b"".join(chunks))
+
+
+def extract_lz4_contents(file_bytes: bytes) -> IO[bytes]:
+  """Extracts an LZ4 frame as a stream, or raises if `lz4` is unavailable."""
+  try:
+    lz4_frame = importlib.import_module("lz4.frame")
+  except ImportError as e:
+    raise ValueError("Cannot scan LZ4 frame: lz4 is not installed.") from e
+  return lz4_frame.open(io.BytesIO(file_bytes))
 
 
 def is_gzip_bytes(file_bytes: bytes | BinaryIO) -> bool:
   """Checks if the provided bytes represent a gzip file."""
-  return _peek_bytes(file_bytes, 2).startswith(b"\x1f\x8b")
+  return peek_bytes(file_bytes, 2).startswith(b"\x1f\x8b")
 
 
 def extract_gzip_contents(file_bytes: bytes | IO[bytes]) -> IO[bytes]:
@@ -331,25 +699,314 @@ def extract_gzip_contents(file_bytes: bytes | IO[bytes]) -> IO[bytes]:
   return cast(IO[bytes], gzip.open(stream))
 
 
-def is_tar_bytes(file_bytes: bytes | BinaryIO) -> bool:
-  """Checks if the provided bytes represent a tar file."""
-  peeked = _peek_bytes(file_bytes, 262)
-  return len(peeked) >= 262 and peeked[257:262] == b"ustar"
+def is_tar_bytes(file_bytes: bytes | IO[bytes] | io.IOBase) -> bool:
+  """Checks if `file_bytes` starts with a checksum-valid tar header.
+
+  Args:
+    file_bytes: Raw byte buffer or binary stream to inspect.
+
+  Returns:
+    True if `file_bytes` has a valid tar header, or False otherwise.
+  """
+  peeked_bytes = peek_bytes(file_bytes, 512)
+  if len(peeked_bytes) < 512:
+    has_ustar = len(peeked_bytes) >= 262 and peeked_bytes[257:262] == b"ustar"
+    return has_ustar and not (
+        peeked_bytes[0] == 0x80 and 1 <= peeked_bytes[1] <= 5
+    )
+
+  # `tarfile` ignores the magic field and accepts any checksum-valid header.
+  try:
+    tarfile.TarInfo.frombuf(peeked_bytes[:512], "latin1", "surrogateescape")
+    return True
+  except (tarfile.HeaderError, ValueError):
+    return False
+
+
+def detect_archive_type(
+    data: bytes | IO[bytes] | io.IOBase,
+    *,
+    _nesting: int = 0,
+) -> Optional[str]:
+  """Identifies the archive format of `data`, or returns None.
+
+  Args:
+    data: Raw byte buffer or binary stream to inspect.
+    _nesting: Internal trial-decode nesting depth for weak-magic formats.
+
+  Returns:
+    The archive format identifier (`'zip'`, `'bz2'`, `'gzip'`, `'lz4'`,
+    `'tar'`, `'lzma'`, or `'zlib'`), or None if `data` is not a recognized
+    archive.
+  """
+  header = peek_bytes(data, 512)
+  if is_zip_bytes(header):
+    return "zip"
+  if is_bz2_bytes(header):
+    return "bz2"
+  if is_gzip_bytes(header):
+    return "gzip"
+  if header.startswith(_LZ4_FRAME_MAGIC):
+    return "lz4"
+  if is_tar_bytes(header):
+    return "tar"
+  # Weak-magic formats run after every strong signature.
+  if is_lzma_bytes(header, _nesting=_nesting):
+    return "lzma"
+  if is_zlib_bytes(header, _nesting=_nesting):
+    return "zlib"
+  if _has_trailing_zip_eocd(data):
+    return "zip"
+  return None
 
 
 def extract_tar_contents(
     file_bytes: bytes | BinaryIO,
-) -> Generator[Tuple[str, IO[bytes]], None, None]:
+) -> Iterator[Tuple[str, IO[bytes]]]:
   """Extracts contents from tar bytes/stream."""
   stream = (
       io.BytesIO(file_bytes) if isinstance(file_bytes, bytes) else file_bytes
   )
-  with tarfile.open(fileobj=stream, mode="r:*") as tf:
+
+  with tarfile.open(fileobj=stream, mode="r:") as tf:
     for member in tf.getmembers():
+      if (member.issym() or member.islnk()) and is_unsafe_archive_path(
+          member.linkname
+      ):
+        raise tarfile.TarError(
+            f"Unsafe tar link target detected: {member.linkname}"
+        )
+
+      if not member.isfile() and is_unsafe_archive_path(member.name):
+        raise tarfile.TarError(
+            f"Unsafe tar member path detected: {member.name}"
+        )
+
       if member.isfile():
         f = tf.extractfile(member)
         if f is not None:
           yield member.name, cast(IO[bytes], f)
+
+
+def _npy_descr_has_object(descr: Any) -> bool:
+  """Mirrors `numpy.lib.format.descr_to_dtype` to find object-dtype fields."""
+  if isinstance(descr, list):
+    return any(_npy_descr_has_object(tuple(field)[1:]) for field in descr)
+  if isinstance(descr, tuple):
+    return any(_npy_descr_has_object(part) for part in descr)
+  return "O" in repr(descr) or "object" in repr(descr)
+
+
+def _is_object_npy_header(header_bytes: bytes) -> bool:
+  """Checks whether a NumPy `.npy` header declares an object-dtype array."""
+  text = header_bytes.decode("latin1")
+  # NumPy also retries Python 2 headers after stripping `L` integer suffixes.
+  for candidate in (text, re.sub(r"(\d)L", r"\1", text)):
+    try:
+      return _npy_descr_has_object(ast.literal_eval(candidate)["descr"])
+    except SyntaxError:
+      continue
+    except (ValueError, TypeError, LookupError, RecursionError, MemoryError):
+      break
+  return True
+
+
+def _find_object_npy_data_offset(
+    prefix: bytes,
+    source: bytes | IO[bytes] | None,
+) -> int:
+  """Returns the embedded pickle byte offset for an object `.npy`, or `0`.
+
+  Args:
+    prefix: Leading bytes already peeked from the `.npy` candidate.
+    source: Full byte buffer or seekable stream when header exceeds `prefix`.
+
+  Returns:
+    The byte offset where the embedded pickle payload begins, or `0` if the
+    input is not a supported object-dtype `.npy` header.
+  """
+  if len(prefix) < 10 or not prefix.startswith(b"\x93NUMPY"):
+    return 0
+  ver = (prefix[6], prefix[7])
+  if ver == (1, 0):
+    hdr_start, hlen = 10, int.from_bytes(prefix[8:10], "little")
+  elif ver in ((2, 0), (3, 0)) and len(prefix) >= 12:
+    hdr_start, hlen = 12, int.from_bytes(prefix[8:12], "little")
+  else:
+    return 0
+  if hlen == 0:
+    return 0
+
+  data_offset = hdr_start + hlen
+  # NumPy accepts any header size with `allow_pickle=True`; headers too large
+  # to parse cheaply count as object arrays.
+  if hlen > constants.MAX_NPY_HEADER_PARSE_BYTES:
+    return data_offset
+
+  if len(prefix) >= data_offset:
+    hdr_bytes = prefix[hdr_start:data_offset]
+  elif isinstance(source, bytes):
+    hdr_bytes = source[hdr_start:data_offset]
+  elif source is not None:
+    hdr_bytes = peek_bytes(source, data_offset)[hdr_start:data_offset]
+  else:
+    return 0
+
+  if len(hdr_bytes) < hlen or not _is_object_npy_header(hdr_bytes):
+    return 0
+  return data_offset
+
+
+def _clean_protocol0_line(raw_bytes: bytes) -> bytes:
+  r"""Strips NUL-byte truncation and trailing carriage returns from a line."""
+  return raw_bytes.split(b"\x00", 1)[0].rstrip(b"\r")
+
+
+def _is_valid_protocol0_global_prefix(raw_bytes: bytes) -> bool:
+  """Checks whether `raw_bytes` begins with a valid Protocol 0 `GLOBAL`/`INST`.
+
+  Args:
+    raw_bytes: Leading bytes of the candidate stream.
+
+  Returns:
+    True if `raw_bytes` starts with a syntactically valid Protocol 0 `GLOBAL`
+    or `INST` instruction, or False otherwise.
+  """
+  if not raw_bytes or raw_bytes[0] not in (ord("c"), ord("i")):
+    return False
+  first_newline_index = raw_bytes.find(b"\n")
+  if first_newline_index <= 1:
+    return False
+  second_newline_index = raw_bytes.find(b"\n", first_newline_index + 1)
+  if second_newline_index <= first_newline_index + 1:
+    return False
+  module_bytes = _clean_protocol0_line(raw_bytes[1:first_newline_index])
+  attribute_bytes = _clean_protocol0_line(
+      raw_bytes[first_newline_index + 1 : second_newline_index]
+  )
+  module_name = module_bytes.decode("latin1", errors="ignore")
+  attribute_name = attribute_bytes.decode("latin1", errors="ignore")
+  if not module_name or not attribute_name:
+    return False
+  name_parts = module_name.split(".") + attribute_name.split(".")
+  parts_valid = all(part.isidentifier() for part in name_parts)
+  return parts_valid
+
+
+def _read_protocol0_line(stream: IO[bytes]) -> bytes:
+  """Reads one newline-terminated Protocol 0 argument without its newline."""
+  raw_line = stream.readline()
+  if not raw_line.endswith(b"\n"):
+    raise ValueError("Truncated newline-terminated argument")
+  return raw_line[:-1]
+
+
+def _check_pickle_stream(
+    raw_bytes: bytes,
+    pickle_stream: IO[bytes],
+    check_magic_bytes: bool,
+) -> tuple[bool, int]:
+  """Validates whether `pickle_stream` starts with valid pickle opcodes.
+
+  Args:
+    raw_bytes: Leading bytes peeked from the start of `pickle_stream`.
+    pickle_stream: Binary stream positioned at the start of the candidate data.
+    check_magic_bytes: Whether to fast-path reject text files and non-object
+      NumPy arrays using magic-byte heuristics.
+
+  Returns:
+    A tuple `(is_valid_pickle, valid_opcodes_count)` indicating whether the
+    stream is likely a valid pickle payload and how many opcodes were read.
+  """
+  if raw_bytes and raw_bytes[0] not in constants.OPCODES_INFO_INT:
+    return (False, 0)
+
+  if raw_bytes.startswith(b"\x93NUMPY"):
+    offset = _find_object_npy_data_offset(raw_bytes, pickle_stream)
+    return (offset > 0, 1 if offset > 0 else 0)
+
+  if check_magic_bytes:
+    if raw_bytes.isascii():
+      stripped_bytes = raw_bytes.lstrip()
+      has_non_pickle_text_prefix = (
+          stripped_bytes.startswith(constants.TEXT_BASED_PREFIXES)
+          or stripped_bytes.startswith(constants.CODE_KEYWORDS)
+          or stripped_bytes.isalpha()
+      )
+      if has_non_pickle_text_prefix and not _is_valid_protocol0_global_prefix(
+          raw_bytes
+      ):
+        return (False, 0)
+
+  valid_opcodes_count = 0
+  while True:
+    charcode = pickle_stream.read(1)
+    if not charcode:
+      return (valid_opcodes_count >= 3, valid_opcodes_count)
+
+    decoded_char = charcode.decode("latin-1")
+    if decoded_char == ".":
+      valid_opcodes_count += 1
+      return (True, valid_opcodes_count)
+
+    opcode = constants.OPCODES_INFO.get(decoded_char)
+    if opcode is None:
+      return (valid_opcodes_count >= 3, valid_opcodes_count)
+
+    valid_opcodes_count += 1
+    if valid_opcodes_count > constants.MAX_BYTES_TO_CHECK:
+      return (True, valid_opcodes_count)
+
+    if opcode.arg is None:
+      continue
+
+    if opcode.name in constants.PAYLOAD_PREFIX_SIZES and is_seekable_stream(
+        pickle_stream
+    ):
+      prefix_size = constants.PAYLOAD_PREFIX_SIZES[opcode.name]
+      len_bytes = pickle_stream.read(prefix_size)
+      if len(len_bytes) != prefix_size:
+        return (valid_opcodes_count >= 3, valid_opcodes_count)
+      payload_len = int.from_bytes(len_bytes, "little")
+      cur_pos = pickle_stream.tell()
+      known_end_pos = getattr(pickle_stream, "_orig_file_size", None)
+      if known_end_pos is None:
+        known_end_pos = getattr(pickle_stream, "size", None)
+      if isinstance(known_end_pos, int):
+        end_pos = known_end_pos
+      else:
+        pickle_stream.seek(0, io.SEEK_END)
+        end_pos = pickle_stream.tell()
+      if cur_pos + payload_len > end_pos:
+        return (valid_opcodes_count >= 3, valid_opcodes_count)
+      pickle_stream.seek(cur_pos + payload_len)
+      continue
+
+    try:
+      if opcode.name in ("INT", "LONG", "PUT", "GET"):
+        raw_line = _read_protocol0_line(pickle_stream)
+        clean_number_bytes = _clean_protocol0_line(raw_line).rstrip(b"L")
+        if clean_number_bytes not in (b"00", b"01"):
+          int(clean_number_bytes, 0)
+      elif opcode.name == "FLOAT":
+        float(_clean_protocol0_line(_read_protocol0_line(pickle_stream)))
+      elif opcode.name == "STRING":
+        clean_str_bytes = _read_protocol0_line(pickle_stream).rstrip(b"\r")
+        if (
+            len(clean_str_bytes) < 2
+            or clean_str_bytes[0:1] not in (b"'", b'"')
+            or clean_str_bytes[-1:] != clean_str_bytes[0:1]
+        ):
+          raise ValueError("Unquoted string argument")
+      elif opcode.name in ("UNICODE", "PERSID"):
+        _read_protocol0_line(pickle_stream)
+      elif opcode.name in ("GLOBAL", "INST"):
+        _read_protocol0_line(pickle_stream)
+        _read_protocol0_line(pickle_stream)
+      else:
+        _ = opcode.arg.reader(pickle_stream)
+    except ValueError:
+      return (valid_opcodes_count >= 3, valid_opcodes_count)
 
 
 def is_pickle_file(
@@ -383,185 +1040,291 @@ def is_pickle_file(
         - False if the input is not a valid pickle file.
   """
   original_pos = None
-  is_seekable = True
-  if isinstance(pickle_bytes, bytes):
-    raw_bytes = pickle_bytes
-    pickle_stream = io.BytesIO(pickle_bytes)
+  if isinstance(pickle_bytes, (bytes, bytearray, memoryview)):
+    raw_bytes = bytes(pickle_bytes[:1024])
+    pickle_stream: IO[bytes] = io.BytesIO(bytes(pickle_bytes))
+  elif is_seekable_stream(pickle_bytes):
+    original_pos = pickle_bytes.tell()
+    raw_bytes = pickle_bytes.read(1024)
+    pickle_bytes.seek(original_pos)
+    pickle_stream = pickle_bytes
   else:
-    try:
-      original_pos = pickle_bytes.tell()
-    except (OSError, io.UnsupportedOperation, AttributeError):
-      is_seekable = False
+    raw_bytes = peek_bytes(pickle_bytes, 1024) or pickle_bytes.read(1024)
+    pickle_stream = io.BytesIO(raw_bytes)
 
-    if is_seekable:
-      # Read a chunk to check text-based and non-pickle-magic prefixes safely
-      raw_bytes = pickle_bytes.read(1024)
-      pickle_bytes.seek(original_pos)  # pyrefly: ignore[bad-argument-type]
-      pickle_stream = pickle_bytes
-    else:
-      # Fallback for non-seekable stream: try to peek without advancing pointer
-      if hasattr(pickle_bytes, "peek"):
-        try:
-          raw_bytes = pickle_bytes.peek(1024)
-          pickle_stream = pickle_bytes
-        except (OSError, io.UnsupportedOperation):
-          raw_bytes = pickle_bytes.read(1024)
-          pickle_stream = io.BytesIO(raw_bytes)
-      else:
-        raw_bytes = pickle_bytes.read(1024)
-        pickle_stream = io.BytesIO(raw_bytes)
-
-  if raw_bytes:
-    first_byte = raw_bytes[0]
-    if first_byte not in constants.OPCODES_INFO_INT:
-      if return_num_bytes_read:
-        return (False, 0)
-      return False
-
-  if check_magic_bytes:
-    pickle_file_is_ascii = raw_bytes.isascii()
-
-    if pickle_file_is_ascii:
-      stripped_bytes = raw_bytes.lstrip()
-      if stripped_bytes.startswith(
-          constants.TEXT_BASED_PREFIXES
-      ) or stripped_bytes.startswith(constants.CODE_KEYWORDS):
-        if return_num_bytes_read:
-          return (False, 0)
-        return False
-
-    if raw_bytes.startswith(constants.NON_PICKLE_MAGIC_BYTES):
-      if raw_bytes[0] not in constants.OPCODES_INFO_INT:
-        if return_num_bytes_read:
-          return (False, 0)
-        return False
-
-  valid_opcodes_count = 0
   try:
-    while True:
-      charcode = pickle_stream.read(1)
-      if not charcode:  # EOF reached without STOP
-        is_suspected_pickle = valid_opcodes_count >= 3
-        if return_num_bytes_read:
-          return (is_suspected_pickle, valid_opcodes_count)
-        return is_suspected_pickle
-
-      decoded_char = charcode.decode("latin-1")
-      if decoded_char == ".":  # STOP opcode found
-        valid_opcodes_count += 1
-        if return_num_bytes_read:
-          return (True, valid_opcodes_count)
-        return True
-
-      opcode = constants.OPCODES_INFO.get(decoded_char)
-      if opcode is None:  # Invalid opcode before STOP
-        is_suspected_pickle = valid_opcodes_count >= 3
-        if return_num_bytes_read:
-          return (is_suspected_pickle, valid_opcodes_count)
-        return is_suspected_pickle
-
-      valid_opcodes_count += 1
-      if valid_opcodes_count > constants.MAX_BYTES_TO_CHECK:
-        if return_num_bytes_read:
-          return (True, valid_opcodes_count)
-        return True
-
-      if opcode.arg is None:
-        continue
-
-      if opcode.name in constants.PAYLOAD_PREFIX_SIZES and hasattr(
-          pickle_stream, "seek"
-      ):
-        prefix_size = constants.PAYLOAD_PREFIX_SIZES[opcode.name]
-        len_bytes = pickle_stream.read(prefix_size)
-        if len(len_bytes) != prefix_size:
-          is_suspected_pickle = valid_opcodes_count >= 3
-          return (
-              (is_suspected_pickle, valid_opcodes_count)
-              if return_num_bytes_read
-              else is_suspected_pickle
-          )
-
-        payload_len = int.from_bytes(len_bytes, "little")
-        cur_pos = pickle_stream.tell()
-        stream_end_pos = pickle_stream.seek(0, io.SEEK_END)
-        if cur_pos + payload_len > stream_end_pos:
-          is_suspected_pickle = valid_opcodes_count >= 3
-          return (
-              (is_suspected_pickle, valid_opcodes_count)
-              if return_num_bytes_read
-              else is_suspected_pickle
-          )
-
-        pickle_stream.seek(cur_pos + payload_len)
-        continue
-
-      try:
-        _ = opcode.arg.reader(pickle_stream)
-      except ValueError:
-        is_suspected_pickle = valid_opcodes_count >= 3
-        if return_num_bytes_read:
-          return (is_suspected_pickle, valid_opcodes_count)
-        return is_suspected_pickle
+    is_valid, opcodes_count = _check_pickle_stream(
+        raw_bytes, pickle_stream, check_magic_bytes
+    )
+    return (is_valid, opcodes_count) if return_num_bytes_read else is_valid
   finally:
     if original_pos is not None:
       pickle_stream.seek(original_pos)
 
 
-def find_pickle_start_offset(pickle_bytes: bytes | IO[bytes]) -> int:
-  """Finds the start offset of a valid pickle payload in the bytes."""
-  if isinstance(pickle_bytes, bytes):
-    max_search_len = min(len(pickle_bytes), 1024)
-    for offset in range(max_search_len):
-      char = pickle_bytes[offset : offset + 1]
-      if not char:
-        break
-      try:
-        decoded_char = char.decode("latin-1")
-      except UnicodeDecodeError:
-        continue
-      if decoded_char not in constants.OPCODES_INFO:
-        continue
-      if is_pickle_file(pickle_bytes[offset:]):
+def find_pickle_start_offset(
+    pickle_bytes: bytes | IO[bytes] | io.IOBase,
+) -> int:
+  """Finds the start offset of a valid pickle payload in `pickle_bytes`.
+
+  Args:
+    pickle_bytes: Raw byte buffer or seekable binary stream to inspect.
+
+  Returns:
+    The integer byte offset where a valid pickle stream starts, or `0` if none
+    is found within the leading window.
+  """
+  if isinstance(pickle_bytes, (bytes, bytearray, memoryview)):
+    raw_buffer = bytes(pickle_bytes)
+    header_bytes = raw_buffer[:1024]
+    original_pos = 0
+    seekable_stream = None
+  elif is_seekable_stream(pickle_bytes):
+    seekable_stream = cast(IO[bytes], pickle_bytes)
+    original_pos = seekable_stream.tell()
+    header_bytes = peek_bytes(seekable_stream, 1024)
+    raw_buffer = None
+  else:
+    return 0
+
+  if header_bytes.startswith(b"\x93NUMPY"):
+    offset = _find_object_npy_data_offset(
+        header_bytes, raw_buffer if raw_buffer is not None else seekable_stream
+    )
+    if offset > 0 and (
+        raw_buffer is None or is_pickle_file(raw_buffer[offset:])
+    ):
+      return offset
+    return 0
+
+  for offset in range(len(header_bytes)):
+    opcode_byte = header_bytes[offset]
+    if opcode_byte not in constants.OPCODES_INFO_INT or (
+        offset > 0 and opcode_byte in constants.NON_INITIAL_PICKLE_OPCODES
+    ):
+      continue
+    if raw_buffer is not None:
+      if is_pickle_file(raw_buffer[offset:]):
         return offset
-    return 0
-
-  # It is a stream
-  stream = pickle_bytes
-  try:
-    original_pos = stream.tell()
-    # Read 1024 bytes to find candidates
-    header_bytes = stream.read(1024)
-    stream.seek(original_pos)
-  except (OSError, AttributeError, io.UnsupportedOperation):
-    return 0
-
-  max_search_len = len(header_bytes)
-  for offset in range(max_search_len):
-    char = header_bytes[offset : offset + 1]
-    if not char:
-      break
-    try:
-      decoded_char = char.decode("latin-1")
-    except UnicodeDecodeError:
       continue
-    if decoded_char not in constants.OPCODES_INFO:
-      continue
-
-    # Verify candidate offset using the stream
+    assert seekable_stream is not None
     try:
-      stream.seek(original_pos + offset)
-      if is_pickle_file(stream):
+      seekable_stream.seek(original_pos + offset)
+      if is_pickle_file(seekable_stream):
         return offset
     except (OSError, AttributeError, io.UnsupportedOperation):
       pass
     finally:
       try:
-        stream.seek(original_pos)
+        seekable_stream.seek(original_pos)
       except (OSError, AttributeError, io.UnsupportedOperation):
-        pass  # If we can't seek back, it poses an issue
+        pass
 
   return 0
+
+
+_STREAM_ARCHIVE_EXTRACTORS = types.MappingProxyType({
+    "bz2": extract_bz2_contents,
+    "lzma": extract_lzma_contents,
+    "gzip": extract_gzip_contents,
+    "zlib": extract_zlib_contents,
+    "lz4": extract_lz4_contents,
+})
+
+
+def _iter_archive_entries(
+    data: bytes,
+    archive_type: str,
+) -> Iterator[tuple[str | None, IO[bytes]]]:
+  """Yields `(entry_name, content_stream)` pairs from a supported archive."""
+  if archive_type == "zip":
+    yield from extract_zip_contents(data)
+  elif archive_type in _STREAM_ARCHIVE_EXTRACTORS:
+    yield None, _STREAM_ARCHIVE_EXTRACTORS[archive_type](data)
+  elif archive_type == "tar":
+    yield from extract_tar_contents(data)
+  else:
+    raise ValueError(f"Unsupported archive type: {archive_type}")
+
+
+def _iter_scannable_archive_children(
+    archive_bytes: bytes,
+    archive_type: str,
+    budget: list[int],
+    *,
+    force_scan: bool = False,
+    check_magic_bytes: bool = True,
+    advance_to_pickle: bool = False,
+) -> Iterator[tuple[bytes, bool]]:
+  """Yields `(entry_bytes, child_force_scan)` for scannable archive members."""
+  for entry_name, content_stream in _iter_archive_entries(
+      archive_bytes, archive_type
+  ):
+    if entry_name is not None and is_unsafe_archive_path(entry_name):
+      raise exceptions.UnsafeArchivePathError(entry_name)
+
+    if entry_name is not None:
+      is_named_pickle = entry_name.lower().endswith(
+          constants.PICKLE_MEMBER_EXTENSIONS
+      )
+      if (
+          not is_named_pickle
+          and not force_scan
+          and detect_archive_type(content_stream) is None
+          and not is_pickle_file(
+              content_stream,
+              check_magic_bytes=check_magic_bytes,
+          )
+          and not has_inflated_zip_eocd_tail(content_stream, budget)
+      ):
+        continue
+
+      entry_bytes = read_bounded(content_stream, remaining_budget=budget)
+      child_force_scan = force_scan
+      if is_named_pickle and detect_archive_type(entry_bytes) is None:
+        child_force_scan = True
+      yield entry_bytes, child_force_scan
+      continue
+
+    entry_bytes = read_bounded(content_stream, remaining_budget=budget)
+    if (
+        not force_scan
+        and detect_archive_type(entry_bytes) is None
+        and not is_pickle_file(
+            entry_bytes,
+            check_magic_bytes=check_magic_bytes,
+        )
+        and not (
+            advance_to_pickle and find_pickle_start_offset(entry_bytes) > 0
+        )
+    ):
+      continue
+
+    yield entry_bytes, force_scan
+
+
+def scan_payload_tree(
+    data: bytes | IO[bytes],
+    on_leaf: Callable[[bytes | IO[bytes], bool, bool], bool],
+    on_error: Callable[[str], bool],
+    *,
+    force_scan: bool = False,
+    check_magic_bytes: bool = True,
+    advance_to_pickle: bool = False,
+    recursion_depth: int = 0,
+    remaining_budget: Optional[list[int]] = None,
+) -> bool:
+  """Recursively walks archives, polyglots, and `.npy` files to leaf payloads.
+
+  Args:
+    data: Raw byte buffer or binary stream to inspect.
+    on_leaf: Callback `(payload, leaf_force_scan, leaf_check_magic_bytes)`
+      invoked on each non-archive leaf payload; returns True to stop early.
+    on_error: Callback `(error_tag)` invoked on archive traversal or extraction
+      failure; returns True to stop early.
+    force_scan: Whether to scan entries even when `is_pickle_file` is False.
+    check_magic_bytes: Whether to enable magic-byte fast rejection.
+    advance_to_pickle: Whether to advance leaves past leading non-pickle bytes.
+    recursion_depth: Current archive nesting depth (`0` at top-level caller).
+    remaining_budget: Shared mutable single-item byte budget `[bytes_left]`.
+
+  Returns:
+    True if `on_leaf` or `on_error` requested early termination, or False
+    otherwise.
+
+  Raises:
+    MaxRecursionDepthExceededError: If `recursion_depth` exceeds
+      `constants.MAX_ARCHIVE_RECURSION_DEPTH`.
+  """
+  max_depth = constants.MAX_ARCHIVE_RECURSION_DEPTH
+  if recursion_depth > max_depth:
+    raise exceptions.MaxRecursionDepthExceededError(
+        f"Max recursion depth of {max_depth} exceeded."
+    )
+
+  normalized_data = ensure_seekable_stream(data)
+  original_pos = get_stream_pos(normalized_data)
+
+  try:
+    archive_type = detect_archive_type(normalized_data)
+    if archive_type is not None:
+      archive_bytes = (
+          bytes(normalized_data)
+          if isinstance(normalized_data, (bytes, mmap.mmap))
+          else normalized_data.read()
+      )
+      budget = (
+          remaining_budget
+          if remaining_budget is not None
+          else [constants.MAX_ARCHIVE_DECOMPRESSED_BYTES]
+      )
+      try:
+        for entry_bytes, child_force_scan in _iter_scannable_archive_children(
+            archive_bytes,
+            archive_type,
+            budget,
+            force_scan=force_scan,
+            check_magic_bytes=check_magic_bytes,
+            advance_to_pickle=advance_to_pickle,
+        ):
+          if scan_payload_tree(
+              entry_bytes,
+              on_leaf,
+              on_error,
+              force_scan=child_force_scan,
+              check_magic_bytes=check_magic_bytes,
+              advance_to_pickle=advance_to_pickle,
+              recursion_depth=recursion_depth + 1,
+              remaining_budget=budget,
+          ):
+            return True
+      except exceptions.UnsafeArchivePathError as slip_err:
+        logging.warning(
+            "%s slip detected: %s",
+            archive_type.capitalize(),
+            slip_err,
+        )
+        return on_error(f"{archive_type}_slip_detected")
+      except ARCHIVE_EXTRACTION_ERRORS as exc:  # pylint: disable=catching-non-exception
+        logging.warning("Error processing %s archive: %s", archive_type, exc)
+        return on_error("archive_extraction_error")
+
+      # The raw bytes may also load as a pickle, so they are scanned as one too.
+      # `PK`-prefixed ZIPs are skipped: their local header is not a loadable
+      # pickle start and benign checkpoints would trip the pickle heuristic.
+      is_prefix_zip = archive_type == "zip" and is_zip_bytes(archive_bytes)
+      if not is_prefix_zip and is_pickle_file(
+          archive_bytes, check_magic_bytes=False
+      ):
+        return on_leaf(archive_bytes, True, False)
+      return False
+
+    if peek_bytes(normalized_data, 6) == b"\x93NUMPY":
+      offset = find_pickle_start_offset(normalized_data)
+      if offset <= 0:
+        return False
+      if isinstance(normalized_data, (bytes, mmap.mmap)):
+        return on_leaf(normalized_data[offset:], True, False)
+      normalized_data.seek((original_pos or 0) + offset)
+      return on_leaf(normalized_data, True, False)
+
+    leaf_data = normalized_data
+    if advance_to_pickle or (
+        force_scan
+        and not is_pickle_file(
+            normalized_data, check_magic_bytes=check_magic_bytes
+        )
+    ):
+      offset = find_pickle_start_offset(normalized_data)
+      if offset > 0:
+        if isinstance(normalized_data, (bytes, mmap.mmap)):
+          leaf_data = normalized_data[offset:]
+        else:
+          normalized_data.seek((original_pos or 0) + offset)
+
+    return on_leaf(leaf_data, force_scan, check_magic_bytes)
+  finally:
+    safe_seek(normalized_data, original_pos)
 
 
 @functools.lru_cache(maxsize=None)

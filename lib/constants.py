@@ -443,6 +443,22 @@ MAX_NUM_CHUNKS = (os.cpu_count() or 1) // 2
 # High score to indicate definite unsafety due to a detected zip slip.
 HIGH_SEVERITY_ZIPSLIP = 1337
 
+MAX_ARCHIVE_RECURSION_DEPTH: int = 3
+MAX_ARCHIVE_DECOMPRESSED_BYTES: int = 512 * 1024 * 1024  # 512 MB
+MAX_NPY_HEADER_PARSE_BYTES: int = 1024 * 1024  # 1 MB
+MIN_LZMA_ALONE_DICT_BYTES: int = 4096
+MAX_LZMA_ALONE_DICT_BYTES: int = 64 * 1024 * 1024  # 64 MB
+PICKLE_MEMBER_EXTENSIONS: tuple[str, ...] = (
+    ".pkl",
+    ".pickle",
+    ".dill",
+    ".joblib",
+    ".p",
+)
+NON_INITIAL_PICKLE_OPCODES: frozenset[int] = frozenset(
+    b"aeltdsu012Rbio.Qghjpqr\x81\x85\x86\x87\x90\x91\x92\x93\x94\x98"
+)
+
 
 OPCODES_4BYTE_LEN = (b"B",)
 OPCODES_8BYTE_LEN = (b"\x8e", b"\x96")

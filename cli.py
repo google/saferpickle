@@ -48,19 +48,9 @@ def security_scan_with_justifications(
       set(),
   )
 
-  if utils.is_zip_bytes(pickle_bytes):
-    unzipped_files = utils.extract_zip_contents(pickle_bytes)
-    for unzipped_file in unzipped_files:
-      _, file_stream = unzipped_file
-      file_bytes = file_stream.read()
-
-      if not utils.is_pickle_file(file_bytes) or not file_bytes:
-        continue
-
-      pickle_bytes = file_bytes
-      break
-
-  if not utils.is_pickle_file(pickle_bytes):
+  if utils.detect_archive_type(
+      pickle_bytes
+  ) is None and not utils.is_pickle_file(pickle_bytes):
     return {"classification": classification, "justification": justification}
 
   # Call the individual scan functions from SaferPickle to sets of results.
@@ -190,6 +180,16 @@ def scan_directory(directory_path: str) -> List[Dict[str, Any]]:
             **analysis_result,
         }
 
+      except (
+          safer_pickle.UnsafePickleDetectedError,
+          safer_pickle.MaxRecursionDepthExceededError,
+      ) as error:
+        file_result = {
+            "status": "success",
+            "filename": file_path,
+            "classification": "unsafe",
+            "justification": f"Found malicious results: {error}",
+        }
       except (IOError, ValueError) as e:
         file_result = {
             "status": "error",
