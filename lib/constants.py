@@ -52,7 +52,6 @@ SUSPICIOUS_STRINGS: FrozenSet[str] = frozenset([
     "glob",
     "hasattr",
     "itertools",
-    "lib2to3.fixer_util.attr_chain",
     "linecache",
     "operator",
     "pathlib",
@@ -124,7 +123,11 @@ UNSAFE_STRINGS: FrozenSet[str] = frozenset([
     "importlib",
     "io.open",
     "itemgetter",
-    "joblib",
+    "joblib.load",
+    "joblib.memory",
+    "joblib.numpy_pickle.NumpyArrayWrapper",
+    "keras.saving.pickle_utils",
+    "lib2to3.fixer_util.attr_chain",
     "load_module",
     "lzma.open",
     "malicious",
@@ -158,6 +161,7 @@ UNSAFE_STRINGS: FrozenSet[str] = frozenset([
     "pickle.load",
     "pickle.loads",
     "picklemagic",
+    "pip",
     "posix.exec",
     "posix.kill",
     "posix.open",
@@ -259,7 +263,6 @@ UNSAFE_ROOT_PACKAGES: FrozenSet[str] = frozenset([
     "idlelib",
     "imp",
     "importlib",
-    "joblib",
     "joblib_copy",
     "lib2to3",
     "logging",
@@ -460,9 +463,9 @@ NON_INITIAL_PICKLE_OPCODES: frozenset[int] = frozenset(
 )
 
 
-OPCODES_4BYTE_LEN = (b"B",)
+OPCODES_4BYTE_LEN = (b"B", b"T")
 OPCODES_8BYTE_LEN = (b"\x8e", b"\x96")
-OPCODES_1BYTE_LEN = (b"C",)
+OPCODES_1BYTE_LEN = (b"C", b"U")
 LENGTH_PREFIXED_OPCODES = (
     OPCODES_4BYTE_LEN + OPCODES_8BYTE_LEN + OPCODES_1BYTE_LEN
 )
@@ -470,8 +473,10 @@ LENGTH_PREFIXED_OPCODES = (
 PAYLOAD_PREFIX_SIZES = immutabledict.immutabledict({
     "SHORT_BINBYTES": 1,
     "SHORT_BINUNICODE": 1,
+    "SHORT_BINSTRING": 1,
     "BINBYTES": 4,
     "BINUNICODE": 4,
+    "BINSTRING": 4,
     "BINBYTES8": 8,
     "BINUNICODE8": 8,
     "BYTEARRAY8": 8,
@@ -546,6 +551,10 @@ ALL_BASE_CLASS_SPECS: tuple[str, ...] = (
     "torch.Tensor",
     "torch.nn.parameter.Parameter",
     "torch.dtype",
+    "torch.UntypedStorage",
+    "torch.storage.TypedStorage",
+    "torch.storage._StorageBase",
+    "torch.storage._LegacyStorage",
     "flax.linen.Module",
     "flax.struct.dataclass",
     "jax.Array",
@@ -557,11 +566,17 @@ ALL_BASE_CLASS_SPECS: tuple[str, ...] = (
     "pandas.DataFrame",
     "pandas.Series",
     "pandas.Index",
+    "scipy.sparse._base._spbase",
+    "scipy.sparse._compressed._cs_matrix",
+    "scipy.sparse._data._data_matrix",
+    "scipy.sparse.spmatrix",
+    "sklearn.base.BaseEstimator",
     "datetime.date",
     "datetime.datetime",
     "datetime.time",
     "datetime.timedelta",
     "datetime.timezone",
+    "decimal.Decimal",
     "enum.Enum",
     "enum.IntEnum",
     "enum.Flag",
@@ -571,6 +586,7 @@ ALL_BASE_CLASS_SPECS: tuple[str, ...] = (
     "collections.Counter",
     "collections.deque",
     "collections.UserDict",
+    "uuid.UUID",
 )
 
 SAFE_BUILTIN_TYPES: FrozenSet[str] = frozenset({
@@ -669,17 +685,24 @@ UNSAFE_INLINE_PATTERNS: FrozenSet[str] = frozenset({
     "posix.popen(",
     ".system(",
     ".popen(",
-    "import os",
-    "import posix",
-    "import subprocess",
-    "import requests",
-    "import urllib",
-    "import socket",
-    ".requests.",
-    ".urllib.",
-    ".socket.",
-    ".http.",
-    ".subprocess.",
+    "import os;",
+    "import os ",
+    "from os import ",
+    "import posix;",
+    "from posix import ",
+    "import subprocess;",
+    "from subprocess import ",
+    "import pty;",
+    "from pty import ",
+    "import ctypes;",
+    "from ctypes import ",
+    "import runpy;",
+    "from runpy import ",
+    "import requests;",
+    "from requests import ",
+    "import urllib;",
+    "from urllib import ",
+    "import socket;",
 })
 
 DANGEROUS_EXEC_MODULES: FrozenSet[str] = frozenset({
@@ -777,6 +800,7 @@ APPROVED_RECONSTRUCTOR_FUNCTIONS: FrozenSet[str] = frozenset({
     "__newobj__",
     "__newobj_ex__",
     "_from_backing_data",
+    "_frombuffer",
     "_new_Index",
     "_pickle_ufunc",
     "_rebuild_device_tensor_from_numpy",
@@ -784,12 +808,12 @@ APPROVED_RECONSTRUCTOR_FUNCTIONS: FrozenSet[str] = frozenset({
     "_rebuild_qtensor",
     "_rebuild_tensor",
     "_rebuild_tensor_v2",
+    "_rebuild_tensor_v3",
     "_reconstruct",
     "_reconstructor",
     "_unpickle_block",
     "_unpickle_named_sharding",
     "dataclass",
-    "from_buffer",
     "new_block",
     "scalar",
     "unpickle_pspec",
@@ -816,6 +840,14 @@ UNPICKLE_LIFECYCLE_HOOKS: FrozenSet[str] = (
 RESTRICTED_DATACLASS_DISALLOWED_HOOKS: FrozenSet[str] = (
     DANGEROUS_CLASS_LIFECYCLE_HOOKS - {"__setstate__"}
 ) | frozenset({"__new__"})
+
+NON_RESTRICTED_UNKNOWN_HOOKS: FrozenSet[str] = frozenset({
+    "__getnewargs__",
+    "__getnewargs_ex__",
+    "__new__",
+    "__reduce__",
+    "__reduce_ex__",
+})
 
 RESTRICTED_APPROVED_ROOTS: FrozenSet[str] = frozenset({
     "collections",
@@ -915,6 +947,52 @@ INTERNAL_SANDBOX_SAFE_SYMBOLS: FrozenSet[str] = (
         "picklemagic.failed_newobj",
     })
 )
+
+IMPORT_OPCODES: FrozenSet[str] = frozenset({
+    "GLOBAL",
+    "STACK_GLOBAL",
+    "INST",
+    "EXT1",
+    "EXT2",
+    "EXT4",
+    "PERSID",
+    "BINPERSID",
+})
+
+DANGEROUS_BUILD_STATE_KEYS: FrozenSet[str] = frozenset({
+    "__setstate__",
+    "__getstate__",
+    "__reduce__",
+    "__reduce_ex__",
+    "__getattr__",
+    "__getattribute__",
+    "__setattr__",
+    "__delattr__",
+    "__del__",
+    "__call__",
+    "__setitem__",
+    "__getitem__",
+    "__delitem__",
+    "__hash__",
+    "__eq__",
+    "__ne__",
+    "__lt__",
+    "__le__",
+    "__gt__",
+    "__ge__",
+    "__enter__",
+    "__exit__",
+    "__class__",
+    "__dict__",
+    "__bases__",
+    "__mro__",
+    "__subclasses__",
+    "__init_subclass__",
+    "__new__",
+    "__init__",
+    "append",
+    "extend",
+})
 
 SAFE_DUNDER_RECONSTRUCTORS: FrozenSet[str] = frozenset({
     "__newobj__",
